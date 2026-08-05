@@ -11,11 +11,18 @@ pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
 const HTTP_TIMEOUT_CONNECT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT_READ: Duration = Duration::from_secs(60);
 
-/// LLM 호출 백엔드. ClaudeCli = `claude -p` 서브프로세스, OpenRouter = REST API.
+/// LLM 호출 백엔드. ClaudeCli = `claude -p` 서브프로세스, OpenRouter = REST API,
+/// Fixture = 테스트 전용(네트워크/서브프로세스 없이 미리 정해둔 응답을 순서대로 반환).
 #[derive(Clone, Debug)]
 pub enum Provider {
-    ClaudeCli { bin: String },
-    OpenRouter { api_key: String },
+    ClaudeCli {
+        bin: String,
+    },
+    OpenRouter {
+        api_key: String,
+    },
+    #[cfg(test)]
+    Fixture(Arc<Mutex<std::collections::VecDeque<String>>>),
 }
 
 /// 누적 토큰/비용 사용량. 여러 Llm 인스턴스(예: 본 모델 + 저비용 모델)가
@@ -113,6 +120,20 @@ impl Llm {
         })
     }
 
+    /// 테스트 전용 — `responses`를 호출 순서대로 하나씩 반환한다(네트워크/서브프로세스 없음).
+    /// concurrency=1일 때만 호출 순서가 소스 코드 순서와 일치해 결정적이므로, E2E 테스트는
+    /// 반드시 concurrency=1로 돌려야 한다.
+    #[cfg(test)]
+    pub fn fixture(responses: Vec<String>, retries: u32, usage: Arc<Mutex<Usage>>) -> Self {
+        Llm {
+            provider: Provider::Fixture(Arc::new(Mutex::new(responses.into_iter().collect()))),
+            model: None,
+            retries,
+            verbose: false,
+            usage,
+        }
+    }
+
     /// 현재까지 누적된 사용량 스냅샷(공유 tracker 기준). 다른 스레드가 lock을 쥔 채
     /// panic해 poison되어도(누적치가 잘못될 수는 있어도) 여기서 또 panic하지는 않는다.
     pub fn usage(&self) -> Usage {
@@ -136,6 +157,17 @@ impl Llm {
             }
             Provider::OpenRouter { api_key } => {
                 call_openrouter(api_key, self.model.as_deref(), ctx, task, system)
+            }
+            #[cfg(test)]
+            Provider::Fixture(queue) => {
+                let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                let text = q.pop_front().ok_or_else(|| {
+                    anyhow!("fixture 응답 큐가 비었음 — 예상보다 LLM 호출이 많음")
+                })?;
+                Ok(CallResult {
+                    text,
+                    usage: CallUsage::default(),
+                })
             }
         }
     }
