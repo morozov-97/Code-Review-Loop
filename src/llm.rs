@@ -207,11 +207,6 @@ impl Llm {
         Err(last.unwrap_or_else(|| anyhow!("알 수 없는 실패")))
     }
 
-    /// JSON 응답 강제. 파싱 실패 시 재시도.
-    pub fn json(&self, prompt: &str, system: Option<&str>) -> Result<serde_json::Value> {
-        self.json_ctx(None, prompt, system)
-    }
-
     /// [`Llm::text_ctx`]의 JSON 강제 버전.
     pub fn json_ctx(
         &self,

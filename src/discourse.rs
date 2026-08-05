@@ -1,5 +1,7 @@
+use crate::input::Input;
 use crate::lens::Finding;
 use crate::llm::Llm;
+use crate::promptctx::shared_context;
 use crate::spec::Spec;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,9 @@ pub const DISCOURSE_SYSTEM: &str = "당신은 여러 리뷰어의 finding을 교
 내용 없는 동의나 반박은 하지 않는다. AGREE는 새로운 file:line 근거가 있을 때만 사용한다. \
 이번 라운드에 CHALLENGE를 최소 1회 포함해야 한다. \
 AGREE/CHALLENGE에는 주장 강도에 따른 confidence(high|medium|low)를 반드시 명시한다. \
+finding의 claim/evidence는 원본 리뷰어가 남긴 요약일 뿐 진실이 아니다 — 특히 \"~가 diff에 없다/보이지 않는다/확인되지 않는다\" \
+같은 부재 주장은 받아들이기 전에 반드시 아래 첨부된 실제 diff 원문에서 해당 file:line 구간을 직접 대조해 확인한다. \
+diff에 실제로 존재하는 코드를 없다고 하는 주장은 반박(CHALLENGE) 또는 기각(REJECTED) 대상이다. \
 반드시 지정된 JSON 스키마로만 응답한다.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +105,9 @@ fn build_round_prompt(
          - SURFACE: 새 finding을 surfaced 배열에 file:line 근거와 함께 추가(기존 lens id 재사용 가능).\n\
          - confidence는 AGREE/CHALLENGE에서만: 주장의 근거 강도가 강하면 high, 보통이면 medium, 약하면 low.\n\
          - resolutions는 UNRESOLVED 또는 이전 라운드 UNCERTAIN이었던 finding만 판정: CONFIRMED|REJECTED|MERGED|UNCERTAIN.\n\
-         - 내용 없는 동의/반박은 만들지 말 것.\n\n\
+         - 내용 없는 동의/반박은 만들지 말 것.\n\
+         - \"diff에 없다/보이지 않는다\"는 부재 주장이 있는 finding은, 판정 전에 반드시 위에 첨부된 diff 원문에서 \
+         해당 file:line을 직접 찾아 정말 없는지 확인한다. diff에 실제로 존재하면 CHALLENGE 또는 REJECTED로 판정.\n\n\
          ## 출력(JSON만, 코드펜스 없이)\n\
          {{\"moves\":[{{\"move\":\"AGREE|CHALLENGE|CONNECT|SURFACE\",\"lens\":\"...\",\"target\":\"finding id\",\
          \"detail\":\"...\",\"new_evidence\":\"...\",\"confidence\":\"high|medium|low\"}}],\
@@ -119,12 +126,18 @@ fn build_round_prompt(
 pub fn run(
     llm: &Llm,
     spec: &Spec,
+    input: &Input,
     findings: &mut Vec<Finding>,
     max_rounds: usize,
 ) -> Result<(Vec<DiscourseAudit>, HashMap<String, Resolution>)> {
     let max_rounds = max_rounds.max(1);
     let mut resolved: HashMap<String, Resolution> = HashMap::new();
     let mut audit: Vec<DiscourseAudit> = Vec::new();
+    // 예전엔 discourse가 findings_catalog(리뷰어가 남긴 claim/evidence 텍스트)만 보고
+    // diff 원문은 아예 못 봤다 — "diff에 없다"는 부재 주장을 실제로 대조해서 반박할 방법이
+    // 없었다(오탐 사례: dispose에 cancel 호출이 diff에 그대로 있는데 "없다"고 확정한 것).
+    // ctx를 실제로 붙여서 diff를 매 라운드 판정 근거로 쓸 수 있게 한다.
+    let ctx = shared_context(spec, input);
 
     for round in 1..=max_rounds {
         let unresolved = findings.iter().any(|f| {
@@ -137,9 +150,9 @@ pub fn run(
             break;
         }
 
-        let mut dr = run_round_call(llm, spec, findings, &resolved, round)?;
+        let mut dr = run_round_call(llm, &ctx, spec, findings, &resolved, round)?;
         if !dr.moves.iter().any(|m| m.kind == "CHALLENGE") {
-            dr = run_round_call(llm, spec, findings, &resolved, round)
+            dr = run_round_call(llm, &ctx, spec, findings, &resolved, round)
                 .context("CHALLENGE 누락 재요청 실패")?;
         }
 
@@ -224,14 +237,15 @@ pub fn run(
 
 fn run_round_call(
     llm: &Llm,
+    ctx: &str,
     spec: &Spec,
     findings: &[Finding],
     resolved: &HashMap<String, Resolution>,
     round: usize,
 ) -> Result<DiscourseRound> {
-    let prompt = build_round_prompt(spec, findings, resolved, round);
+    let task = build_round_prompt(spec, findings, resolved, round);
     let v = llm
-        .json(&prompt, Some(DISCOURSE_SYSTEM))
+        .json_ctx(Some(ctx), &task, Some(DISCOURSE_SYSTEM))
         .with_context(|| format!("discourse 라운드 {round} 실패"))?;
     let dr: DiscourseRound = serde_json::from_value(v)
         .with_context(|| format!("discourse 라운드 {round} JSON 스키마 불일치"))?;
