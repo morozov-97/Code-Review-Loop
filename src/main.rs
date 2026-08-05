@@ -341,7 +341,7 @@ fn run_review(
         (Vec::new(), std::collections::HashMap::new())
     } else {
         println!("discourse 시작 (최대 {}라운드)", max_rounds);
-        discourse::run(llm, &sp, &mut findings, max_rounds)?
+        discourse::run(llm, &sp, &inp, &mut findings, max_rounds)?
     };
 
     // 이전 라운드(--prior) 대비: 확정됐던 finding이 이번 diff에서 고쳐졌는지 판정.

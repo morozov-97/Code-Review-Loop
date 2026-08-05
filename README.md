@@ -247,6 +247,15 @@ If not provided, and if `semgrep` is available, Code-Review-Loop currently execu
 It fills only SAST and secret-like checks; SCA/taint/deprecation remain `NOT_RUN` unless available
 by upstream tooling. Those results are presented as-is and are **not re-decided by LLM**.
 
+**Worked example — move a mechanically-checkable claim out of LLM judgment.** A lens/discourse
+finding might claim "this `dispose()` doesn't cancel the `StreamSubscription` it created." That's
+not a judgment call — it's a fact a program can check (does the file contain both a subscription
+assignment and a matching `.cancel()` call). Wire a project-specific script or semgrep rule for
+exactly that pattern, feed its result through `--deterministic-results` under a custom check id
+(e.g. `subscription_cleanup`) added to `spec.deterministic_checks`, and it's presented as-is —
+not something an LLM discourse round can second-guess or contradict itself on later. See
+[Recommended CI integration](#recommended-ci-integration) for why this matters in practice.
+
 ```mermaid
 flowchart TD
     subgraph det["Deterministic (LLM not used)"]
@@ -324,6 +333,32 @@ sequenceDiagram
 - `--prior` assumes compatible finding identity across re-runs with the same spec.
 - repository-independent claim matching can become noisy when file renames are common
   without supporting heuristics.
+- LLM judgment can be wrong in either direction — it can miss a real issue, and it can also
+  assert something false with high confidence (e.g. claiming code is absent from a diff when it's
+  actually present). Neither failure mode is fully eliminated by the deterministic scoring layer,
+  since that layer's inputs (finding existence, severity) still come from the LLM. See
+  [Recommended CI integration](#recommended-ci-integration).
+
+## Recommended CI integration
+
+Don't wire `verdict` into a required/blocking CI check that auto-merges or auto-rejects PRs
+without a human reading the report first. Treat `report.md` as an informational PR comment/artifact
+that helps a reviewer prioritize what to look at (start with `P0`/`P1` findings), not as a
+replacement for their judgment:
+
+- Post the report as a PR comment or check-run **annotation**, not a required status check that
+  blocks merge on its own.
+- Findings that assert something is *absent* from the diff (`"~가 diff에 없다"`,
+  `"not present"`, `"missing"`) are the most failure-prone category — discourse now has the actual
+  diff to verify these against (previously it didn't; see `src/discourse.rs`'s `ctx` handling), but
+  an LLM can still be confidently wrong. Spot-check high-impact absence claims against the diff
+  before acting on them.
+- Move whatever you can out of LLM judgment and into `--deterministic-results` (see the worked
+  example above) — anything mechanically checkable shouldn't be left for the LLM to assert and
+  potentially contradict itself on across discourse rounds.
+- Before trusting `verdict` for any kind of gating, measure its actual precision/recall against a
+  golden set of known-good/known-bad diffs (see `evals/` — scaffolded but not yet validated with a
+  real API key/run) rather than assuming it.
 
 ## Governance and internal docs
 
