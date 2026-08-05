@@ -10,6 +10,14 @@ pub const HUMANVOICE_SYSTEM: &str =
 사소한 지적은 'Nit:'으로 표시하고, 단정보다 질문형을 섞어 정중하게 쓴다. \
 확정된 목록에 없는 새 지적은 만들지 않는다.";
 
+fn format_good_things(good_things: &[GoodThing]) -> String {
+    good_things
+        .iter()
+        .map(|g| format!("- {} — {} ({})", g.file_line, g.practice, g.why))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn fence_or_none(s: &str, lang: &str) -> String {
     if s.is_empty() {
         "(없음)".to_string()
@@ -56,11 +64,7 @@ pub fn rewrite(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let good_text = good_things
-        .iter()
-        .map(|g| format!("- {} — {}", g.file_line, g.practice))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let good_text = format_good_things(good_things);
     let ctx = shared_context(spec, input);
     let task = build_task(&findings_text, &good_text);
     llm.text_ctx(Some(&ctx), &task, Some(HUMANVOICE_SYSTEM))
@@ -78,6 +82,23 @@ mod tests {
         assert!(
             task.contains("````findings\n"),
             "findings_text 안 3연속 백틱보다 긴 펜스로 감싸져야 함"
+        );
+    }
+
+    #[test]
+    fn format_good_things_includes_why_not_just_practice() {
+        // report.rs는 practice와 why를 둘 다 렌더링하는데, human-voice 리라이트는 why를
+        // 빠뜨려서 사람이 실제로 PR에 붙여넣는 버전에서 근거가 사라졌었다.
+        let good_things = vec![GoodThing {
+            file_line: "src/x.rs:10".to_string(),
+            practice: "명시적 에러 처리".to_string(),
+            why: "실패를 조용히 삼키지 않고 호출자에게 전파함".to_string(),
+        }];
+        let text = format_good_things(&good_things);
+        assert!(text.contains("명시적 에러 처리"));
+        assert!(
+            text.contains("실패를 조용히 삼키지 않고 호출자에게 전파함"),
+            "why 필드가 출력에 포함돼야 함"
         );
     }
 }
