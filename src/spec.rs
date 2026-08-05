@@ -83,6 +83,17 @@ impl Spec {
             );
         }
 
+        // 빈 문자열 패턴이 섞이면 policy::matches_one의 substring 매칭(path.contains(""))이
+        // 항상 true라 그 정책이 상시 PASS로 샌다 — TOML 오타(빈 배열 항목)를 로드 시점에 잡는다.
+        anyhow::ensure!(
+            spec.test_path_patterns.iter().all(|p| !p.trim().is_empty()),
+            "test_path_patterns에 빈 패턴이 있음"
+        );
+        anyhow::ensure!(
+            spec.doc_path_patterns.iter().all(|p| !p.trim().is_empty()),
+            "doc_path_patterns에 빈 패턴이 있음"
+        );
+
         Ok(spec)
     }
 
@@ -173,6 +184,42 @@ title = "Tests"
         );
         let spec = Spec::load(&path).expect("valid spec should load");
         assert_eq!(spec.lenses.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_empty_test_path_pattern() {
+        let path = write_spec(
+            "empty-pattern.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+test_path_patterns = ["tests/", ""]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let err = Spec::load(&path).expect_err("empty test_path_patterns entry must be rejected");
+        assert!(err.to_string().contains("test_path_patterns"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_empty_doc_path_pattern() {
+        let path = write_spec(
+            "empty-doc-pattern.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+doc_path_patterns = [""]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let err = Spec::load(&path).expect_err("empty doc_path_patterns entry must be rejected");
+        assert!(err.to_string().contains("doc_path_patterns"));
         let _ = std::fs::remove_file(&path);
     }
 }

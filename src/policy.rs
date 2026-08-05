@@ -31,19 +31,53 @@ fn matches_any(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| matches_one(path, p))
 }
 
+fn is_word_boundary_char(c: char) -> bool {
+    !c.is_alphanumeric()
+}
+
+/// 순수 substring 매칭은 패턴이 다른 단어 중간에서 우연히 매치되는 걸 못 막는다 — 예:
+/// "tests"(트레일링 슬래시를 빠뜨린 흔한 오타)가 "contests/foo.rs"의 "con[tests]/..."처럼
+/// 단어 중간에서 매치돼 테스트 파일이 아닌 걸 테스트 파일로 오판한다. 패턴 자신의 첫/끝
+/// 글자가 이미 구두점(밑줄·점 등)이면 그 자체가 경계 역할을 하므로("_test.", "README" 뒤에
+/// 오는 ".md") path 쪽 인접 글자가 영숫자일 때만 매치를 무효화한다.
+fn matches_word_boundary(path: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let pattern_starts_alnum = pattern.chars().next().is_some_and(|c| c.is_alphanumeric());
+    let pattern_ends_alnum = pattern
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric());
+    path.match_indices(pattern).any(|(idx, m)| {
+        let left_ok = !pattern_starts_alnum
+            || path[..idx]
+                .chars()
+                .next_back()
+                .is_none_or(is_word_boundary_char);
+        let right_ok = !pattern_ends_alnum
+            || path[idx + m.len()..]
+                .chars()
+                .next()
+                .is_none_or(is_word_boundary_char);
+        left_ok && right_ok
+    })
+}
+
 /// "test/"처럼 슬래시로 끝나는(디렉터리 스타일) 패턴은 경로 세그먼트 경계에서만 매치되게
 /// 강제한다 — 안 그러면 "test/"가 "contest/practice.rs"의 "con[test/]..."처럼 단어 중간에서
-/// 우연히 매치돼 테스트/문서 파일이 아닌 것을 테스트 파일로 오판한다. "_test."처럼 밑줄/점을
-/// 포함한 파일명 스타일 패턴은 그 구두점 자체가 이미 경계 역할을 하므로 기존 substring 매칭을
-/// 그대로 둔다("README" 같은 단어 패턴도 동일).
+/// 우연히 매치돼 테스트/문서 파일이 아닌 것을 테스트 파일로 오판한다.
 fn matches_one(path: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
     match pattern.strip_suffix('/') {
         Some(dir) => {
             let wrapped = format!("/{path}/");
             let needle = format!("/{dir}/");
             wrapped.contains(&needle)
         }
-        None => path.contains(pattern),
+        None => matches_word_boundary(path, pattern),
     }
 }
 
@@ -216,5 +250,24 @@ mod tests {
         assert!(matches_one("src/foo_test.rs", "_test."));
         assert!(matches_one("docs/README.md", "README"));
         assert!(!matches_one("src/foo.rs", "_test."));
+    }
+
+    #[test]
+    fn matches_one_rejects_mid_word_substring_for_bare_word_patterns_without_trailing_slash() {
+        // 트레일링 슬래시를 빠뜨린 흔한 오타("test/" 대신 "tests") — 이미 고친
+        // 슬래시-종료 패턴 버그와 동일 클래스가 이 스펠링에도 재현되면 안 된다.
+        assert!(!matches_one("src/contests/foo.rs", "tests"));
+        assert!(!matches_one("src/latest.rs", "test"));
+    }
+
+    #[test]
+    fn matches_one_still_matches_bare_word_pattern_at_a_real_boundary() {
+        assert!(matches_one("src/tests/foo.rs", "tests"));
+        assert!(matches_one("a/b/tests_helpers.rs", "tests"));
+    }
+
+    #[test]
+    fn matches_one_rejects_empty_pattern() {
+        assert!(!matches_one("src/anything.rs", ""));
     }
 }
