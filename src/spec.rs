@@ -65,6 +65,24 @@ impl Spec {
             .with_context(|| format!("스펙 TOML 파싱 실패: {}", path.display()))?;
         anyhow::ensure!(!spec.lenses.is_empty(), "lenses 비어 있음");
         anyhow::ensure!(!spec.labels.is_empty(), "labels 비어 있음");
+
+        // lens_by_id()는 첫 매치만 반환한다 — id가 비어있거나 중복되면 그 id를 참조하는
+        // --lenses/선정 결과가 조용히 엉뚱한(또는 의도와 다른) 렌즈로 매핑될 수 있다.
+        // TOML 파싱 시점에 바로 잡아야지 런타임에 예측 불가하게 새면 안 된다.
+        let mut seen_ids = std::collections::HashSet::new();
+        for l in &spec.lenses {
+            anyhow::ensure!(
+                !l.id.trim().is_empty(),
+                "lenses에 id가 빈 항목이 있음(title=\"{}\")",
+                l.title
+            );
+            anyhow::ensure!(
+                seen_ids.insert(l.id.clone()),
+                "lenses에 중복 id 있음: \"{}\"",
+                l.id
+            );
+        }
+
         Ok(spec)
     }
 
@@ -86,5 +104,75 @@ impl Spec {
             .map(|l| format!("\"{l}\""))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_spec(name: &str, toml: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("codereview-loop-spec-load-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, toml).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_rejects_duplicate_lens_ids() {
+        let path = write_spec(
+            "dup.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+[[lenses]]
+id = "design"
+title = "Design again"
+"#,
+        );
+        let err = Spec::load(&path).expect_err("duplicate lens id must be rejected");
+        assert!(err.to_string().contains("중복"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_empty_lens_id() {
+        let path = write_spec(
+            "empty-id.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = ""
+title = "No id"
+"#,
+        );
+        let err = Spec::load(&path).expect_err("empty lens id must be rejected");
+        assert!(err.to_string().contains("빈"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_accepts_valid_unique_lens_ids() {
+        let path = write_spec(
+            "ok.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+[[lenses]]
+id = "tests"
+title = "Tests"
+"#,
+        );
+        let spec = Spec::load(&path).expect("valid spec should load");
+        assert_eq!(spec.lenses.len(), 2);
+        let _ = std::fs::remove_file(&path);
     }
 }
