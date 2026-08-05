@@ -411,11 +411,7 @@ fn run_review(
 
     state::write(
         &out_dir,
-        &state::State {
-            round,
-            findings: findings.clone(),
-            resolved: resolved.clone(),
-        },
+        &state::State::new(round, findings.clone(), resolved.clone()),
     )?;
 
     println!(
