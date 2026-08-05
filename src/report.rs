@@ -243,6 +243,53 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         md.push('\n');
     }
 
+    // MERGED/UNCERTAIN(또는 미해결) finding은 score/verdict에 반영되지 않고, 예전엔
+    // 리포트 어디에도 안 보였다 — CONFIRMED/REJECTED 둘 다 아니라는 이유로 완전히
+    // 사라진 것. 하지만 여러 렌즈가 독립적으로 같은 문제를 지적했는데 discourse가
+    // 합의에 못 이른 경우(UNCERTAIN)나 다른 finding에 흡수된 경우(MERGED)는 오히려
+    // 사람이 직접 봐야 할 신호다 — 실전에서 SQL injection이 이 경로로 통째로
+    // 증발한 사례를 실제로 확인했다.
+    let needs_human_look: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| {
+            !matches!(
+                resolved.get(&f.id).map(|r| r.status.as_str()),
+                Some("CONFIRMED") | Some("REJECTED")
+            )
+        })
+        .collect();
+    if !needs_human_look.is_empty() {
+        md.push_str(
+            "### 사람이 봐야 할 항목 (확정도 기각도 아님 — score/verdict 미반영)\n\n\
+             discourse가 합의에 이르지 못했거나(UNCERTAIN) 다른 finding에 병합(MERGED)된 \
+             항목이다. 여러 렌즈가 독립적으로 같은 문제를 지적했을 수 있으니 직접 확인 권장.\n\n\
+             | ID | Priority | Label | File:line | Claim | 상태 | 사유 |\n|---|---|---|---|---|---|---|\n",
+        );
+        for f in &needs_human_look {
+            let r = resolved.get(&f.id);
+            let status = r.map(|r| r.status.as_str()).unwrap_or("UNRESOLVED");
+            let reason = r.map(|r| r.reason.as_str()).unwrap_or("");
+            let reason = if status == "MERGED" {
+                let target = r.map(|r| r.merged_into.as_str()).unwrap_or("");
+                format!("{target}로 병합: {reason}")
+            } else {
+                reason.to_string()
+            };
+            md.push_str(&format!(
+                "| {} | {} | {} | {}:{} | {} | {} | {} |\n",
+                f.id,
+                f.severity,
+                escape_table_cell(&f.label),
+                escape_table_cell(&f.file),
+                escape_table_cell(&f.line),
+                escape_table_cell(&f.claim),
+                escape_table_cell(status),
+                escape_table_cell(&reason)
+            ));
+        }
+        md.push('\n');
+    }
+
     md.push_str("## Good Things\n\n");
     if good_things.is_empty() {
         md.push_str("관찰되지 않음\n\n");
@@ -372,5 +419,143 @@ mod tests {
     #[test]
     fn escape_table_cell_handles_both_at_once() {
         assert_eq!(escape_table_cell("a | b\nc | d"), "a \\| b<br>c \\| d");
+    }
+
+    fn test_spec() -> Spec {
+        Spec {
+            name: "test".to_string(),
+            context: String::new(),
+            lenses: Vec::new(),
+            deterministic_checks: Vec::new(),
+            labels: vec!["security".to_string()],
+            diff_size_limit: 0,
+            test_path_patterns: Vec::new(),
+            doc_path_patterns: Vec::new(),
+        }
+    }
+
+    fn test_input() -> Input {
+        Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+        }
+    }
+
+    fn test_quant() -> QuantSummary {
+        QuantSummary {
+            verdict: "REQUEST_CHANGES".to_string(),
+            score: 99,
+            score_deductions: Vec::new(),
+            estimated_effort_1_5: 1,
+            time_best_min: 5,
+            time_average_min: 15,
+            time_worst_min: 40,
+        }
+    }
+
+    fn test_finding(id: &str, claim: &str) -> Finding {
+        Finding {
+            id: id.to_string(),
+            file: "src/users.rs".to_string(),
+            line: "12".to_string(),
+            claim: claim.to_string(),
+            evidence: "format! 로 SQL 문자열 조립".to_string(),
+            impact: String::new(),
+            severity: "P1".to_string(),
+            label: "security".to_string(),
+            confidence: "high".to_string(),
+            recommendation: String::new(),
+            lens: "security".to_string(),
+            reviewer: "Reviewer".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_shows_uncertain_and_merged_findings_that_score_ignores() {
+        // 실전 재현: 4개 렌즈가 독립적으로 같은 SQL injection을 지적했지만 discourse가
+        // CONFIRMED도 REJECTED도 못 내려서 리포트 어디에도 안 보이던 문제.
+        let findings = vec![
+            test_finding("security-r1-1", "raw SQL injection"),
+            test_finding("security-r1-2", "동일 SQL injection, 다른 렌즈"),
+        ];
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            "security-r1-1".to_string(),
+            Resolution {
+                finding_id: "security-r1-1".to_string(),
+                status: "UNCERTAIN".to_string(),
+                merged_into: String::new(),
+                reason: "합의 실패(net=0.30)".to_string(),
+            },
+        );
+        resolved.insert(
+            "security-r1-2".to_string(),
+            Resolution {
+                finding_id: "security-r1-2".to_string(),
+                status: "MERGED".to_string(),
+                merged_into: "security-r1-1".to_string(),
+                reason: "동일 근본 원인".to_string(),
+            },
+        );
+        let spec = test_spec();
+        let input = test_input();
+        let quant = test_quant();
+        let dir = std::env::temp_dir().join("codereview-loop-report-uncertain-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["security".to_string()],
+            round: 1,
+            findings: &findings,
+            resolved: &resolved,
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &[],
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &[],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        let findings_section = md
+            .split("## Findings")
+            .nth(1)
+            .unwrap()
+            .split("### 사람이 봐야 할 항목")
+            .next()
+            .unwrap();
+        assert!(
+            !findings_section.contains("security-r1-1")
+                && !findings_section.contains("security-r1-2"),
+            "UNCERTAIN/MERGED finding이 CONFIRMED Findings 테이블에 섞이면 안 됨"
+        );
+        assert!(
+            md.contains("사람이 봐야 할 항목"),
+            "새 가시성 섹션이 렌더링돼야 함"
+        );
+        assert!(
+            md.contains("security-r1-1"),
+            "UNCERTAIN finding이 보여야 함"
+        );
+        assert!(md.contains("security-r1-2"), "MERGED finding이 보여야 함");
+        assert!(
+            md.contains("security-r1-1로 병합"),
+            "MERGED 사유에 병합 대상이 보여야 함"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
