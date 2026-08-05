@@ -22,6 +22,20 @@ struct RequirementsOutput {
     requirements: Vec<RequirementCheck>,
 }
 
+const VALID_STATUSES: [&str; 4] = ["MET", "MISSING", "AMBIGUOUS", "N/A"];
+
+/// severity와 동일한 문제: quantify.rs가 이 필드를 정확 문자열 매칭하므로, LLM이
+/// 지정된 리터럴에서 벗어나면 조용히 무시된다. 실패는 AMBIGUOUS(사람이 다시 봐야 함)
+/// 쪽으로 나야지, 조용히 검증을 통과한 것처럼 새면 안 된다.
+fn normalize_status(raw: &str) -> String {
+    let upper = raw.trim().to_ascii_uppercase();
+    if VALID_STATUSES.contains(&upper.as_str()) {
+        upper
+    } else {
+        "AMBIGUOUS".to_string()
+    }
+}
+
 /// requirements 미제공 시 None 반환(검증 대상 없음, N/A 나열하지 않음).
 pub fn verify(
     llm: &Llm,
@@ -51,7 +65,33 @@ pub fn verify(
     let v = llm
         .json_ctx(Some(&ctx), &task, Some(REQ_SYSTEM))
         .context("요구사항 검증 실패")?;
-    let out: RequirementsOutput =
+    let mut out: RequirementsOutput =
         serde_json::from_value(v).context("요구사항 검증 JSON 스키마 불일치")?;
+    for r in out.requirements.iter_mut() {
+        r.status = normalize_status(&r.status);
+    }
     Ok(Some(out.requirements))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_status_passes_through_valid_values() {
+        for s in ["MET", "MISSING", "AMBIGUOUS", "N/A"] {
+            assert_eq!(normalize_status(s), s);
+        }
+    }
+
+    #[test]
+    fn normalize_status_trims_and_uppercases() {
+        assert_eq!(normalize_status(" missing "), "MISSING");
+    }
+
+    #[test]
+    fn normalize_status_falls_back_to_ambiguous_on_unknown_value() {
+        assert_eq!(normalize_status("Done"), "AMBIGUOUS");
+        assert_eq!(normalize_status(""), "AMBIGUOUS");
+    }
 }

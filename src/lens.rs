@@ -39,6 +39,21 @@ fn unknown() -> String {
     "UNKNOWN".to_string()
 }
 
+const VALID_SEVERITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
+
+/// LLM이 지정된 리터럴(P0-P3)에서 벗어난 값을 낼 수 있다(대소문자·공백·동의어 등,
+/// --cheap-model 경로에서 특히). quantify.rs/report.rs가 이 필드를 정확 문자열 매칭하므로
+/// 정규화하지 않은 값은 score/verdict에서 조용히 0점 취급된다 — 실패는 안전한 방향(P0,
+/// 더 엄격한 심사)으로 나야지 조용히 APPROVE 쪽으로 새면 안 된다.
+pub fn normalize_severity(raw: &str) -> String {
+    let upper = raw.trim().to_ascii_uppercase();
+    if VALID_SEVERITIES.contains(&upper.as_str()) {
+        upper
+    } else {
+        "P0".to_string()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LensOutput {
     #[serde(default)]
@@ -165,6 +180,7 @@ pub fn review_lens(llm: &Llm, spec: &Spec, input: &Input, lens_id: &str) -> Resu
         f.id = format!("{}-{}", lens_id, i + 1);
         f.lens = lens_id.to_string();
         f.reviewer = reviewer.clone();
+        f.severity = normalize_severity(&f.severity);
         if f.line.trim().is_empty() {
             f.line = unknown();
         }
@@ -191,4 +207,27 @@ pub fn review_good_things(llm: &Llm, spec: &Spec, input: &Input) -> Result<GoodT
     let out: GoodThingsOutput =
         serde_json::from_value(v).context("Good Things JSON 스키마 불일치")?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_severity_passes_through_valid_values() {
+        for s in ["P0", "P1", "P2", "P3"] {
+            assert_eq!(normalize_severity(s), s);
+        }
+    }
+
+    #[test]
+    fn normalize_severity_trims_and_uppercases() {
+        assert_eq!(normalize_severity(" p1 "), "P1");
+    }
+
+    #[test]
+    fn normalize_severity_falls_back_to_most_severe_on_unknown_value() {
+        assert_eq!(normalize_severity("Critical"), "P0");
+        assert_eq!(normalize_severity(""), "P0");
+    }
 }
