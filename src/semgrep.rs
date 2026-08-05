@@ -10,8 +10,16 @@ use std::process::Command;
 /// `--` 구분자 없이 그대로 넘길 경우 semgrep 자체 인자 파서가 이를 플래그로 오인해
 /// 스캔 설정(룰셋 출처 등)을 공격자가 override할 수 있다. `--`로 이후 전부를
 /// 위치 인자로 강제 고정한다.
+///
+/// 실제 semgrep 1.172.0 바이너리로 검증: `scan` 서브커맨드를 명시하지 않고(semgrep의
+/// "서브커맨드 생략 시 scan으로 취급" 편의 기능에 의존) `--`만 붙이면 `--`가 조용히
+/// 무시되고 `--config=`로 시작하는 파일명이 여전히 플래그로 파싱된다(Click의 top-level
+/// group이 기본 커맨드로 위임할 때 `--`를 올바르게 전달하지 않는 것으로 보임) —
+/// `semgrep --config=auto --json --quiet -- <악성파일명>`은 그대로 뚫린다. `scan`을
+/// 명시하면(`semgrep scan --config=auto ... -- <파일>`) `--` 이후가 정확히 위치
+/// 인자로 처리된다. 이전 수정(`--`만 추가)은 이 서브커맨드 생략 경로에서는 무력했다.
 fn build_args<'a>(existing: &[&'a str]) -> Vec<&'a str> {
-    let mut args = vec!["--config=auto", "--json", "--quiet", "--"];
+    let mut args = vec!["scan", "--config=auto", "--json", "--quiet", "--"];
     args.extend_from_slice(existing);
     args
 }
@@ -134,6 +142,14 @@ mod build_args_tests {
     use super::*;
 
     #[test]
+    fn build_args_starts_with_explicit_scan_subcommand() {
+        // 실제 semgrep 바이너리로 검증: 서브커맨드 생략(암묵적 scan)에 의존하면 --가
+        // 조용히 무시된다 — scan을 명시해야 -- 이후가 실제로 위치 인자로 처리된다.
+        let args = build_args(&["src/main.rs"]);
+        assert_eq!(args[0], "scan");
+    }
+
+    #[test]
     fn build_args_places_separator_before_file_list() {
         let existing = vec!["src/main.rs", "src/lib.rs"];
         let args = build_args(&existing);
@@ -142,8 +158,8 @@ mod build_args_tests {
             .position(|a| *a == "--")
             .expect("-- separator missing");
         assert!(
-            args[..sep].iter().all(|a| a.starts_with('-')),
-            "everything before -- must be a real flag"
+            args[1..sep].iter().all(|a| a.starts_with('-')),
+            "scan 다음부터 -- 전까지는 전부 실제 플래그여야 함"
         );
         assert_eq!(&args[sep + 1..], existing.as_slice());
     }
