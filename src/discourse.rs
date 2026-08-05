@@ -49,6 +49,19 @@ fn confidence_weight(c: &str) -> f64 {
 
 const VOTE_THRESHOLD: f64 = 0.6;
 
+/// finding X가 Y로 MERGED되면 discourse는 "X와 Y는 같은 문제"라 판단한 것이지 X가
+/// 가짜라는 뜻이 아니다 — 그런데 MERGE 자체는 생존자(Y)를 겨냥한 AGREE/CHALLENGE 투표가
+/// 아니라서, Y를 직접 겨냥하는 투표가 하나도 없으면 Y는 아무 투표 없이 UNCERTAIN으로
+/// 남아 점수에 전혀 반영되지 않는다(두 렌즈가 독립적으로 잡은 버그가 점수 0으로 증발).
+/// MERGED 판정 자체를 high-confidence AGREE 1표와 동등하게 취급해 생존자 쪽 집계에 더한다.
+fn merge_vote_weight(resolved: &HashMap<String, Resolution>, target_id: &str) -> f64 {
+    resolved
+        .values()
+        .filter(|r| r.status == "MERGED" && r.merged_into == target_id)
+        .count() as f64
+        * confidence_weight("high")
+}
+
 /// 필드 전부 `#[serde(default)]` — 바로 위 Move와 동일 이유(실전에서 필드 하나 빠지면
 /// 라운드 전체가 죽는 걸 겪음)가 여기도 그대로 적용된다. status는 정규화되지 않은 값
 /// (빈 문자열 포함)이 들어와도 `normalize_status`가 UNCERTAIN으로 안전하게 떨어뜨린다.
@@ -249,7 +262,8 @@ pub fn run(
                 "CHALLENGE" => -confidence_weight(&m.confidence),
                 _ => 0.0,
             })
-            .sum();
+            .sum::<f64>()
+            + merge_vote_weight(&resolved, &f.id);
 
         let (status, reason) = if net >= VOTE_THRESHOLD {
             (
@@ -412,6 +426,72 @@ mod tests {
         assert!(
             prompt.contains("````findings\n"),
             "evidence 안 3연속 백틱보다 긴 펜스로 감싸져야 함"
+        );
+    }
+
+    #[test]
+    fn merge_vote_weight_counts_only_merges_targeting_this_id() {
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            "a".to_string(),
+            Resolution {
+                finding_id: "a".to_string(),
+                status: "MERGED".to_string(),
+                merged_into: "b".to_string(),
+                reason: String::new(),
+            },
+        );
+        resolved.insert(
+            "c".to_string(),
+            Resolution {
+                finding_id: "c".to_string(),
+                status: "CONFIRMED".to_string(),
+                merged_into: String::new(),
+                reason: String::new(),
+            },
+        );
+        assert_eq!(merge_vote_weight(&resolved, "b"), confidence_weight("high"));
+        assert_eq!(merge_vote_weight(&resolved, "c"), 0.0);
+        assert_eq!(merge_vote_weight(&resolved, "nonexistent"), 0.0);
+    }
+
+    #[test]
+    fn run_confirms_merge_survivor_even_with_zero_direct_votes() {
+        // 실전 시나리오: 두 렌즈(design, security)가 같은 버그를 독립적으로 잡았다.
+        // discourse가 design 쪽을 security 쪽으로 MERGED 처리하지만, security 쪽을
+        // 직접 겨냥하는 AGREE/CHALLENGE는 이번 라운드에 하나도 없다 — 고치기 전에는
+        // security 쪽이 투표 0표로 UNCERTAIN에 머물러 점수에 전혀 반영 안 됐다.
+        let mut findings = vec![
+            test_finding("설계 관점에서도 같은 버그", "evidence A"),
+            test_finding("보안 관점에서 SQL 인젝션", "evidence B"),
+        ];
+        findings[0].id = "design-r1-1".to_string();
+        findings[1].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{"move": "CHALLENGE", "lens": "tests", "target": "design-r1-1", "detail": "d", "confidence": "high"}],
+            "resolutions": [{"finding_id": "design-r1-1", "status": "MERGED", "merged_into": "security-r1-1", "reason": "같은 근본 원인"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+        };
+
+        let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();
+
+        assert_eq!(resolved["design-r1-1"].status, "MERGED");
+        assert_eq!(
+            resolved["security-r1-1"].status, "CONFIRMED",
+            "MERGE 대상(생존자)이 직접 투표 없이도 확정돼야 한다"
         );
     }
 }
