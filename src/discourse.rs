@@ -11,9 +11,14 @@ pub const DISCOURSE_SYSTEM: &str = "당신은 여러 리뷰어의 finding을 교
 내용 없는 동의나 반박은 하지 않는다. AGREE는 새로운 file:line 근거가 있을 때만 사용한다. \
 이번 라운드에 CHALLENGE를 최소 1회 포함해야 한다. \
 AGREE/CHALLENGE에는 주장 강도에 따른 confidence(high|medium|low)를 반드시 명시한다. \
+CHALLENGE에는 반드시 challenge_axis를 명시한다: finding 자체가 근거 없거나 틀렸다는 \
+반박이면 \"existence\", finding은 실재하지만 심각도(severity)가 과대평가됐다는 반박이면 \
+\"severity\". existence 반박만 확정/기각 투표에 영향을 준다 — severity 반박은 심각도 \
+재검토 사유로만 남고 finding의 존재 자체를 부정하지 않는다(둘을 같은 투표로 섞으면 \
+심각도 이견 하나로 실재하는 finding이 완전히 사라질 수 있다). \
 finding의 claim/evidence는 원본 리뷰어가 남긴 요약일 뿐 진실이 아니다 — 특히 \"~가 diff에 없다/보이지 않는다/확인되지 않는다\" \
 같은 부재 주장은 받아들이기 전에 반드시 아래 첨부된 실제 diff 원문에서 해당 file:line 구간을 직접 대조해 확인한다. \
-diff에 실제로 존재하는 코드를 없다고 하는 주장은 반박(CHALLENGE) 또는 기각(REJECTED) 대상이다. \
+diff에 실제로 존재하는 코드를 없다고 하는 주장은 반박(CHALLENGE, challenge_axis=existence) 또는 기각(REJECTED) 대상이다. \
 반드시 지정된 JSON 스키마로만 응답한다.";
 
 /// 필드 전부 `#[serde(default)]` — 실전에서 LLM이 이 중 하나(주로 detail)를 빠뜨리면
@@ -35,6 +40,27 @@ pub struct Move {
     pub new_evidence: String,
     #[serde(default)]
     pub confidence: String, // high|medium|low (AGREE/CHALLENGE에만 의미 있음)
+    /// CHALLENGE에만 의미 있음: existence|severity. 정규화는 normalize_challenge_axis 참고.
+    #[serde(default)]
+    pub challenge_axis: String,
+}
+
+const VALID_CHALLENGE_AXES: [&str; 2] = ["EXISTENCE", "SEVERITY"];
+
+/// 실전에서 발견: 4개 렌즈가 독립적으로 같은 SQL injection을 잡았는데, "심각도가
+/// 과대평가"라는 취지의 CHALLENGE 하나가 existence 반박과 동일한 투표 가중치로 집계되며
+/// finding이 UNCERTAIN까지 밀려 리포트에서 완전히 사라졌다(#75). challenge_axis가
+/// 없거나 스키마 밖 값이면 "SEVERITY"(투표에 영향 없음)로 안전하게 떨어뜨린다 —
+/// 이 세션 전체가 따른 "실패는 finding을 못 놓치는 방향으로" 원칙과 같은 이유:
+/// existence로 잘못 기본값을 주면 LLM이 이 신규 필드를 못 채울 때마다 예전의
+/// "심각도 이견이 finding을 지운다" 버그가 조용히 재현된다.
+fn normalize_challenge_axis(raw: &str) -> String {
+    let upper = raw.trim().to_ascii_uppercase();
+    if VALID_CHALLENGE_AXES.contains(&upper.as_str()) {
+        upper
+    } else {
+        "SEVERITY".to_string()
+    }
 }
 
 /// ReConcile식 confidence bucket → 가중치. 라운드 소진 후 잔여 UNCERTAIN을
@@ -149,7 +175,9 @@ fn build_round_prompt(
          ## 규칙\n\
          - 각 move는 AGREE/CHALLENGE/CONNECT/SURFACE 중 하나, target에 finding id 명시.\n\
          - AGREE: 대상 finding에 없던 새 file:line 근거(new_evidence)가 있을 때만. confidence 필수.\n\
-         - CHALLENGE: 이번 라운드 최소 1회. 근거·반례·범위·심각도·가정 중 하나를 구체적으로 반박. confidence 필수.\n\
+         - CHALLENGE: 이번 라운드 최소 1회. 근거·반례·범위·가정 중 하나를 구체적으로 반박. confidence 필수. \
+         challenge_axis 필수: finding 자체가 근거 없거나 틀렸다는 반박이면 \"existence\"(확정/기각 투표에 반영됨), \
+         finding은 실재하지만 심각도가 과대평가됐다는 반박이면 \"severity\"(투표에 영향 없이 심각도 재검토 사유로만 남음).\n\
          - CONNECT: 둘 이상의 finding id를 detail에 명시하며 원인·영향 사슬 서술.\n\
          - SURFACE: 새 finding을 surfaced 배열에 file:line 근거와 함께 추가(기존 lens id 재사용 가능).\n\
          - confidence는 AGREE/CHALLENGE에서만: 주장의 근거 강도가 강하면 high, 보통이면 medium, 약하면 low.\n\
@@ -159,7 +187,8 @@ fn build_round_prompt(
          해당 file:line을 직접 찾아 정말 없는지 확인한다. diff에 실제로 존재하면 CHALLENGE 또는 REJECTED로 판정.\n\n\
          ## 출력(JSON만, 코드펜스 없이)\n\
          {{\"moves\":[{{\"move\":\"AGREE|CHALLENGE|CONNECT|SURFACE\",\"lens\":\"...\",\"target\":\"finding id\",\
-         \"detail\":\"...\",\"new_evidence\":\"...\",\"confidence\":\"high|medium|low\"}}],\
+         \"detail\":\"...\",\"new_evidence\":\"...\",\"confidence\":\"high|medium|low\",\
+         \"challenge_axis\":\"existence|severity(CHALLENGE에만 필요)\"}}],\
          \"resolutions\":[{{\"finding_id\":\"...\",\"status\":\"CONFIRMED|REJECTED|MERGED|UNCERTAIN\",\
          \"merged_into\":\"\",\"reason\":\"...\"}}],\
          \"surfaced\":[{{\"file\":\"...\",\"line\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\"impact\":\"...\",\
@@ -232,6 +261,12 @@ pub fn run(
             resolved.insert(r.finding_id.clone(), r);
         }
 
+        for m in dr.moves.iter_mut() {
+            if m.kind == "CHALLENGE" {
+                m.challenge_axis = normalize_challenge_axis(&m.challenge_axis);
+            }
+        }
+
         audit.push(DiscourseAudit {
             round,
             moves: dr.moves,
@@ -259,7 +294,9 @@ pub fn run(
             .filter(|m| m.target == f.id)
             .map(|m| match m.kind.as_str() {
                 "AGREE" => confidence_weight(&m.confidence),
-                "CHALLENGE" => -confidence_weight(&m.confidence),
+                // severity 축 CHALLENGE는 finding 존재 자체를 반박하지 않으므로 투표에서
+                // 제외한다(CONNECT/SURFACE와 동일하게 0표) — existence 축만 기각 방향으로 집계.
+                "CHALLENGE" if m.challenge_axis == "EXISTENCE" => -confidence_weight(&m.confidence),
                 _ => 0.0,
             })
             .sum::<f64>()
@@ -492,6 +529,92 @@ mod tests {
         assert_eq!(
             resolved["security-r1-1"].status, "CONFIRMED",
             "MERGE 대상(생존자)이 직접 투표 없이도 확정돼야 한다"
+        );
+    }
+
+    #[test]
+    fn normalize_challenge_axis_passes_through_valid_values_case_insensitively() {
+        assert_eq!(normalize_challenge_axis("existence"), "EXISTENCE");
+        assert_eq!(normalize_challenge_axis("Severity"), "SEVERITY");
+    }
+
+    #[test]
+    fn normalize_challenge_axis_falls_back_to_severity_on_unknown_or_empty_value() {
+        // "심각도만 문제 삼는 반박"이 기본값이어야 finding 존재 자체가 조용히 부정되지
+        // 않는다 — 이 필드를 LLM이 안 채워도(스키마 밖 값이어도) 안전한 쪽으로 떨어진다.
+        assert_eq!(normalize_challenge_axis(""), "SEVERITY");
+        assert_eq!(normalize_challenge_axis("scope"), "SEVERITY");
+    }
+
+    #[test]
+    fn run_confirms_finding_despite_severity_only_challenge() {
+        // 실전 재현(#75): 4개 렌즈가 독립 확인한 SQL injection이 "심각도 과대평가"
+        // 취지의 CHALLENGE 하나 때문에 UNCERTAIN까지 밀려 리포트에서 사라졌다. 고치기
+        // 전이었다면 이 테스트의 net은 AGREE(1.0) + CHALLENGE(-1.0) = 0.0으로 UNCERTAIN.
+        let mut findings = vec![test_finding("SQL injection 발견", "evidence")];
+        findings[0].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [
+                {"move": "AGREE", "lens": "security", "target": "security-r1-1", "confidence": "high", "new_evidence": "e"},
+                {"move": "CHALLENGE", "lens": "style", "target": "security-r1-1", "confidence": "high", "challenge_axis": "severity", "detail": "심각도 과대평가"}
+            ],
+            "resolutions": [],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+        };
+
+        let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();
+
+        assert_eq!(
+            resolved["security-r1-1"].status, "CONFIRMED",
+            "severity 축 CHALLENGE는 확정 투표를 깎으면 안 된다"
+        );
+    }
+
+    #[test]
+    fn run_still_lets_existence_challenge_suppress_confirmation() {
+        // 회귀 방지: severity 축을 투표에서 뺐다고 existence 축까지 무력화되면 안 된다.
+        let mut findings = vec![test_finding("가짜일 수 있는 주장", "evidence")];
+        findings[0].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [
+                {"move": "AGREE", "lens": "security", "target": "security-r1-1", "confidence": "high", "new_evidence": "e"},
+                {"move": "CHALLENGE", "lens": "style", "target": "security-r1-1", "confidence": "high", "challenge_axis": "existence", "detail": "근거 자체가 diff에 없음"}
+            ],
+            "resolutions": [],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+        };
+
+        let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();
+
+        assert_eq!(
+            resolved["security-r1-1"].status, "UNCERTAIN",
+            "existence 축 CHALLENGE는 여전히 확정을 막아야 한다(net=0)"
         );
     }
 }

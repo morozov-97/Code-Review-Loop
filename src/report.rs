@@ -312,14 +312,20 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
 
     md.push_str("## Discourse audit\n\n");
     md.push_str(
-        "| Round | Move | Lens | Target | Detail | New evidence |\n|---|---|---|---|---|---|\n",
+        "| Round | Move | Challenge axis | Lens | Target | Detail | New evidence |\n|---|---|---|---|---|---|---|\n",
     );
     for a in audit {
         for m in &a.moves {
+            let axis = if m.kind == "CHALLENGE" {
+                m.challenge_axis.as_str()
+            } else {
+                ""
+            };
             md.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
                 a.round,
                 escape_table_cell(&m.kind),
+                escape_table_cell(axis),
                 escape_table_cell(&m.lens),
                 escape_table_cell(&m.target),
                 escape_table_cell(&m.detail),
