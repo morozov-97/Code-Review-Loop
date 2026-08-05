@@ -79,6 +79,14 @@ fn normalize_status(raw: &str) -> String {
     }
 }
 
+/// lens.rs::finding_id와 동일한 이유: outer_round(--prior로 이어지는 전체 파이프라인
+/// 라운드)를 넣지 않으면, discourse 내부 round는 매 outer_round 호출마다 다시 1부터
+/// 시작하므로 서로 다른 outer_round에서 우연히 같은 (round, index)가 나와 완전히 다른
+/// finding이 같은 id를 공유한다.
+fn surface_id(outer_round: usize, round: usize, index: usize) -> String {
+    format!("surface-o{outer_round}-r{round}-{index}")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DiscourseRound {
     #[serde(default)]
@@ -151,12 +159,19 @@ fn build_round_prompt(
 
 /// discourse 라운드 반복. 미해결/UNCERTAIN finding이 없어지거나 max_rounds에 도달하면 종료.
 /// 매 라운드 CHALLENGE 누락 시 1회 재요청.
+///
+/// `outer_round`는 `--prior`로 이어지는 전체 파이프라인 라운드(lens.rs::finding_id가 쓰는
+/// 것과 동일한 번호)다. discourse 내부 루프의 `round`(항상 1부터 다시 시작)만으로 SURFACE
+/// id를 만들면, 서로 다른 outer_round 호출에서 우연히 같은 (round, index) 조합이 나와
+/// 완전히 다른 finding이 같은 id를 공유하게 된다 — score 이중 집계·discourse 판정 덮어씀의
+/// 원인. lens.rs와 동일하게 outer_round를 id에 넣어 막는다.
 pub fn run(
     llm: &Llm,
     spec: &Spec,
     input: &Input,
     findings: &mut Vec<Finding>,
     max_rounds: usize,
+    outer_round: usize,
 ) -> Result<(Vec<DiscourseAudit>, HashMap<String, Resolution>)> {
     let max_rounds = max_rounds.max(1);
     let mut resolved: HashMap<String, Resolution> = HashMap::new();
@@ -185,7 +200,7 @@ pub fn run(
         }
 
         for (i, sf) in dr.surfaced.iter_mut().enumerate() {
-            sf.id = format!("surface-r{}-{}", round, i + 1);
+            sf.id = surface_id(outer_round, round, i + 1);
             // lens는 코드가 항상 권위있게 채운다 — 일반 finding(lens.rs:221)과 동일 원칙.
             // LLM이 스키마에 없는 lens 값을 자체적으로 채워 보내도 그대로 살아남지 않게 한다.
             sf.lens = "discourse".to_string();
@@ -339,5 +354,18 @@ mod tests {
     fn normalize_status_falls_back_to_uncertain_on_unknown_or_empty_value() {
         assert_eq!(normalize_status("IN_PROGRESS"), "UNCERTAIN");
         assert_eq!(normalize_status(""), "UNCERTAIN");
+    }
+
+    #[test]
+    fn surface_id_differs_across_outer_prior_rounds_for_the_same_position() {
+        // 고침 전: discourse 내부 round는 매 --prior 호출마다 다시 1부터 시작해서,
+        // outer_round 1과 2의 (round=1, index=1)이 똑같이 "surface-r1-1"이 됐다.
+        assert_ne!(surface_id(1, 1, 1), surface_id(2, 1, 1));
+    }
+
+    #[test]
+    fn surface_id_differs_across_inner_rounds_and_positions() {
+        assert_ne!(surface_id(1, 1, 1), surface_id(1, 2, 1));
+        assert_ne!(surface_id(1, 1, 1), surface_id(1, 1, 2));
     }
 }
