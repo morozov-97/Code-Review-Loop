@@ -16,7 +16,7 @@ pub struct Finding {
     #[serde(default)]
     pub id: String,
     pub file: String,
-    #[serde(default = "unknown")]
+    #[serde(default = "unknown", deserialize_with = "string_or_number")]
     pub line: String,
     pub claim: String,
     pub evidence: String,
@@ -37,6 +37,24 @@ pub struct Finding {
 
 fn unknown() -> String {
     "UNKNOWN".to_string()
+}
+
+/// LLM이 `"line": 20`처럼 JSON 정수로 응답하는 경우가 실제로 관측됨(문자열만 받으면
+/// 스키마 불일치로 해당 렌즈 findings 전체가 부분실패 경로로 드롭됨) — 문자열/숫자 모두 허용.
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(serde_json::Number),
+    }
+    match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => Ok(s),
+        StringOrNumber::Number(n) => Ok(n.to_string()),
+    }
 }
 
 const VALID_SEVERITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
@@ -317,5 +335,36 @@ mod tests {
     #[test]
     fn finding_id_differs_across_positions_within_a_round() {
         assert_ne!(finding_id("design", 1, 1), finding_id("design", 1, 2));
+    }
+
+    #[test]
+    fn finding_line_accepts_json_integer_like_live_every_line_response() {
+        // 실제 도그푸딩 run에서 every_line 렌즈가 "line": 20 (정수)로 응답해
+        // "invalid type: integer `20`, expected a string"로 렌즈 전체가 드롭됨.
+        let json = r#"{"findings":[{"file":"x.dart","line":20,"claim":"c","evidence":"e","severity":"P3","label":"typo"}]}"#;
+        let out: LensOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.findings[0].line, "20");
+    }
+
+    #[test]
+    fn finding_line_accepts_json_integer_like_live_functionality_response() {
+        // 동일 문제가 functionality 렌즈에서 "line": 21로 재현됨.
+        let json = r#"{"findings":[{"file":"x.dart","line":21,"claim":"c","evidence":"e","severity":"P2","label":"possible bug"}]}"#;
+        let out: LensOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.findings[0].line, "21");
+    }
+
+    #[test]
+    fn finding_line_still_accepts_string() {
+        let json = r#"{"findings":[{"file":"x.dart","line":"17,21-25","claim":"c","evidence":"e","severity":"P2","label":"possible bug"}]}"#;
+        let out: LensOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.findings[0].line, "17,21-25");
+    }
+
+    #[test]
+    fn finding_line_defaults_when_absent() {
+        let json = r#"{"findings":[{"file":"x.dart","claim":"c","evidence":"e","severity":"P2","label":"possible bug"}]}"#;
+        let out: LensOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.findings[0].line, "UNKNOWN");
     }
 }
