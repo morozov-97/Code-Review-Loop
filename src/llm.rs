@@ -10,7 +10,12 @@ pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
 /// 영원히 블록될 수 있다. CI 등 자동화 환경에서 특히 치명적 — DNS부터 응답 본문 수신까지
 /// 전체를 하나의 상한으로 묶는 게(개별 구간별 상한보다) "절대 이 시간 넘게 안 멈춘다"는
 /// 보장이 더 직접적이라 timeout_global 하나로 건다.
-const HTTP_TIMEOUT_GLOBAL: Duration = Duration::from_secs(90);
+///
+/// 90초는 evals/ 골든셋을 실제 OpenRouter로 돌리다 라이브로 재현됨 — discourse 라운드
+/// 호출 하나가 90초를 넘겨 "json: timeout: global"로 전체 리뷰가 실패했다(재시도 후에도).
+/// 같은 "LLM 응답 하나 기다리기"란 목적의 CLAUDE_CLI_TIMEOUT(600초)과 맞춰 완화한다 —
+/// 서브프로세스 백엔드보다 유독 타이트해야 할 이유가 없다.
+const HTTP_TIMEOUT_GLOBAL: Duration = Duration::from_secs(600);
 /// claude -p 서브프로세스도 network 콜과 마찬가지로 무제한 대기 위험이 있다(외부 CLI가
 /// hang하면 리뷰 전체가 영원히 멈춤) — README상 "초 단위~분 단위" 소요를 감안해 넉넉히 잡음.
 const CLAUDE_CLI_TIMEOUT: Duration = Duration::from_secs(600);
