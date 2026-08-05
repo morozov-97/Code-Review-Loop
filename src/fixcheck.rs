@@ -81,6 +81,29 @@ fn corroborate(
     results
 }
 
+/// LLM이 finding_id를 결과 배열에서 그냥 언급하지 않고 넘어가는 경우(FIXED라고 명시하지도
+/// 않았지만 STILL_OPEN/UNKNOWN으로도 안 나옴)를 "판정 누락"이 아니라 암묵적 "고쳐짐"으로
+/// 취급하면 안 된다 — main.rs의 재편입 루프는 결과 배열에 있는 항목만 보므로, 언급 자체가
+/// 없으면 이전에 CONFIRMED였던 P0/P1이 점수·리포트에서 조용히 사라진다. 실패는 항상
+/// STILL_OPEN(더 엄격한 방향, 사람이 다시 봄)으로 나야 한다.
+fn fill_missing_as_still_open(
+    mut results: Vec<FixStatus>,
+    prior_confirmed: &[Finding],
+) -> Vec<FixStatus> {
+    for f in prior_confirmed {
+        if !results.iter().any(|r| r.finding_id == f.id) {
+            results.push(FixStatus {
+                finding_id: f.id.clone(),
+                status: "STILL_OPEN".to_string(),
+                evidence:
+                    "fix check 응답에 이 finding_id가 없었음(누락) — 안전하게 STILL_OPEN 처리"
+                        .to_string(),
+            });
+        }
+    }
+    results
+}
+
 /// prior_confirmed 비어있으면 빈 결과(라운드 1이거나 이전에 확정 finding 없음).
 pub fn run(
     llm: &Llm,
@@ -117,7 +140,8 @@ pub fn run(
     for r in out.results.iter_mut() {
         r.status = normalize_status(&r.status);
     }
-    Ok(corroborate(out.results, prior_confirmed, &input.diff))
+    let results = fill_missing_as_still_open(out.results, prior_confirmed);
+    Ok(corroborate(results, prior_confirmed, &input.diff))
 }
 
 #[cfg(test)]
@@ -200,5 +224,37 @@ mod tests {
     fn normalize_status_falls_back_to_unknown_on_unknown_or_empty_value() {
         assert_eq!(normalize_status("IN_PROGRESS"), "UNKNOWN");
         assert_eq!(normalize_status(""), "UNKNOWN");
+    }
+
+    #[test]
+    fn fill_missing_as_still_open_synthesizes_entry_for_omitted_finding_id() {
+        // LLM이 두 finding 중 하나만 결과에 넣고 나머지는 그냥 언급을 빼먹은 경우 —
+        // "빠짐"이 "고쳐짐"으로 둔갑하면 안 되고 STILL_OPEN으로 안전하게 재편입돼야 한다.
+        let prior = vec![finding("a", "unsafe { *ptr }"), finding("b", "eval(input)")];
+        let results = vec![FixStatus {
+            finding_id: "a".to_string(),
+            status: "FIXED".to_string(),
+            evidence: "replaced with safe accessor".to_string(),
+        }];
+        let out = fill_missing_as_still_open(results, &prior);
+        assert_eq!(out.len(), 2);
+        let b = out
+            .iter()
+            .find(|r| r.finding_id == "b")
+            .expect("b가 합성돼야 함");
+        assert_eq!(b.status, "STILL_OPEN");
+    }
+
+    #[test]
+    fn fill_missing_as_still_open_leaves_fully_covered_results_untouched() {
+        let prior = vec![finding("a", "unsafe { *ptr }")];
+        let results = vec![FixStatus {
+            finding_id: "a".to_string(),
+            status: "FIXED".to_string(),
+            evidence: "e".to_string(),
+        }];
+        let out = fill_missing_as_still_open(results, &prior);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, "FIXED");
     }
 }
