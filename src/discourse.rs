@@ -16,12 +16,20 @@ finding의 claim/evidence는 원본 리뷰어가 남긴 요약일 뿐 진실이 
 diff에 실제로 존재하는 코드를 없다고 하는 주장은 반박(CHALLENGE) 또는 기각(REJECTED) 대상이다. \
 반드시 지정된 JSON 스키마로만 응답한다.";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 필드 전부 `#[serde(default)]` — 실전에서 LLM이 이 중 하나(주로 detail)를 빠뜨리면
+/// discourse 라운드 전체가 스키마 불일치로 죽고 리포트 자체가 안 나오는 걸 직접 겪었다
+/// (canary_flutter 실사용 테스트). kind/target이 비면 해당 move는 어차피 어떤 finding도
+/// 못 겨냥해 투표/카운트에서 조용히 무효표가 될 뿐이라(quantify 로직상 안전), 필드 하나
+/// 없다고 라운드 전체를 죽이는 것보다 낫다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Move {
-    #[serde(rename = "move")]
+    #[serde(rename = "move", default)]
     pub kind: String, // AGREE|CHALLENGE|CONNECT|SURFACE
+    #[serde(default)]
     pub lens: String,
+    #[serde(default)]
     pub target: String,
+    #[serde(default)]
     pub detail: String,
     #[serde(default)]
     pub new_evidence: String,
@@ -250,4 +258,32 @@ fn run_round_call(
     let dr: DiscourseRound = serde_json::from_value(v)
         .with_context(|| format!("discourse 라운드 {round} JSON 스키마 불일치"))?;
     Ok(dr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_deserializes_when_detail_is_missing() {
+        // 실전 재현: canary_flutter 리뷰에서 LLM이 detail 필드를 빠뜨려 라운드 전체가 죽었다.
+        let json = serde_json::json!({
+            "move": "CHALLENGE",
+            "lens": "tests",
+            "target": "every_line-r1-1",
+            "confidence": "high"
+        });
+        let m: Move = serde_json::from_value(json).expect("detail 없어도 파싱 성공해야 함");
+        assert_eq!(m.kind, "CHALLENGE");
+        assert_eq!(m.detail, "");
+    }
+
+    #[test]
+    fn move_deserializes_when_only_kind_is_present() {
+        let json = serde_json::json!({"move": "SURFACE"});
+        let m: Move = serde_json::from_value(json).expect("나머지 필드 다 없어도 파싱 성공해야 함");
+        assert_eq!(m.kind, "SURFACE");
+        assert_eq!(m.target, "");
+        assert_eq!(m.lens, "");
+    }
 }
