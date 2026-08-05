@@ -79,8 +79,9 @@ pub struct ReportCtx<'a> {
     pub quant: &'a QuantSummary,
     pub fix_results: &'a [FixStatus],
     pub human_voice: Option<&'a str>,
-    /// 렌즈 리뷰가 실패한 경우의 에러 메시지들 — 조용히 무시하지 않고 리포트에 남긴다.
-    pub lens_errors: &'a [String],
+    /// 렌즈 리뷰/good_things/requirements 등 부분 실패 허용 단계의 에러 메시지들 —
+    /// 조용히 무시하지 않고 리포트에 남긴다.
+    pub stage_errors: &'a [String],
 }
 
 pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
@@ -100,7 +101,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         quant,
         fix_results,
         human_voice,
-        lens_errors,
+        stage_errors,
     } = ctx;
 
     let mut md = String::new();
@@ -120,13 +121,13 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     ));
     md.push_str(&format!("선택 렌즈: {}\n\n", selected_lenses.join(", ")));
 
-    if !lens_errors.is_empty() {
+    if !stage_errors.is_empty() {
         md.push_str(&format!(
-            "## ⚠ 렌즈 리뷰 실패 ({}건)\n\n일부 렌즈가 실패해 이 결과는 부분적입니다 — \
-             아래 실패한 렌즈의 관점은 findings에 반영되지 않았습니다.\n\n",
-            lens_errors.len()
+            "## ⚠ 일부 단계 실패 ({}건)\n\n아래 단계가 실패해 이 결과는 부분적입니다 — \
+             해당 단계의 관점/판정은 findings·requirements 결과에 반영되지 않았습니다.\n\n",
+            stage_errors.len()
         ));
-        for e in lens_errors {
+        for e in stage_errors {
             md.push_str(&format!("- {}\n", e));
         }
         md.push('\n');

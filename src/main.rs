@@ -304,7 +304,7 @@ fn run_review(
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
-    let mut lens_errors: Vec<String> = Vec::new();
+    let mut stage_errors: Vec<String> = Vec::new();
     for r in lens_results {
         match r {
             Ok((id, out)) => {
@@ -315,13 +315,22 @@ fn run_review(
             }
             Err(e) => {
                 eprintln!("경고: 렌즈 리뷰 실패 — {e:#}");
-                lens_errors.push(format!("{e:#}"));
+                stage_errors.push(format!("{e:#}"));
             }
         }
     }
 
+    // good_things는 findings/score/verdict에 영향 없는 부가 정보라, 실패해도 핵심 리뷰 결과를
+    // 통째로 날릴 이유가 없다 — 경고만 남기고 빈 목록으로 계속 진행한다.
     let good_things = if sp.lens_by_id("good_things").is_some() {
-        lens::review_good_things(cheap_llm, &sp, &inp)?.good_things
+        match lens::review_good_things(cheap_llm, &sp, &inp) {
+            Ok(out) => out.good_things,
+            Err(e) => {
+                eprintln!("경고: good_things 렌즈 실패 — {e:#}");
+                stage_errors.push(format!("good_things: {e:#}"));
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -377,7 +386,17 @@ fn run_review(
         .iter()
         .filter(|f| resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED"))
         .collect();
-    let req_results = requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs)?;
+    // 실패 시 "요구사항 미제공"(None)과 같은 취급으로 넘어가되, 그 둘을 헷갈리지 않도록
+    // stage_errors에 남긴다 — requirements가 verdict의 NEEDS_CONTEXT 판정에 관여하므로
+    // 조용히 통과시키는 것보다야 낫지만, 렌즈 실패처럼 이 단계 하나로 리뷰 전체를 죽이진 않는다.
+    let req_results = match requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("경고: requirements 검증 실패 — {e:#}");
+            stage_errors.push(format!("requirements: {e:#}"));
+            None
+        }
+    };
 
     // 10단계: 정량 요약 + verdict
     let quant = quantify::summarize(
@@ -418,7 +437,7 @@ fn run_review(
         quant: &quant,
         fix_results: &fix_results,
         human_voice: hv.as_deref(),
-        lens_errors: &lens_errors,
+        stage_errors: &stage_errors,
     })?;
 
     state::write(
