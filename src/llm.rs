@@ -318,6 +318,34 @@ fn wait_with_timeout(
     })
 }
 
+/// wait_with_timeout은 stdout/stderr를 poll 시작 전에 스레드로 미리 드레인해 파이프가
+/// 꽉 차 자식이 블록되는 걸 막는다 — stdin 쓰기(수백 KB까지 갈 수 있는 diff 전체 포함)를
+/// 그 poll이 시작되기도 전에 동기적으로 하면 동일한 보호를 못 받는다. 자식이 시작 지연
+/// 등으로 stdin을 즉시 안 읽으면 CLAUDE_CLI_TIMEOUT과 무관하게 write_all이 무기한 블록될
+/// 수 있어, stdout/stderr와 대칭으로 stdin 쓰기도 별도 스레드에서 한다.
+fn write_stdin_and_wait(
+    mut child: std::process::Child,
+    stdin_data: Vec<u8>,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("stdin 열기 실패"))?;
+    let stdin_handle =
+        std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(&stdin_data) });
+
+    let out = wait_with_timeout(child, timeout)?;
+    // 정상 종료 후(타임아웃 kill이 아닌 경우)에만 쓰기 오류를 진짜 문제로 취급한다.
+    // 타임아웃으로 죽은 뒤의 broken pipe는 예상된 결과라 별도 에러로 보고할 필요 없다
+    // (이미 위에서 타임아웃 자체가 에러로 반환됨) — join 안 해도 스레드는 곧 자연 종료.
+    match stdin_handle.join() {
+        Ok(Ok(())) => Ok(out),
+        Ok(Err(e)) => Err(anyhow!("stdin 쓰기 실패: {e}")),
+        Err(_) => Err(anyhow!("stdin 쓰기 스레드 panic")),
+    }
+}
+
 /// 프롬프트는 stdin으로 전달(인자 길이 제한 회피). 서브프로세스 호출이라 캐싱은 적용되지
 /// 않으므로 ctx+task를 그냥 이어붙인다(순서만: 안정적 맥락 먼저, 가변 지시문 나중).
 fn call_claude(
@@ -339,22 +367,13 @@ fn call_claude(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("`{bin}` 실행 실패 (설치 및 PATH 확인)"))?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("stdin 열기 실패"))?;
-        if let Some(c) = ctx {
-            stdin.write_all(c.as_bytes())?;
-        }
-        stdin.write_all(task.as_bytes())?;
-    }
-    drop(child.stdin.take());
 
-    let out = wait_with_timeout(child, CLAUDE_CLI_TIMEOUT)
+    let mut stdin_data = ctx.map(|c| c.as_bytes().to_vec()).unwrap_or_default();
+    stdin_data.extend_from_slice(task.as_bytes());
+    let out = write_stdin_and_wait(child, stdin_data, CLAUDE_CLI_TIMEOUT)
         .with_context(|| format!("`{bin}` 실행 대기 실패"))?;
     if !out.status.success() {
         return Err(anyhow!(
@@ -573,5 +592,46 @@ mod tests {
         let err = wait_with_timeout(child, Duration::from_millis(300))
             .expect_err("hanging process must time out");
         assert!(err.to_string().contains("초 넘게"));
+    }
+
+    #[test]
+    fn write_stdin_and_wait_returns_output_for_a_process_that_echoes_stdin() {
+        let child = Command::new("sh")
+            .args(["-c", "cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = write_stdin_and_wait(child, b"hello".to_vec(), Duration::from_secs(5)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
+
+    #[test]
+    fn write_stdin_and_wait_times_out_promptly_instead_of_blocking_on_a_large_write() {
+        // 회귀 방지: stdin 쓰기가 wait_with_timeout의 폴 루프보다 먼저(동기) 실행되면,
+        // stdin을 전혀 안 읽는 이 자식을 상대로 파이프 버퍼보다 큰 데이터를 쓸 때
+        // CLAUDE_CLI_TIMEOUT과 무관하게 무기한 블록된다. 고쳐졌다면 wait_with_timeout의
+        // 타임아웃(여기선 1초)이 정상적으로 먼저 개입해 전체 호출이 그 근처에서 끝나야 한다
+        // — 동기 쓰기로 회귀하면 자식의 sleep 10만큼(또는 그 이상) 블록된다.
+        let child = Command::new("sh")
+            .args(["-c", "sleep 10"]) // stdin을 전혀 읽지 않음
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let large_payload = vec![b'x'; 4 * 1024 * 1024]; // 4MB, 어떤 OS 파이프 버퍼보다 큼
+        let start = std::time::Instant::now();
+        let err = write_stdin_and_wait(child, large_payload, Duration::from_secs(1))
+            .expect_err("stdin을 안 읽는 프로세스는 타임아웃으로 종료돼야 함");
+        assert!(err.to_string().contains("초 넘게"));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "wait_with_timeout의 1초 타임아웃 근처에서 끝나야 하는데 {:?} 걸림 \
+             (동기 쓰기로 회귀했을 가능성)",
+            start.elapsed()
+        );
     }
 }
