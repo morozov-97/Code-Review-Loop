@@ -28,7 +28,23 @@ pub struct PolicyResult {
 }
 
 fn matches_any(path: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|p| path.contains(p.as_str()))
+    patterns.iter().any(|p| matches_one(path, p))
+}
+
+/// "test/"처럼 슬래시로 끝나는(디렉터리 스타일) 패턴은 경로 세그먼트 경계에서만 매치되게
+/// 강제한다 — 안 그러면 "test/"가 "contest/practice.rs"의 "con[test/]..."처럼 단어 중간에서
+/// 우연히 매치돼 테스트/문서 파일이 아닌 것을 테스트 파일로 오판한다. "_test."처럼 밑줄/점을
+/// 포함한 파일명 스타일 패턴은 그 구두점 자체가 이미 경계 역할을 하므로 기존 substring 매칭을
+/// 그대로 둔다("README" 같은 단어 패턴도 동일).
+fn matches_one(path: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('/') {
+        Some(dir) => {
+            let wrapped = format!("/{path}/");
+            let needle = format!("/{dir}/");
+            wrapped.contains(&needle)
+        }
+        None => path.contains(pattern),
+    }
 }
 
 /// 테스트 동반 여부. spec.test_path_patterns 미설정 시 NOT_CONFIGURED.
@@ -176,4 +192,29 @@ pub fn check_all(spec: &Spec, input: &Input) -> Vec<PolicyResult> {
         diff_size(spec, input),
         docs_updated(spec, input),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_one_rejects_mid_word_substring_for_directory_style_patterns() {
+        assert!(!matches_one("src/contest/practice.rs", "test/"));
+        assert!(!matches_one("src/latest_utils.rs", "test/"));
+    }
+
+    #[test]
+    fn matches_one_accepts_real_directory_segment_for_directory_style_patterns() {
+        assert!(matches_one("src/test/foo.rs", "test/"));
+        assert!(matches_one("test/foo.rs", "test/"));
+        assert!(matches_one("a/b/tests/foo.rs", "tests/"));
+    }
+
+    #[test]
+    fn matches_one_keeps_plain_substring_behavior_for_non_slash_patterns() {
+        assert!(matches_one("src/foo_test.rs", "_test."));
+        assert!(matches_one("docs/README.md", "README"));
+        assert!(!matches_one("src/foo.rs", "_test."));
+    }
 }
