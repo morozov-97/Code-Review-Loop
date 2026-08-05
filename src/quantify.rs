@@ -122,3 +122,140 @@ pub fn summarize(
         time_worst_min: worst,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(id: &str, severity: &str) -> Finding {
+        Finding {
+            id: id.to_string(),
+            file: "src/x.rs".to_string(),
+            line: "1".to_string(),
+            claim: "claim".to_string(),
+            evidence: "evidence".to_string(),
+            impact: String::new(),
+            severity: severity.to_string(),
+            label: "possible bug".to_string(),
+            confidence: "high".to_string(),
+            recommendation: String::new(),
+            lens: "design".to_string(),
+            reviewer: "Reviewer".to_string(),
+        }
+    }
+
+    fn resolution(id: &str, status: &str) -> Resolution {
+        Resolution {
+            finding_id: id.to_string(),
+            status: status.to_string(),
+            merged_into: String::new(),
+            reason: String::new(),
+        }
+    }
+
+    fn policy(status: PolicyStatus) -> PolicyResult {
+        PolicyResult {
+            title: "Some policy".to_string(),
+            status,
+            evidence: String::new(),
+        }
+    }
+
+    fn requirement(status: &str) -> RequirementCheck {
+        RequirementCheck {
+            requirement: "must do X".to_string(),
+            status: status.to_string(),
+            evidence: String::new(),
+        }
+    }
+
+    // --- score() ---
+
+    #[test]
+    fn score_deducts_only_confirmed_findings_by_severity() {
+        let findings = vec![finding("a", "P0"), finding("b", "P2")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        resolved.insert("b".to_string(), resolution("b", "REJECTED"));
+        let (sc, deductions) = score(&findings, &resolved);
+        assert_eq!(sc, 75); // 100 - 25 (P0 only; P2 rejected, not deducted)
+        assert_eq!(deductions.len(), 1);
+    }
+
+    #[test]
+    fn score_treats_unresolved_findings_as_not_deducted() {
+        let findings = vec![finding("a", "P0")];
+        let (sc, deductions) = score(&findings, &HashMap::new());
+        assert_eq!(sc, 100);
+        assert!(deductions.is_empty());
+    }
+
+    #[test]
+    fn score_clamps_at_zero_instead_of_going_negative() {
+        let findings: Vec<Finding> = (0..10).map(|i| finding(&format!("p{i}"), "P0")).collect();
+        let mut resolved = HashMap::new();
+        for f in &findings {
+            resolved.insert(f.id.clone(), resolution(&f.id, "CONFIRMED"));
+        }
+        let (sc, _) = score(&findings, &resolved);
+        assert_eq!(sc, 0);
+    }
+
+    // --- verdict() ---
+
+    #[test]
+    fn verdict_request_changes_on_confirmed_p0() {
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "REQUEST_CHANGES");
+    }
+
+    #[test]
+    fn verdict_request_changes_on_policy_failure_even_with_no_findings() {
+        let policies = vec![policy(PolicyStatus::Fail)];
+        assert_eq!(
+            verdict(&[], &HashMap::new(), &policies, &None),
+            "REQUEST_CHANGES"
+        );
+    }
+
+    #[test]
+    fn verdict_comment_on_confirmed_p1_without_p0() {
+        let findings = vec![finding("a", "P1")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "COMMENT");
+    }
+
+    #[test]
+    fn verdict_needs_context_on_missing_requirement() {
+        let reqs = vec![requirement("MISSING")];
+        assert_eq!(
+            verdict(&[], &HashMap::new(), &[], &Some(reqs)),
+            "NEEDS_CONTEXT"
+        );
+    }
+
+    #[test]
+    fn verdict_needs_context_on_ambiguous_requirement() {
+        let reqs = vec![requirement("AMBIGUOUS")];
+        assert_eq!(
+            verdict(&[], &HashMap::new(), &[], &Some(reqs)),
+            "NEEDS_CONTEXT"
+        );
+    }
+
+    #[test]
+    fn verdict_approve_when_nothing_confirmed_and_no_other_signal() {
+        assert_eq!(verdict(&[], &HashMap::new(), &[], &None), "APPROVE");
+    }
+
+    #[test]
+    fn verdict_comment_on_confirmed_p2_only() {
+        let findings = vec![finding("a", "P2")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "COMMENT");
+    }
+}
