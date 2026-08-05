@@ -2,9 +2,14 @@ use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
+/// ureq는 connect/read 타임아웃 기본값이 0(무제한)이라 명시적으로 안 걸면 네트워크 정체 시
+/// 프로세스가 영원히 블록될 수 있다. CI 등 자동화 환경에서 특히 치명적.
+const HTTP_TIMEOUT_CONNECT: Duration = Duration::from_secs(10);
+const HTTP_TIMEOUT_READ: Duration = Duration::from_secs(60);
 
 /// LLM 호출 백엔드. ClaudeCli = `claude -p` 서브프로세스, OpenRouter = REST API.
 #[derive(Clone, Debug)]
@@ -353,7 +358,12 @@ fn call_openrouter(
         "messages": messages,
     });
 
-    let result = ureq::post(OPENROUTER_URL)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(HTTP_TIMEOUT_CONNECT)
+        .timeout_read(HTTP_TIMEOUT_READ)
+        .build();
+    let result = agent
+        .post(OPENROUTER_URL)
         .set("Authorization", &format!("Bearer {api_key}"))
         .set("Content-Type", "application/json")
         .send_json(body);
