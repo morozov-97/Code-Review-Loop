@@ -341,7 +341,7 @@ fn run_review(
         (Vec::new(), std::collections::HashMap::new())
     } else {
         println!("discourse 시작 (최대 {}라운드)", max_rounds);
-        discourse::run(llm, &sp, &inp, &mut findings, max_rounds)?
+        discourse::run(llm, &sp, &inp, &mut findings, max_rounds, round)?
     };
 
     // 이전 라운드(--prior) 대비: 확정됐던 finding이 이번 diff에서 고쳐졌는지 판정.
@@ -360,9 +360,19 @@ fn run_review(
             .cloned()
             .collect();
         fix_results = fixcheck::run(cheap_llm, &sp, &inp, &prior_confirmed)?;
+        // 재편입은 discourse::run(위)보다 뒤에 실행되므로 이번 라운드 discourse 검증을
+        // 거치지 않는다(의도됨 — fixcheck 자체가 "여전히 열려있는지" 판정 담당). id 자체의
+        // 중복 재편입만 막는다: discourse SURFACE id는 outer_round로 스코핑돼 이제 라운드
+        // 간 충돌은 없지만, 같은 id가 이 루프에서 두 번 안 들어가게 방어적으로 확인한다.
+        // (주의: 이번 라운드 렌즈가 같은 버그를 다른 id로 새로 발견한 경우까지는 못 잡는다
+        // — id가 다르면 서로 다른 finding으로 보여 이중 집계될 수 있음, 별도 의미론적
+        // dedup 없이는 해결 불가한 한계로 남겨둠.)
         for fr in &fix_results {
             if fr.status == "STILL_OPEN" {
                 if let Some(orig) = prior_confirmed.iter().find(|f| f.id == fr.finding_id) {
+                    if findings.iter().any(|f| f.id == orig.id) {
+                        continue;
+                    }
                     findings.push(orig.clone());
                     resolved.insert(
                         orig.id.clone(),
