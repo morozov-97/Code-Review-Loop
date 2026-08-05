@@ -87,7 +87,7 @@ fn persona_system(lens: &Lens) -> String {
     }
 }
 
-/// 렌즈 후보(always 제외) 중 diff 성격에 맞는 3~5개를 LLM으로 선정한다.
+/// 렌즈 후보(always 제외) 중 diff 성격에 맞는 1~3개를 LLM으로 선정한다.
 pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String>> {
     let optional = spec.optional_lenses();
     if optional.is_empty() {

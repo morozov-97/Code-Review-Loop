@@ -185,7 +185,7 @@ The implementation is a 12-step pipeline; the most important modules are:
 | Stage | Module |
 |---|---|
 | Input normalization / convention injection | `input.rs` |
-| Lens selection (3–5) | `lens.rs::select_lenses` |
+| Lens selection (1–3) | `lens.rs::select_lenses` |
 | Deterministic vs semantic split | `report.rs::deterministic_table` |
 | Policy checks and binary verdicts | `policy.rs` |
 | Per-lens independent review | `lens.rs::review_lens` |
@@ -200,7 +200,7 @@ The implementation is a 12-step pipeline; the most important modules are:
 
 ```mermaid
 flowchart TD
-    input["input.rs<br/><sub>normalization / convention injection</sub>"] --> lens["lens.rs::select_lenses<br/><sub>lens selection (3–5)</sub>"]
+    input["input.rs<br/><sub>normalization / convention injection</sub>"] --> lens["lens.rs::select_lenses<br/><sub>lens selection (1–3)</sub>"]
     lens --> split["report.rs::deterministic_table<br/><sub>deterministic vs semantic split</sub>"]
     split --> policy["policy.rs<br/><sub>policy checks / binary verdicts</sub>"]
     lens --> review["lens.rs::review_lens<br/><sub>per-lens independent review</sub>"]
