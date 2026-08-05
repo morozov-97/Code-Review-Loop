@@ -75,7 +75,9 @@ enum Cmd {
         lenses: Option<String>,
         #[arg(long, default_value = "runs")]
         out: PathBuf,
-        #[arg(long, default_value_t = 1)]
+        /// 렌즈별 리뷰(review_lens)는 서로 독립이라 병렬 실행 가능 — 기본값을 3으로 둬서
+        /// (선정 렌즈 1~3개 + always 렌즈 1개 규모에 맞춤) 기본 실행이 직렬로 도는 걸 피한다.
+        #[arg(long, default_value_t = 3)]
         concurrency: usize,
         /// discourse 최대 라운드 수
         #[arg(long, default_value_t = 2)]
