@@ -49,14 +49,34 @@ fn confidence_weight(c: &str) -> f64 {
 
 const VOTE_THRESHOLD: f64 = 0.6;
 
+/// 필드 전부 `#[serde(default)]` — 바로 위 Move와 동일 이유(실전에서 필드 하나 빠지면
+/// 라운드 전체가 죽는 걸 겪음)가 여기도 그대로 적용된다. status는 정규화되지 않은 값
+/// (빈 문자열 포함)이 들어와도 `normalize_status`가 UNCERTAIN으로 안전하게 떨어뜨린다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {
+    #[serde(default)]
     pub finding_id: String,
+    #[serde(default)]
     pub status: String, // CONFIRMED|REJECTED|MERGED|UNCERTAIN
     #[serde(default)]
     pub merged_into: String,
     #[serde(default)]
     pub reason: String,
+}
+
+const VALID_RESOLUTION_STATUSES: [&str; 4] = ["CONFIRMED", "REJECTED", "MERGED", "UNCERTAIN"];
+
+/// severity/requirements.status와 동일 문제: quantify.rs/report.rs가 이 필드를 정확
+/// 문자열 매칭하므로, LLM이 대소문자·공백을 벗어나면 score/verdict/report 세 군데서
+/// 동시에 조용히 사라진다(CONFIRMED도 REJECTED도 아니게 되어 아예 안 보임). 실패는
+/// 안전한 방향(UNCERTAIN — 다음 라운드에 재판정 대상)으로 나야 한다.
+fn normalize_status(raw: &str) -> String {
+    let upper = raw.trim().to_ascii_uppercase();
+    if VALID_RESOLUTION_STATUSES.contains(&upper.as_str()) {
+        upper
+    } else {
+        "UNCERTAIN".to_string()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -166,9 +186,9 @@ pub fn run(
 
         for (i, sf) in dr.surfaced.iter_mut().enumerate() {
             sf.id = format!("surface-r{}-{}", round, i + 1);
-            if sf.lens.is_empty() {
-                sf.lens = "discourse".to_string();
-            }
+            // lens는 코드가 항상 권위있게 채운다 — 일반 finding(lens.rs:221)과 동일 원칙.
+            // LLM이 스키마에 없는 lens 값을 자체적으로 채워 보내도 그대로 살아남지 않게 한다.
+            sf.lens = "discourse".to_string();
             if sf.line.trim().is_empty() {
                 sf.line = "UNKNOWN".to_string();
             }
@@ -176,7 +196,8 @@ pub fn run(
         }
         findings.extend(dr.surfaced.clone());
 
-        for r in dr.resolutions.clone() {
+        for mut r in dr.resolutions.clone() {
+            r.status = normalize_status(&r.status);
             resolved.insert(r.finding_id.clone(), r);
         }
 
@@ -285,5 +306,38 @@ mod tests {
         assert_eq!(m.kind, "SURFACE");
         assert_eq!(m.target, "");
         assert_eq!(m.lens, "");
+    }
+
+    #[test]
+    fn discourse_round_survives_resolution_missing_status() {
+        // Move.detail과 동일 계열 실패: resolutions 배열 원소 하나가 status를 빠뜨리면
+        // moves/surfaced까지 포함한 라운드 전체 파싱이 죽었다.
+        let json = serde_json::json!({
+            "moves": [],
+            "resolutions": [{"finding_id": "security-r1-1"}],
+            "surfaced": []
+        });
+        let dr: DiscourseRound =
+            serde_json::from_value(json).expect("status 없어도 라운드 전체 파싱 성공해야 함");
+        assert_eq!(dr.resolutions[0].finding_id, "security-r1-1");
+        assert_eq!(dr.resolutions[0].status, "");
+    }
+
+    #[test]
+    fn normalize_status_passes_through_valid_values() {
+        for s in ["CONFIRMED", "REJECTED", "MERGED", "UNCERTAIN"] {
+            assert_eq!(normalize_status(s), s);
+        }
+    }
+
+    #[test]
+    fn normalize_status_is_case_insensitive() {
+        assert_eq!(normalize_status("Confirmed"), "CONFIRMED");
+    }
+
+    #[test]
+    fn normalize_status_falls_back_to_uncertain_on_unknown_or_empty_value() {
+        assert_eq!(normalize_status("IN_PROGRESS"), "UNCERTAIN");
+        assert_eq!(normalize_status(""), "UNCERTAIN");
     }
 }

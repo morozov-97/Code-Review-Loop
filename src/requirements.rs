@@ -9,10 +9,16 @@ use serde::{Deserialize, Serialize};
 pub const REQ_SYSTEM: &str = "당신은 요구사항 충족 여부를 diff와 대조해 판정한다. \
 근거가 없으면 MET으로 판정하지 않는다. 반드시 지정된 JSON 스키마로만 응답한다.";
 
+/// 필드 전부 `#[serde(default)]` — discourse::Move/Resolution, fixcheck::FixStatus와
+/// 동일 이유(필드 하나 누락이 배열 전체 파싱을 죽이는 걸 방지). status 누락은
+/// normalize_status가 AMBIGUOUS로 안전하게 떨어뜨린다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequirementCheck {
+    #[serde(default)]
     pub requirement: String,
+    #[serde(default)]
     pub status: String, // MET|MISSING|AMBIGUOUS|N/A
+    #[serde(default)]
     pub evidence: String,
 }
 
@@ -93,5 +99,15 @@ mod tests {
     fn normalize_status_falls_back_to_ambiguous_on_unknown_value() {
         assert_eq!(normalize_status("Done"), "AMBIGUOUS");
         assert_eq!(normalize_status(""), "AMBIGUOUS");
+    }
+
+    #[test]
+    fn requirements_output_survives_check_missing_status() {
+        let json =
+            serde_json::json!({"requirements": [{"requirement": "로그인 시 세션 만료 처리"}]});
+        let out: RequirementsOutput =
+            serde_json::from_value(json).expect("status 없어도 파싱 성공해야 함");
+        assert_eq!(out.requirements[0].requirement, "로그인 시 세션 만료 처리");
+        assert_eq!(out.requirements[0].status, "");
     }
 }
