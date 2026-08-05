@@ -53,8 +53,8 @@ fn deterministic_table(spec: &Spec, results: &Option<serde_json::Value>) -> Stri
         };
         md.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            c.title,
-            c.tool,
+            escape_table_cell(&c.title),
+            escape_table_cell(&c.tool),
             escape_table_cell(&status),
             escape_table_cell(&evidence)
         ));
@@ -138,8 +138,8 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         for f in fix_results {
             md.push_str(&format!(
                 "| {} | {} | {} |\n",
-                f.finding_id,
-                f.status,
+                escape_table_cell(&f.finding_id),
+                escape_table_cell(&f.status),
                 escape_table_cell(&f.evidence)
             ));
         }
@@ -210,7 +210,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             f.lens,
             escape_table_cell(&f.reviewer),
             escape_table_cell(&f.file),
-            f.line,
+            escape_table_cell(&f.line),
             escape_table_cell(&f.evidence),
             escape_table_cell(&f.impact),
             escape_table_cell(&f.recommendation),
@@ -272,7 +272,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             md.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} |\n",
                 a.round,
-                m.kind,
+                escape_table_cell(&m.kind),
                 escape_table_cell(&m.lens),
                 escape_table_cell(&m.target),
                 escape_table_cell(&m.detail),
