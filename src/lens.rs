@@ -157,7 +157,22 @@ fn build_review_task(spec: &Spec, lens_title: &str, lens_guide: &str) -> String 
     )
 }
 
-pub fn review_lens(llm: &Llm, spec: &Spec, input: &Input, lens_id: &str) -> Result<LensOutput> {
+/// `--prior` 재검토에서 이전 라운드 STILL_OPEN finding이 이번 라운드 findings/resolved에
+/// 그대로 재편입된다(src/main.rs). id에 라운드 번호가 없으면 같은 렌즈가 다음 라운드에도
+/// 선정될 때 위치 기반 번호("design-1" 등)가 그대로 재발급되어 서로 다른 finding이
+/// 같은 id를 갖게 된다 — score 이중 차감·리포트 중복의 원인. round을 id에 넣어
+/// (재편입되는 finding은 항상 더 이전 라운드 번호를 갖는다는 불변식으로) 충돌을 막는다.
+fn finding_id(lens_id: &str, round: usize, index: usize) -> String {
+    format!("{lens_id}-r{round}-{index}")
+}
+
+pub fn review_lens(
+    llm: &Llm,
+    spec: &Spec,
+    input: &Input,
+    lens_id: &str,
+    round: usize,
+) -> Result<LensOutput> {
     let lens = spec
         .lens_by_id(lens_id)
         .ok_or_else(|| anyhow::anyhow!("spec에 없는 렌즈: {lens_id}"))?;
@@ -177,7 +192,7 @@ pub fn review_lens(llm: &Llm, spec: &Spec, input: &Input, lens_id: &str) -> Resu
         lens.persona_name.clone()
     };
     for (i, f) in out.findings.iter_mut().enumerate() {
-        f.id = format!("{}-{}", lens_id, i + 1);
+        f.id = finding_id(lens_id, round, i + 1);
         f.lens = lens_id.to_string();
         f.reviewer = reviewer.clone();
         f.severity = normalize_severity(&f.severity);
@@ -229,5 +244,15 @@ mod tests {
     fn normalize_severity_falls_back_to_most_severe_on_unknown_value() {
         assert_eq!(normalize_severity("Critical"), "P0");
         assert_eq!(normalize_severity(""), "P0");
+    }
+
+    #[test]
+    fn finding_id_differs_across_rounds_for_the_same_position() {
+        assert_ne!(finding_id("design", 1, 1), finding_id("design", 2, 1));
+    }
+
+    #[test]
+    fn finding_id_differs_across_positions_within_a_round() {
+        assert_ne!(finding_id("design", 1, 1), finding_id("design", 1, 2));
     }
 }
