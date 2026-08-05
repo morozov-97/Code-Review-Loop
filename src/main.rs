@@ -290,17 +290,35 @@ fn run_review(
     // 7단계: 렌즈별 독립 리뷰(봉인 후 순차 공개 — 병렬 실행해도 서로 결과를 참조하지 않으므로 동일).
     // 렌즈 하나가 실패해도(LLM 호출 에러 등) 나머지 렌즈 결과는 살리고, 실패는 리포트에
     // 남긴다 — 렌즈 하나 때문에 리뷰 전체가 부분결과 없이 중단되는 걸 피한다.
-    let lens_results: Vec<Result<(String, lens::LensOutput)>> =
-        par_map(concurrency, selected_ids.clone(), |id| {
-            let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
-            println!(
-                "  렌즈 완료: {} — finding {}건, 미검증 {}건",
-                id,
-                out.findings.len(),
-                out.unverified.len()
-            );
-            Ok((id, out))
+    // good_things는 findings에 의존하지 않는 독립 LLM 호출(diff/spec만 필요)인데도 예전엔
+    // 렌즈 리뷰가 다 끝난 뒤 순차로 실행됐다 — 별 이유 없이 리뷰 하나 분량의 왕복시간이
+    // 그대로 critical path에 더해짐. 별 스레드로 렌즈 par_map과 동시에 돌린다.
+    let (lens_results, good_things_result): (
+        Vec<Result<(String, lens::LensOutput)>>,
+        Option<Result<lens::GoodThingsOutput>>,
+    ) = std::thread::scope(|s| {
+        let lens_handle = s.spawn(|| {
+            par_map(concurrency, selected_ids.clone(), |id| {
+                let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
+                println!(
+                    "  렌즈 완료: {} — finding {}건, 미검증 {}건",
+                    id,
+                    out.findings.len(),
+                    out.unverified.len()
+                );
+                Ok((id, out))
+            })
         });
+        let good_things_handle = sp
+            .lens_by_id("good_things")
+            .is_some()
+            .then(|| s.spawn(|| lens::review_good_things(cheap_llm, &sp, &inp)));
+
+        let lens_results = lens_handle.join().expect("렌즈 리뷰 스레드 panic");
+        let good_things_result =
+            good_things_handle.map(|h| h.join().expect("good_things 스레드 panic"));
+        (lens_results, good_things_result)
+    });
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
@@ -322,17 +340,14 @@ fn run_review(
 
     // good_things는 findings/score/verdict에 영향 없는 부가 정보라, 실패해도 핵심 리뷰 결과를
     // 통째로 날릴 이유가 없다 — 경고만 남기고 빈 목록으로 계속 진행한다.
-    let good_things = if sp.lens_by_id("good_things").is_some() {
-        match lens::review_good_things(cheap_llm, &sp, &inp) {
-            Ok(out) => out.good_things,
-            Err(e) => {
-                eprintln!("경고: good_things 렌즈 실패 — {e:#}");
-                stage_errors.push(format!("good_things: {e:#}"));
-                Vec::new()
-            }
+    let good_things = match good_things_result {
+        Some(Ok(out)) => out.good_things,
+        Some(Err(e)) => {
+            eprintln!("경고: good_things 렌즈 실패 — {e:#}");
+            stage_errors.push(format!("good_things: {e:#}"));
+            Vec::new()
         }
-    } else {
-        Vec::new()
+        None => Vec::new(),
     };
 
     // 8~9단계: discourse 라운드
