@@ -87,6 +87,10 @@ fn persona_system(lens: &Lens) -> String {
     }
 }
 
+/// 프롬프트로 "1~3개"를 지시하지만 LLM이 그 지시를 안 지킬 수 있다 — 강제 상한이 없으면
+/// 렌즈 수만큼 호출이 그대로 늘어나 토큰 비용·지연이 급증한다. 코드에서 확실히 자른다.
+const MAX_AUTO_SELECTED_LENSES: usize = 3;
+
 /// 렌즈 후보(always 제외) 중 diff 성격에 맞는 1~3개를 LLM으로 선정한다.
 pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String>> {
     let optional = spec.optional_lenses();
@@ -128,9 +132,12 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
                 .collect()
         })
         .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
     let valid: Vec<String> = selected
         .into_iter()
         .filter(|id| spec.lens_by_id(id).is_some())
+        .filter(|id| seen.insert(id.clone()))
+        .take(MAX_AUTO_SELECTED_LENSES)
         .collect();
     anyhow::ensure!(
         !valid.is_empty(),
@@ -249,6 +256,62 @@ mod tests {
     #[test]
     fn finding_id_differs_across_rounds_for_the_same_position() {
         assert_ne!(finding_id("design", 1, 1), finding_id("design", 2, 1));
+    }
+
+    fn optional_lens(id: &str) -> crate::spec::Lens {
+        crate::spec::Lens {
+            id: id.to_string(),
+            title: id.to_string(),
+            guide: String::new(),
+            always: false,
+            signal: String::new(),
+            persona_name: String::new(),
+            persona_voice: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    fn test_spec(lens_ids: &[&str]) -> crate::spec::Spec {
+        crate::spec::Spec {
+            name: "test".to_string(),
+            context: String::new(),
+            lenses: lens_ids.iter().map(|id| optional_lens(id)).collect(),
+            deterministic_checks: Vec::new(),
+            labels: vec!["bug".to_string()],
+            diff_size_limit: 0,
+            test_path_patterns: Vec::new(),
+            doc_path_patterns: Vec::new(),
+        }
+    }
+
+    fn test_input() -> Input {
+        Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+        }
+    }
+
+    #[test]
+    fn select_lenses_caps_count_and_dedupes_even_if_llm_ignores_the_instruction() {
+        let spec = test_spec(&["design", "complexity", "tests", "naming", "style"]);
+        let inp = test_input();
+        // LLM이 "1~3개" 지시를 무시하고 5개(+중복 1개)를 돌려주는 상황을 흉내낸다.
+        let response =
+            r#"{"selected":["design","complexity","design","tests","naming","style"]}"#.to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+
+        let selected = select_lenses(&llm, &spec, &inp).unwrap();
+
+        assert_eq!(selected.len(), MAX_AUTO_SELECTED_LENSES);
+        let unique: std::collections::HashSet<_> = selected.iter().collect();
+        assert_eq!(unique.len(), selected.len(), "no duplicates expected");
+        assert_eq!(selected, vec!["design", "complexity", "tests"]);
     }
 
     #[test]
