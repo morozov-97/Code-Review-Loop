@@ -11,18 +11,27 @@ pub const LENS_SYSTEM: &str = "당신은 코드 리뷰어 한 명이다. \
 이미 반영된 수정이나 독립적인 docstring·타입힌트·주석·unused import 제안은 하지 않는다. \
 반드시 지정된 JSON 스키마로만 응답한다.";
 
+/// 필드 전부 `#[serde(default)]` — findings는 JSON 배열이라 하나라도 필수 필드가
+/// 빠지면 serde가 그 원소에서 통째로 실패하고, `Vec<Finding>` 파싱은 원소 하나 실패로
+/// 전체가 죽는다(같은 lens가 낸 나머지 정상 findings까지 부분실패 경로로 드롭됨).
+/// line/confidence는 이미 이 문제를 실전에서 겪어 관대화했다 — 나머지 필드도 동일 위험.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     #[serde(default)]
     pub id: String,
+    #[serde(default = "unknown")]
     pub file: String,
     #[serde(default = "unknown", deserialize_with = "string_or_number")]
     pub line: String,
+    #[serde(default)]
     pub claim: String,
+    #[serde(default)]
     pub evidence: String,
     #[serde(default)]
     pub impact: String,
-    pub severity: String, // P0-P3
+    #[serde(default)]
+    pub severity: String, // P0-P3, normalize_severity가 빈 값도 P0로 안전하게 처리
+    #[serde(default = "unknown")]
     pub label: String,
     #[serde(default = "unknown")]
     pub confidence: String,
@@ -366,5 +375,29 @@ mod tests {
         let json = r#"{"findings":[{"file":"x.dart","claim":"c","evidence":"e","severity":"P2","label":"possible bug"}]}"#;
         let out: LensOutput = serde_json::from_str(json).unwrap();
         assert_eq!(out.findings[0].line, "UNKNOWN");
+    }
+
+    #[test]
+    fn lens_output_survives_one_finding_missing_a_required_field() {
+        // 종합 리뷰에서 발견: file/claim/evidence/severity/label 중 하나라도 빠지면
+        // 전체 findings 배열이 통째로 파싱 실패해 이 lens의 다른 정상 finding까지 드롭됐다.
+        let json = r#"{"findings":[
+            {"file":"a.rs","line":"1","claim":"ok","evidence":"e","severity":"P1","label":"possible bug"},
+            {"file":"b.rs","line":"2","claim":"second finding"}
+        ]}"#;
+        let out: LensOutput =
+            serde_json::from_str(json).expect("일부 필드 누락에도 전체 파싱 성공해야 함");
+        assert_eq!(out.findings.len(), 2);
+        assert_eq!(out.findings[0].claim, "ok");
+        assert_eq!(out.findings[1].evidence, "");
+    }
+
+    #[test]
+    fn finding_severity_and_label_default_to_safe_values_when_absent() {
+        let json = r#"{"findings":[{"file":"a.rs","claim":"c"}]}"#;
+        let out: LensOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(normalize_severity(&out.findings[0].severity), "P0");
+        assert_eq!(out.findings[0].label, "UNKNOWN");
+        assert_eq!(out.findings[0].file, "a.rs");
     }
 }

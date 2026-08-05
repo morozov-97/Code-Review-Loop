@@ -10,11 +10,34 @@ pub const FIXCHECK_SYSTEM: &str =
     "당신은 이전 라운드에서 확정된 finding이 이번 diff에서 실제로 고쳐졌는지 판정한다. \
 근거 없이 FIXED로 판정하지 않는다. 확인 불가하면 UNKNOWN. 반드시 지정된 JSON 스키마로만 응답한다.";
 
+/// 필드 전부 `#[serde(default)]` — discourse::Move/Resolution과 동일 이유. status가
+/// 빠지거나 스키마 밖 값이면 "UNKNOWN"(사람이 다시 봐야 함)으로 안전하게 떨어진다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixStatus {
+    #[serde(default)]
     pub finding_id: String,
+    #[serde(default = "unknown_status")]
     pub status: String, // FIXED|STILL_OPEN|UNKNOWN
+    #[serde(default)]
     pub evidence: String,
+}
+
+fn unknown_status() -> String {
+    "UNKNOWN".to_string()
+}
+
+const VALID_FIX_STATUSES: [&str; 3] = ["FIXED", "STILL_OPEN", "UNKNOWN"];
+
+/// discourse::Resolution/requirements::normalize_status와 동일 문제: main.rs/report.rs가
+/// status를 정확 문자열 매칭하므로, 대소문자·공백이 어긋나면 STILL_OPEN 재편입도,
+/// "이전 라운드 대비" 표시도 조용히 빠진다. 실패는 UNKNOWN(사람이 다시 봐야 함)으로.
+fn normalize_status(raw: &str) -> String {
+    let upper = raw.trim().to_ascii_uppercase();
+    if VALID_FIX_STATUSES.contains(&upper.as_str()) {
+        upper
+    } else {
+        "UNKNOWN".to_string()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -89,7 +112,11 @@ pub fn run(
     let v = llm
         .json_ctx(Some(&ctx), &task, Some(FIXCHECK_SYSTEM))
         .context("fix check 실패")?;
-    let out: FixCheckOutput = serde_json::from_value(v).context("fix check JSON 스키마 불일치")?;
+    let mut out: FixCheckOutput =
+        serde_json::from_value(v).context("fix check JSON 스키마 불일치")?;
+    for r in out.results.iter_mut() {
+        r.status = normalize_status(&r.status);
+    }
     Ok(corroborate(out.results, prior_confirmed, &input.diff))
 }
 
@@ -152,5 +179,26 @@ mod tests {
         let diff = "unsafe { *ptr }";
         let out = corroborate(results, &prior, diff);
         assert_eq!(out[0].status, "STILL_OPEN");
+    }
+
+    #[test]
+    fn fix_check_output_survives_result_missing_status() {
+        let json = serde_json::json!({"results": [{"finding_id": "a"}]});
+        let out: FixCheckOutput =
+            serde_json::from_value(json).expect("status 없어도 파싱 성공해야 함");
+        assert_eq!(out.results[0].finding_id, "a");
+        assert_eq!(out.results[0].status, "UNKNOWN");
+    }
+
+    #[test]
+    fn normalize_status_is_case_insensitive() {
+        assert_eq!(normalize_status("Fixed"), "FIXED");
+        assert_eq!(normalize_status("STILL_OPEN"), "STILL_OPEN");
+    }
+
+    #[test]
+    fn normalize_status_falls_back_to_unknown_on_unknown_or_empty_value() {
+        assert_eq!(normalize_status("IN_PROGRESS"), "UNKNOWN");
+        assert_eq!(normalize_status(""), "UNKNOWN");
     }
 }
