@@ -359,14 +359,31 @@ fn run_review(
             })
             .cloned()
             .collect();
-        fix_results = fixcheck::run(cheap_llm, &sp, &inp, &prior_confirmed)?;
+        // 이번 라운드 자체가 이미 CONFIRMED한 findings를 fixcheck에 참고자료로 준다 —
+        // prior finding이 여전히 안 고쳐졌는데 이번 라운드가 동일 근본 원인을 새 id로
+        // 다시 잡았다면 SUPERSEDED로 판정해 아래서 재편입(이중 집계)하지 않는다.
+        let this_round_confirmed: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| {
+                resolved
+                    .get(&f.id)
+                    .map(|r| r.status == "CONFIRMED")
+                    .unwrap_or(false)
+            })
+            .collect();
+        fix_results = fixcheck::run(
+            cheap_llm,
+            &sp,
+            &inp,
+            &prior_confirmed,
+            &this_round_confirmed,
+        )?;
         // 재편입은 discourse::run(위)보다 뒤에 실행되므로 이번 라운드 discourse 검증을
         // 거치지 않는다(의도됨 — fixcheck 자체가 "여전히 열려있는지" 판정 담당). id 자체의
         // 중복 재편입만 막는다: discourse SURFACE id는 outer_round로 스코핑돼 이제 라운드
         // 간 충돌은 없지만, 같은 id가 이 루프에서 두 번 안 들어가게 방어적으로 확인한다.
-        // (주의: 이번 라운드 렌즈가 같은 버그를 다른 id로 새로 발견한 경우까지는 못 잡는다
-        // — id가 다르면 서로 다른 finding으로 보여 이중 집계될 수 있음, 별도 의미론적
-        // dedup 없이는 해결 불가한 한계로 남겨둠.)
+        // SUPERSEDED는 애초에 STILL_OPEN이 아니므로 아래 조건에서 자연히 재편입되지 않는다
+        // (fixcheck가 LLM 판단으로 SUPERSEDED를 잘못 매기는 경우까지는 못 잡는 잔여 한계).
         for fr in &fix_results {
             if fr.status == "STILL_OPEN" {
                 if let Some(orig) = prior_confirmed.iter().find(|f| f.id == fr.finding_id) {
