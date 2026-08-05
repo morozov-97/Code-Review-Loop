@@ -12,6 +12,14 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// 마크다운 테이블 셀에 넣기 전에 이스케이프한다 — 테이블은 파이프로 열을 나누고 줄 단위로
+/// 행을 나누므로, 셀 내용에 `|`가 있으면 열이 밀리고 개행이 있으면 행 자체가 깨진다.
+/// LLM/외부 도구가 만든 문자열(evidence, claim 등)은 이 두 문자를 포함할 수 있다.
+fn escape_table_cell(s: &str) -> String {
+    let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+    normalized.replace('|', "\\|").replace('\n', "<br>")
+}
+
 fn severity_rank(s: &str) -> u8 {
     match s {
         "P0" => 0,
@@ -45,7 +53,10 @@ fn deterministic_table(spec: &Spec, results: &Option<serde_json::Value>) -> Stri
         };
         md.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            c.title, c.tool, status, evidence
+            c.title,
+            c.tool,
+            escape_table_cell(&status),
+            escape_table_cell(&evidence)
         ));
     }
     md
@@ -126,7 +137,9 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         for f in fix_results {
             md.push_str(&format!(
                 "| {} | {} | {} |\n",
-                f.finding_id, f.status, f.evidence
+                f.finding_id,
+                f.status,
+                escape_table_cell(&f.evidence)
             ));
         }
         md.push('\n');
@@ -138,7 +151,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             "| {} | {} | {} |\n",
             p.title,
             p.status.label(),
-            p.evidence
+            escape_table_cell(&p.evidence)
         ));
     }
     md.push('\n');
@@ -167,7 +180,9 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             for r in reqs {
                 md.push_str(&format!(
                     "| {} | {} | {} |\n",
-                    r.requirement, r.status, r.evidence
+                    escape_table_cell(&r.requirement),
+                    r.status,
+                    escape_table_cell(&r.evidence)
                 ));
             }
             md.push('\n');
@@ -190,15 +205,15 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             "| {} | {} | {} | {} | {} | {}:{} | {} | {} | {} | {} |\n",
             f.id,
             f.severity,
-            f.label,
+            escape_table_cell(&f.label),
             f.lens,
-            f.reviewer,
-            f.file,
+            escape_table_cell(&f.reviewer),
+            escape_table_cell(&f.file),
             f.line,
-            f.evidence,
-            f.impact,
-            f.recommendation,
-            discourse_result
+            escape_table_cell(&f.evidence),
+            escape_table_cell(&f.impact),
+            escape_table_cell(&f.recommendation),
+            escape_table_cell(discourse_result)
         ));
     }
     md.push('\n');
@@ -235,7 +250,9 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         for g in good_things {
             md.push_str(&format!(
                 "| {} | {} | {} |\n",
-                g.file_line, g.practice, g.why
+                escape_table_cell(&g.file_line),
+                escape_table_cell(&g.practice),
+                escape_table_cell(&g.why)
             ));
         }
         md.push('\n');
@@ -253,7 +270,12 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         for m in &a.moves {
             md.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} |\n",
-                a.round, m.kind, m.lens, m.target, m.detail, m.new_evidence
+                a.round,
+                m.kind,
+                escape_table_cell(&m.lens),
+                escape_table_cell(&m.target),
+                escape_table_cell(&m.detail),
+                escape_table_cell(&m.new_evidence)
             ));
         }
     }
@@ -318,4 +340,36 @@ pub fn write_improve(out_dir: &Path, suggestions: &[Suggestion]) -> Result<PathB
     let path = out_dir.join("improve.md");
     std::fs::write(&path, md).with_context(|| format!("{} 쓰기 실패", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_table_cell_escapes_pipe() {
+        assert_eq!(
+            escape_table_cell("value with | pipe"),
+            "value with \\| pipe"
+        );
+    }
+
+    #[test]
+    fn escape_table_cell_converts_newlines_to_br() {
+        assert_eq!(escape_table_cell("line1\nline2"), "line1<br>line2");
+        assert_eq!(escape_table_cell("line1\r\nline2"), "line1<br>line2");
+    }
+
+    #[test]
+    fn escape_table_cell_leaves_plain_text_untouched() {
+        assert_eq!(
+            escape_table_cell("nothing special here"),
+            "nothing special here"
+        );
+    }
+
+    #[test]
+    fn escape_table_cell_handles_both_at_once() {
+        assert_eq!(escape_table_cell("a | b\nc | d"), "a \\| b<br>c \\| d");
+    }
 }
