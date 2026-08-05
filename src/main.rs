@@ -15,7 +15,7 @@ mod semgrep;
 mod spec;
 mod state;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use lens::Finding;
 use llm::Llm;
@@ -369,7 +369,7 @@ where
                 let handles: Vec<_> = chunk.into_iter().map(|item| s.spawn(|| f(item))).collect();
                 handles
                     .into_iter()
-                    .map(|h| h.join().map_err(|_| anyhow!("worker thread panicked")))
+                    .map(|h| h.join().map_err(|_| anyhow!("worker thread panicked")).and_then(|r| r))
                     .collect()
             });
             for r in results {

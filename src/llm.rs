@@ -167,9 +167,9 @@ impl Llm {
                     last = Some(e);
                     if self.verbose {
                         match last.as_ref() {
-                            Some(error) => eprintln!("[json retry {}] {error}", attempt + 1, self.retries),
+                            Some(error) => eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries),
                             None => {
-                                eprintln!("[json retry {}] unknown json retry error", attempt + 1, self.retries);
+                                eprintln!("[json retry {}/{}] unknown json retry error", attempt + 1, self.retries);
                             }
                         }
                     }
