@@ -42,6 +42,20 @@ pub fn todo_sections(diff: &str) -> Vec<String> {
     diff.lines()
         .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
         .filter(|l| markers.iter().any(|m| l.contains(m)))
-        .map(|l| l.trim_start_matches('+').trim().to_string())
+        .map(|l| l.strip_prefix('+').unwrap_or(l).trim().to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn todo_sections_keeps_a_leading_plus_that_belongs_to_the_code_itself() {
+        // added line's own content is itself a markdown "+ " bullet (common list marker),
+        // so the diff line is "++ TODO ..." — the outer '+' is only the diff marker.
+        let diff = "+++ b/CHANGELOG.md\n++ TODO: revisit this bullet\n";
+        let sections = todo_sections(diff);
+        assert_eq!(sections, vec!["+ TODO: revisit this bullet".to_string()]);
+    }
 }
