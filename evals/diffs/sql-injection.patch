@@ -1,0 +1,10 @@
+diff --git a/src/users.rs b/src/users.rs
+--- a/src/users.rs
++++ b/src/users.rs
+@@ -10,7 +10,10 @@ pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>> {
+-    let query = "SELECT id, email FROM users WHERE username = ?";
+-    conn.query_row(query, params![username], |row| { ... })
++    // switched to a raw format string while debugging locally, forgot to revert
++    let query = format!("SELECT id, email FROM users WHERE username = '{}'", username);
++    conn.query_row(&query, [], |row| { ... })
+ }
