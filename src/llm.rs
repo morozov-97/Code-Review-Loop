@@ -10,6 +10,9 @@ pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
 /// 프로세스가 영원히 블록될 수 있다. CI 등 자동화 환경에서 특히 치명적.
 const HTTP_TIMEOUT_CONNECT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT_READ: Duration = Duration::from_secs(60);
+/// claude -p 서브프로세스도 network 콜과 마찬가지로 무제한 대기 위험이 있다(외부 CLI가
+/// hang하면 리뷰 전체가 영원히 멈춤) — README상 "초 단위~분 단위" 소요를 감안해 넉넉히 잡음.
+const CLAUDE_CLI_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// LLM 호출 백엔드. ClaudeCli = `claude -p` 서브프로세스, OpenRouter = REST API,
 /// Fixture = 테스트 전용(네트워크/서브프로세스 없이 미리 정해둔 응답을 순서대로 반환).
@@ -266,6 +269,59 @@ impl Llm {
     }
 }
 
+/// `child.wait_with_output()`은 self를 소비해서 폴링 루프와 못 섞는다 — stdout/stderr를
+/// 먼저 별도 스레드로 읽어들이고(파이프가 꽉 차 자식이 블록되는 걸 방지), `try_wait()`으로
+/// 폴링하다 타임아웃되면 kill한다.
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stdout_pipe {
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stderr_pipe {
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+        }
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "claude CLI 호출이 {}초 넘게 응답 없어 강제 종료함",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| anyhow!("stdout 리더 스레드 panic"))?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| anyhow!("stderr 리더 스레드 panic"))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// 프롬프트는 stdin으로 전달(인자 길이 제한 회피). 서브프로세스 호출이라 캐싱은 적용되지
 /// 않으므로 ctx+task를 그냥 이어붙인다(순서만: 안정적 맥락 먼저, 가변 지시문 나중).
 fn call_claude(
@@ -302,7 +358,8 @@ fn call_claude(
     }
     drop(child.stdin.take());
 
-    let out = child.wait_with_output()?;
+    let out = wait_with_timeout(child, CLAUDE_CLI_TIMEOUT)
+        .with_context(|| format!("`{bin}` 실행 대기 실패"))?;
     if !out.status.success() {
         return Err(anyhow!(
             "claude 종료코드 {:?}: {}",
@@ -484,5 +541,36 @@ pub fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_with_timeout_returns_output_when_process_finishes_in_time() {
+        let child = Command::new("sh")
+            .args(["-c", "echo hi"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = wait_with_timeout(child, Duration::from_secs(5)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    #[test]
+    fn wait_with_timeout_kills_and_errors_when_process_hangs() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let err = wait_with_timeout(child, Duration::from_millis(300))
+            .expect_err("hanging process must time out");
+        assert!(err.to_string().contains("초 넘게"));
     }
 }
