@@ -151,6 +151,7 @@ pub fn run(
             if sf.line.trim().is_empty() {
                 sf.line = "UNKNOWN".to_string();
             }
+            sf.severity = crate::lens::normalize_severity(&sf.severity);
         }
         findings.extend(dr.surfaced.clone());
 
