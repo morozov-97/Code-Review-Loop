@@ -261,10 +261,14 @@ fn run_review(
     // 4단계: 렌즈 선정
     let optional_selected: Vec<String> = match lenses_arg {
         Some(s) => {
+            // 중복 지정("--lenses design,design")을 걸러낸다 — review_lens는 렌즈별로
+            // 한 번만 불려야 finding id(위치 기반 번호)가 그 안에서 서로 겹치지 않는다.
+            let mut seen = std::collections::HashSet::new();
             let ids: Vec<String> = s
                 .split(',')
                 .map(|x| x.trim().to_string())
                 .filter(|x| !x.is_empty())
+                .filter(|x| seen.insert(x.clone()))
                 .collect();
             for id in &ids {
                 anyhow::ensure!(sp.lens_by_id(id).is_some(), "spec에 없는 렌즈 id: {id}");
@@ -284,7 +288,7 @@ fn run_review(
     // 7단계: 렌즈별 독립 리뷰(봉인 후 순차 공개 — 병렬 실행해도 서로 결과를 참조하지 않으므로 동일)
     let lens_outputs: Vec<(String, lens::LensOutput)> =
         par_map(concurrency, selected_ids.clone(), |id| {
-            let out = lens::review_lens(llm, &sp, &inp, &id)?;
+            let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
             println!(
                 "  렌즈 완료: {} — finding {}건, 미검증 {}건",
                 id,
