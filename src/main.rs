@@ -545,3 +545,97 @@ mod par_map_tests {
         assert_eq!(sorted, vec![2, 4, 6, 8, 10]);
     }
 }
+
+/// 실제 API 없이 12단계 파이프라인이 실제로 맞물려 도는지 확인하는 최소 E2E 테스트.
+/// Llm::fixture는 호출 순서대로 응답을 꺼내므로 concurrency=1(직렬)로만 결정적이다 —
+/// 시나리오도 그에 맞춰 렌즈 1개(always만, optional 없음 → 렌즈 선정 LLM 호출 자체가
+/// 생략됨)·good_things 렌즈 없음·requirements 없음·--prior 없음·human-voice 없음으로
+/// 최소화해서, 정확히 두 번의 LLM 호출(렌즈 리뷰 1회 + discourse 1라운드)만 필요하게 짰다.
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use crate::llm::Llm;
+    use std::io::Write as _;
+
+    fn write_file(path: &std::path::Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn run_review_end_to_end_with_fixture_llm_produces_expected_report() {
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-review-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "e2e test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "test_lens"
+title = "Test Lens"
+guide = "test"
+always = true
+"#,
+        );
+
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+
+        let out_dir = dir.join("out");
+
+        // 1) review_lens("test_lens", round=1) 응답 — id는 review_lens가 덮어쓰므로 임의값으로 둬도 됨.
+        let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"10","claim":"test claim","evidence":"test evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
+        // 2) discourse round 1 응답 — CHALLENGE를 포함해야 자동 재요청(3번째 호출)이 안 붙는다.
+        //    target id는 review_lens가 실제로 부여하는 "test_lens-r1-1"과 맞춰야 resolutions가 먹는다.
+        let discourse_response = r#"{"moves":[{"move":"CHALLENGE","lens":"reviewer","target":"test_lens-r1-1","detail":"needs more evidence","new_evidence":"","confidence":"medium"}],"resolutions":[{"finding_id":"test_lens-r1-1","status":"CONFIRMED","merged_into":"","reason":"confirmed for e2e test"}],"surfaced":[]}"#.to_string();
+
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![lens_response, discourse_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm, &cheap_llm, &spec_path, &diff_path, &None, &None, &None, &None, &out_dir,
+            1, // concurrency=1: fixture 큐 순서가 곧 호출 순서가 되도록 강제
+            1, // max_rounds
+            &None, false,
+        )
+        .expect("run_review should complete end-to-end against the fixture LLM");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            report.contains("Verdict: COMMENT"),
+            "expected COMMENT verdict (confirmed P1, no P0):\n{report}"
+        );
+        assert!(
+            report.contains("Score: 88/100"),
+            "expected score 88 (100 - 12 for one confirmed P1):\n{report}"
+        );
+        assert!(
+            report.contains("test claim"),
+            "expected the confirmed finding's claim to appear in the report:\n{report}"
+        );
+        assert!(
+            std::fs::metadata(out_dir.join("state.json")).is_ok(),
+            "state.json should be written for --prior to pick up next round"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
