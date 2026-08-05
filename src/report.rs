@@ -68,6 +68,8 @@ pub struct ReportCtx<'a> {
     pub quant: &'a QuantSummary,
     pub fix_results: &'a [FixStatus],
     pub human_voice: Option<&'a str>,
+    /// 렌즈 리뷰가 실패한 경우의 에러 메시지들 — 조용히 무시하지 않고 리포트에 남긴다.
+    pub lens_errors: &'a [String],
 }
 
 pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
@@ -87,6 +89,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         quant,
         fix_results,
         human_voice,
+        lens_errors,
     } = ctx;
 
     let mut md = String::new();
@@ -105,6 +108,18 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         input.removed_lines,
     ));
     md.push_str(&format!("선택 렌즈: {}\n\n", selected_lenses.join(", ")));
+
+    if !lens_errors.is_empty() {
+        md.push_str(&format!(
+            "## ⚠ 렌즈 리뷰 실패 ({}건)\n\n일부 렌즈가 실패해 이 결과는 부분적입니다 — \
+             아래 실패한 렌즈의 관점은 findings에 반영되지 않았습니다.\n\n",
+            lens_errors.len()
+        ));
+        for e in lens_errors {
+            md.push_str(&format!("- {}\n", e));
+        }
+        md.push('\n');
+    }
 
     if !fix_results.is_empty() {
         md.push_str("## 이전 라운드 대비\n\n| Finding | Status | Evidence |\n|---|---|---|\n");

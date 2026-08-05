@@ -287,8 +287,10 @@ fn run_review(
     }
     println!("선정 렌즈: {}", selected_ids.join(", "));
 
-    // 7단계: 렌즈별 독립 리뷰(봉인 후 순차 공개 — 병렬 실행해도 서로 결과를 참조하지 않으므로 동일)
-    let lens_outputs: Vec<(String, lens::LensOutput)> =
+    // 7단계: 렌즈별 독립 리뷰(봉인 후 순차 공개 — 병렬 실행해도 서로 결과를 참조하지 않으므로 동일).
+    // 렌즈 하나가 실패해도(LLM 호출 에러 등) 나머지 렌즈 결과는 살리고, 실패는 리포트에
+    // 남긴다 — 렌즈 하나 때문에 리뷰 전체가 부분결과 없이 중단되는 걸 피한다.
+    let lens_results: Vec<Result<(String, lens::LensOutput)>> =
         par_map(concurrency, selected_ids.clone(), |id| {
             let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
             println!(
@@ -298,14 +300,23 @@ fn run_review(
                 out.unverified.len()
             );
             Ok((id, out))
-        })?;
+        });
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
-    for (id, out) in lens_outputs {
-        findings.extend(out.findings);
-        for u in out.unverified {
-            unverified.push((id.clone(), u));
+    let mut lens_errors: Vec<String> = Vec::new();
+    for r in lens_results {
+        match r {
+            Ok((id, out)) => {
+                findings.extend(out.findings);
+                for u in out.unverified {
+                    unverified.push((id.clone(), u));
+                }
+            }
+            Err(e) => {
+                eprintln!("경고: 렌즈 리뷰 실패 — {e:#}");
+                lens_errors.push(format!("{e:#}"));
+            }
         }
     }
 
@@ -407,6 +418,7 @@ fn run_review(
         quant: &quant,
         fix_results: &fix_results,
         human_voice: hv.as_deref(),
+        lens_errors: &lens_errors,
     })?;
 
     state::write(
@@ -472,19 +484,22 @@ fn prepare_out(p: &PathBuf) -> Result<PathBuf> {
 }
 
 /// concurrency 만큼 스레드를 묶어 순차 실행(청크 단위 배리어).
-fn par_map<T, R, F>(concurrency: usize, items: Vec<T>, f: F) -> Result<Vec<R>>
+/// 항목별 결과를 개별 Result로 모은다(하나 실패해도 나머지는 계속 처리) — 호출부가
+/// 부분 실패를 그대로 무시할지, 에러만 걸러내 계속 진행할지 결정한다. 과거엔 첫 실패에서
+/// 전체를 중단시켰는데, 렌즈 리뷰처럼 서로 독립적인 항목엔 과함(다른 렌즈까지 다 날아감).
+fn par_map<T, R, F>(concurrency: usize, items: Vec<T>, f: F) -> Vec<Result<R>>
 where
     T: Send,
     R: Send,
     F: Fn(T) -> Result<R> + Sync,
 {
     let c = concurrency.max(1);
-    let mut out: Vec<R> = Vec::new();
+    let mut out: Vec<Result<R>> = Vec::new();
     let mut rest = items;
     while !rest.is_empty() {
         let take = c.min(rest.len());
         let chunk: Vec<T> = rest.drain(..take).collect();
-        let results: Vec<Result<R>> = std::thread::scope(|s| {
+        let mut results: Vec<Result<R>> = std::thread::scope(|s| {
             let handles: Vec<_> = chunk.into_iter().map(|item| s.spawn(|| f(item))).collect();
             handles
                 .into_iter()
@@ -495,9 +510,38 @@ where
                 })
                 .collect()
         });
-        for r in results {
-            out.push(r?);
-        }
+        out.append(&mut results);
     }
-    Ok(out)
+    out
+}
+
+#[cfg(test)]
+mod par_map_tests {
+    use super::*;
+
+    #[test]
+    fn par_map_keeps_successful_results_when_one_item_fails() {
+        let items = vec![1, 2, 3];
+        let results = par_map(2, items, |i| {
+            if i == 2 {
+                Err(anyhow!("boom on {i}"))
+            } else {
+                Ok(i * 10)
+            }
+        });
+        assert_eq!(results.len(), 3);
+        let (oks, errs): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+        assert_eq!(oks.len(), 2);
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn par_map_preserves_all_successes_when_nothing_fails() {
+        let items = vec![1, 2, 3, 4, 5];
+        let results = par_map(3, items, |i| Ok::<_, anyhow::Error>(i * 2));
+        let values: Vec<i32> = results.into_iter().map(|r| r.unwrap()).collect();
+        let mut sorted = values.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![2, 4, 6, 8, 10]);
+    }
 }
