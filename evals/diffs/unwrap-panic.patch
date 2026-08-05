@@ -1,0 +1,9 @@
+diff --git a/src/api.rs b/src/api.rs
+--- a/src/api.rs
++++ b/src/api.rs
+@@ -14,7 +14,7 @@ pub fn handle_request(req: &Request) -> Response {
+ pub fn parse_page_param(req: &Request) -> u32 {
+     let raw = req.query_param("page").unwrap_or("1");
+-    raw.parse::<u32>().unwrap_or(1)
++    raw.parse::<u32>().unwrap()
+ }
