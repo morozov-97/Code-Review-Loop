@@ -29,13 +29,32 @@ fn parse_diff_stats(diff: &str) -> (Vec<String>, usize, usize) {
     let mut files: Vec<String> = Vec::new();
     let mut added = 0usize;
     let mut removed = 0usize;
+    // 삭제-only 파일은 "+++ /dev/null"이라 새 경로가 없다 — 직전 "--- a/X" 줄의 경로를
+    // 대신 써야 changed_files가 비지 않는다(순수 삭제 diff가 파이프라인 시작조차 못 하던 버그).
+    let mut pending_old_path: Option<String> = None;
     for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            let path = rest.strip_prefix("a/").unwrap_or(rest);
+            pending_old_path = if path == "/dev/null" {
+                None
+            } else {
+                Some(path.to_string())
+            };
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("+++ ") {
             // trim_start_matches("b/")는 반복 제거라 실제 경로가 b/로 시작하는 레포(예: 최상위
             // 디렉터리명이 b)에서 diff 마커 b/까지 잘못 두 번 벗겨낸다 — strip_prefix로 1회만 제거.
             let path = rest.strip_prefix("b/").unwrap_or(rest);
-            if path != "/dev/null" && !files.contains(&path.to_string()) {
-                files.push(path.to_string());
+            let resolved = if path == "/dev/null" {
+                pending_old_path.take()
+            } else {
+                Some(path.to_string())
+            };
+            if let Some(p) = resolved {
+                if !files.contains(&p) {
+                    files.push(p);
+                }
             }
             continue;
         }
@@ -119,5 +138,42 @@ mod tests {
                      +new\n";
         let (files, _, _) = parse_diff_stats(diff);
         assert_eq!(files, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_diff_stats_captures_delete_only_files_via_old_path() {
+        let diff = "diff --git a/src/dead_code.rs b/src/dead_code.rs\n\
+                     deleted file mode 100644\n\
+                     --- a/src/dead_code.rs\n\
+                     +++ /dev/null\n\
+                     @@ -1,3 +0,0 @@\n\
+                     -fn unused() {}\n\
+                     -// dead\n\
+                     -// code\n";
+        let (files, added, removed) = parse_diff_stats(diff);
+        assert_eq!(files, vec!["src/dead_code.rs".to_string()]);
+        assert_eq!(added, 0);
+        assert_eq!(removed, 3);
+    }
+
+    #[test]
+    fn parse_diff_stats_handles_mixed_delete_and_modify() {
+        let diff = "diff --git a/src/old.rs b/src/old.rs\n\
+                     deleted file mode 100644\n\
+                     --- a/src/old.rs\n\
+                     +++ /dev/null\n\
+                     @@ -1,1 +0,0 @@\n\
+                     -gone\n\
+                     diff --git a/src/main.rs b/src/main.rs\n\
+                     --- a/src/main.rs\n\
+                     +++ b/src/main.rs\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+        let (files, _, _) = parse_diff_stats(diff);
+        assert_eq!(
+            files,
+            vec!["src/old.rs".to_string(), "src/main.rs".to_string()]
+        );
     }
 }
