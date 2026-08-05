@@ -292,12 +292,12 @@ pub fn write_improve(out_dir: &Path, suggestions: &[Suggestion]) -> Result<PathB
         ));
         md.push_str(&format!("{}\n\n", s.suggestion_content));
         md.push_str(&format!(
-            "```{}\n// before\n{}\n```\n\n",
-            s.language, s.existing_code
+            "{}\n\n",
+            crate::promptctx::fenced(&s.language, &format!("// before\n{}", s.existing_code))
         ));
         md.push_str(&format!(
-            "```{}\n// after\n{}\n```\n\n",
-            s.language, s.improved_code
+            "{}\n\n",
+            crate::promptctx::fenced(&s.language, &format!("// after\n{}", s.improved_code))
         ));
     }
     let path = out_dir.join("improve.md");

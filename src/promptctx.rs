@@ -4,7 +4,7 @@ use crate::spec::Spec;
 /// `content` 안 최장 연속 백틱보다 긴 펜스로 감싼다. diff(신뢰할 수 없는 외부 입력) 안에
 /// 백틱 3개 이상 시퀀스를 넣어 코드펜스를 조기 종료시키고 그 뒤에 가짜 지시문을 이어붙이는
 /// prompt-injection을 막는다 — 고정 ``` 펜스는 content가 그 시퀀스를 포함하면 무력화된다.
-fn fenced(lang: &str, content: &str) -> String {
+pub(crate) fn fenced(lang: &str, content: &str) -> String {
     let max_run = content
         .as_bytes()
         .split(|&b| b != b'`')
