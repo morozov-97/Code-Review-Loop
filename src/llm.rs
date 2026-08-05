@@ -6,10 +6,11 @@ use std::time::Duration;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
-/// ureq는 connect/read 타임아웃 기본값이 0(무제한)이라 명시적으로 안 걸면 네트워크 정체 시
-/// 프로세스가 영원히 블록될 수 있다. CI 등 자동화 환경에서 특히 치명적.
-const HTTP_TIMEOUT_CONNECT: Duration = Duration::from_secs(10);
-const HTTP_TIMEOUT_READ: Duration = Duration::from_secs(60);
+/// ureq는 타임아웃 기본값이 무제한이라 명시적으로 안 걸면 네트워크 정체 시 프로세스가
+/// 영원히 블록될 수 있다. CI 등 자동화 환경에서 특히 치명적 — DNS부터 응답 본문 수신까지
+/// 전체를 하나의 상한으로 묶는 게(개별 구간별 상한보다) "절대 이 시간 넘게 안 멈춘다"는
+/// 보장이 더 직접적이라 timeout_global 하나로 건다.
+const HTTP_TIMEOUT_GLOBAL: Duration = Duration::from_secs(90);
 /// claude -p 서브프로세스도 network 콜과 마찬가지로 무제한 대기 위험이 있다(외부 CLI가
 /// hang하면 리뷰 전체가 영원히 멈춤) — README상 "초 단위~분 단위" 소요를 감안해 넉넉히 잡음.
 const CLAUDE_CLI_TIMEOUT: Duration = Duration::from_secs(600);
@@ -447,29 +448,34 @@ fn call_openrouter(
         "messages": messages,
     });
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(HTTP_TIMEOUT_CONNECT)
-        .timeout_read(HTTP_TIMEOUT_READ)
+    // ureq 3.x: AgentBuilder가 Config/ConfigBuilder로 바뀌었다. http_status_as_error(false)로
+    // 4xx/5xx도 Err가 아니라 Ok(response)로 받아서, 기존과 동일하게 상태코드+본문을 함께
+    // 우리 에러 메시지에 담을 수 있게 한다(기본값이면 본문 없이 Err만 와서 body를 못 읽음).
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT_GLOBAL))
+        .http_status_as_error(false)
         .build();
+    let agent: ureq::Agent = config.into();
     let result = agent
         .post(OPENROUTER_URL)
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .set("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
         .send_json(body);
 
-    let resp = match result {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            return Err(anyhow!(
-                "openrouter 응답 코드 {code}: {}",
-                truncate(&body, 400)
-            ));
-        }
-        Err(e) => return Err(anyhow!("openrouter 호출 실패: {e}")),
-    };
+    let mut resp = result.map_err(|e| anyhow!("openrouter 호출 실패: {e}"))?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let body_text = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(anyhow!(
+            "openrouter 응답 코드 {code}: {}",
+            truncate(&body_text, 400)
+        ));
+    }
 
-    let v: serde_json::Value = resp.into_json().context("openrouter 응답 JSON 파싱 실패")?;
+    let v: serde_json::Value = resp
+        .body_mut()
+        .read_json()
+        .context("openrouter 응답 JSON 파싱 실패")?;
     let content = v
         .get("choices")
         .and_then(|c| c.get(0))
