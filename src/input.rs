@@ -59,7 +59,10 @@ pub fn normalize(
         .with_context(|| format!("diff 파일 읽기 실패: {}", diff_path.display()))?;
     anyhow::ensure!(!diff.trim().is_empty(), "diff가 비어 있음");
     let (changed_files, added_lines, removed_lines) = parse_diff_stats(&diff);
-    anyhow::ensure!(!changed_files.is_empty(), "diff에서 변경 파일을 찾지 못함(unified diff 형식 확인)");
+    anyhow::ensure!(
+        !changed_files.is_empty(),
+        "diff에서 변경 파일을 찾지 못함(unified diff 형식 확인)"
+    );
 
     let requirements = read_opt(requirements_path)?;
     let conventions = read_opt(conventions_path)?;

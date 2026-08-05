@@ -25,7 +25,10 @@ pub fn shared_context(spec: &Spec, input: &Input) -> String {
     );
     c.push_str(&format!("## 프로젝트 맥락\n{}\n\n", spec.context));
     if let Some(conv) = &input.conventions {
-        c.push_str(&format!("## repo 컨벤션(원문, 명시적 요구사항 다음으로 우선)\n{}\n\n", conv));
+        c.push_str(&format!(
+            "## repo 컨벤션(원문, 명시적 요구사항 다음으로 우선)\n{}\n\n",
+            conv
+        ));
     }
     if let Some(req) = &input.requirements {
         c.push_str(&format!("## 요구사항\n{}\n\n", req));

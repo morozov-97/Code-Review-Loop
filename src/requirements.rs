@@ -23,7 +23,12 @@ struct RequirementsOutput {
 }
 
 /// requirements 미제공 시 None 반환(검증 대상 없음, N/A 나열하지 않음).
-pub fn verify(llm: &Llm, spec: &Spec, input: &Input, confirmed: &[&Finding]) -> Result<Option<Vec<RequirementCheck>>> {
+pub fn verify(
+    llm: &Llm,
+    spec: &Spec,
+    input: &Input,
+    confirmed: &[&Finding],
+) -> Result<Option<Vec<RequirementCheck>>> {
     if input.requirements.is_none() {
         return Ok(None);
     }
@@ -43,7 +48,9 @@ pub fn verify(llm: &Llm, spec: &Spec, input: &Input, confirmed: &[&Finding]) -> 
          \"evidence\":\"file:line 근거 또는 누락/모호 사유\"}}]}}\n",
         fs = if findings_summary.is_empty() { "(없음)".to_string() } else { findings_summary },
     );
-    let v = llm.json_ctx(Some(&ctx), &task, Some(REQ_SYSTEM)).context("요구사항 검증 실패")?;
+    let v = llm
+        .json_ctx(Some(&ctx), &task, Some(REQ_SYSTEM))
+        .context("요구사항 검증 실패")?;
     let out: RequirementsOutput =
         serde_json::from_value(v).context("요구사항 검증 JSON 스키마 불일치")?;
     Ok(Some(out.requirements))

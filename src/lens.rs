@@ -81,7 +81,11 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
     let catalog = optional
         .iter()
         .map(|l| {
-            let who = if l.persona_name.is_empty() { l.title.clone() } else { format!("{} ({})", l.title, l.persona_name) };
+            let who = if l.persona_name.is_empty() {
+                l.title.clone()
+            } else {
+                format!("{} ({})", l.title, l.persona_name)
+            };
             format!("- id=\"{}\" | {} — 선정 신호: {}", l.id, who, l.signal)
         })
         .collect::<Vec<_>>()
@@ -94,18 +98,29 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
         catalog = catalog
     );
     let v = llm
-        .json_ctx(Some(&ctx), &task, Some("렌즈 선정만 수행하는 Tech Lead다. 반드시 JSON 스키마로만 응답한다."))
+        .json_ctx(
+            Some(&ctx),
+            &task,
+            Some("렌즈 선정만 수행하는 Tech Lead다. 반드시 JSON 스키마로만 응답한다."),
+        )
         .context("렌즈 선정 실패")?;
     let selected: Vec<String> = v
         .get("selected")
         .and_then(|s| s.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let valid: Vec<String> = selected
         .into_iter()
         .filter(|id| spec.lens_by_id(id).is_some())
         .collect();
-    anyhow::ensure!(!valid.is_empty(), "렌즈 선정 결과가 비어있거나 spec에 없는 id뿐");
+    anyhow::ensure!(
+        !valid.is_empty(),
+        "렌즈 선정 결과가 비어있거나 spec에 없는 id뿐"
+    );
     Ok(valid)
 }
 
@@ -139,9 +154,13 @@ pub fn review_lens(llm: &Llm, spec: &Spec, input: &Input, lens_id: &str) -> Resu
     let v = llm
         .json_ctx(Some(&ctx), &task, Some(&system))
         .with_context(|| format!("렌즈 리뷰 실패: {lens_id}"))?;
-    let mut out: LensOutput =
-        serde_json::from_value(v).with_context(|| format!("렌즈 리뷰 JSON 스키마 불일치: {lens_id}"))?;
-    let reviewer = if lens.persona_name.is_empty() { lens.title.clone() } else { lens.persona_name.clone() };
+    let mut out: LensOutput = serde_json::from_value(v)
+        .with_context(|| format!("렌즈 리뷰 JSON 스키마 불일치: {lens_id}"))?;
+    let reviewer = if lens.persona_name.is_empty() {
+        lens.title.clone()
+    } else {
+        lens.persona_name.clone()
+    };
     for (i, f) in out.findings.iter_mut().enumerate() {
         f.id = format!("{}-{}", lens_id, i + 1);
         f.lens = lens_id.to_string();
@@ -153,7 +172,8 @@ pub fn review_lens(llm: &Llm, spec: &Spec, input: &Input, lens_id: &str) -> Resu
     Ok(out)
 }
 
-const GOOD_THINGS_GUIDE: &str = "유지할 가치가 있는 구체적 구현을 찾는다. 근거 없는 칭찬은 만들지 않는다.";
+const GOOD_THINGS_GUIDE: &str =
+    "유지할 가치가 있는 구체적 구현을 찾는다. 근거 없는 칭찬은 만들지 않는다.";
 
 pub fn review_good_things(llm: &Llm, spec: &Spec, input: &Input) -> Result<GoodThingsOutput> {
     let ctx = shared_context(spec, input);
@@ -165,7 +185,9 @@ pub fn review_good_things(llm: &Llm, spec: &Spec, input: &Input) -> Result<GoodT
          근거로 인용할 구체적 구현이 없으면 good_things를 빈 배열로 반환한다.\n",
         guide = GOOD_THINGS_GUIDE,
     );
-    let v = llm.json_ctx(Some(&ctx), &task, Some(LENS_SYSTEM)).context("Good Things 렌즈 실패")?;
+    let v = llm
+        .json_ctx(Some(&ctx), &task, Some(LENS_SYSTEM))
+        .context("Good Things 렌즈 실패")?;
     let out: GoodThingsOutput =
         serde_json::from_value(v).context("Good Things JSON 스키마 불일치")?;
     Ok(out)

@@ -49,7 +49,9 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
     let behavior_files: Vec<&String> = input
         .changed_files
         .iter()
-        .filter(|f| !matches_any(f, &spec.test_path_patterns) && !matches_any(f, &spec.doc_path_patterns))
+        .filter(|f| {
+            !matches_any(f, &spec.test_path_patterns) && !matches_any(f, &spec.doc_path_patterns)
+        })
         .collect();
     if behavior_files.is_empty() {
         return PolicyResult {
@@ -62,7 +64,14 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
         PolicyResult {
             title: "Tests accompany behavior changes".into(),
             status: PolicyStatus::Pass,
-            evidence: format!("테스트 파일 변경: {}", test_files.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")),
+            evidence: format!(
+                "테스트 파일 변경: {}",
+                test_files
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     } else {
         PolicyResult {
@@ -70,7 +79,11 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
             status: PolicyStatus::Fail,
             evidence: format!(
                 "동작 변경 파일({})에 대응하는 테스트 파일 변경 없음",
-                behavior_files.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                behavior_files
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -89,13 +102,19 @@ fn diff_size(spec: &Spec, input: &Input) -> PolicyResult {
         PolicyResult {
             title: "Diff size within configured limit".into(),
             status: PolicyStatus::Pass,
-            evidence: format!("변경 {total}줄 (+{}/-{}) ≤ 임계값 {}", input.added_lines, input.removed_lines, spec.diff_size_limit),
+            evidence: format!(
+                "변경 {total}줄 (+{}/-{}) ≤ 임계값 {}",
+                input.added_lines, input.removed_lines, spec.diff_size_limit
+            ),
         }
     } else {
         PolicyResult {
             title: "Diff size within configured limit".into(),
             status: PolicyStatus::Fail,
-            evidence: format!("변경 {total}줄 (+{}/-{}) > 임계값 {}", input.added_lines, input.removed_lines, spec.diff_size_limit),
+            evidence: format!(
+                "변경 {total}줄 (+{}/-{}) > 임계값 {}",
+                input.added_lines, input.removed_lines, spec.diff_size_limit
+            ),
         }
     }
 }
@@ -118,7 +137,9 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
     let public_surface_files: Vec<&String> = input
         .changed_files
         .iter()
-        .filter(|f| !matches_any(f, &spec.test_path_patterns) && !matches_any(f, &spec.doc_path_patterns))
+        .filter(|f| {
+            !matches_any(f, &spec.test_path_patterns) && !matches_any(f, &spec.doc_path_patterns)
+        })
         .collect();
     if public_surface_files.is_empty() {
         return PolicyResult {
@@ -131,7 +152,14 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
         PolicyResult {
             title: "Changelog/documentation updated".into(),
             status: PolicyStatus::Pass,
-            evidence: format!("문서 파일 변경: {}", doc_files.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")),
+            evidence: format!(
+                "문서 파일 변경: {}",
+                doc_files
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     } else {
         PolicyResult {
@@ -143,5 +171,9 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
 }
 
 pub fn check_all(spec: &Spec, input: &Input) -> Vec<PolicyResult> {
-    vec![tests_included(spec, input), diff_size(spec, input), docs_updated(spec, input)]
+    vec![
+        tests_included(spec, input),
+        diff_size(spec, input),
+        docs_updated(spec, input),
+    ]
 }

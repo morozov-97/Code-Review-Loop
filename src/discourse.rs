@@ -82,7 +82,12 @@ fn findings_catalog(findings: &[Finding], resolved: &HashMap<String, Resolution>
         .join("\n")
 }
 
-fn build_round_prompt(spec: &Spec, findings: &[Finding], resolved: &HashMap<String, Resolution>, round: usize) -> String {
+fn build_round_prompt(
+    spec: &Spec,
+    findings: &[Finding],
+    resolved: &HashMap<String, Resolution>,
+    round: usize,
+) -> String {
     format!(
         "# 과제\n라운드 {round} discourse를 수행한다. 봉인되었던 모든 렌즈의 finding을 공개했다.\n\n\
          ## 렌즈 후보(발화자로 사용 가능한 관점)\n{lenses}\n\n\
@@ -122,9 +127,12 @@ pub fn run(
     let mut audit: Vec<DiscourseAudit> = Vec::new();
 
     for round in 1..=max_rounds {
-        let unresolved = findings
-            .iter()
-            .any(|f| resolved.get(&f.id).map(|r| r.status == "UNCERTAIN").unwrap_or(true));
+        let unresolved = findings.iter().any(|f| {
+            resolved
+                .get(&f.id)
+                .map(|r| r.status == "UNCERTAIN")
+                .unwrap_or(true)
+        });
         if !unresolved {
             break;
         }
@@ -150,7 +158,10 @@ pub fn run(
             resolved.insert(r.finding_id.clone(), r);
         }
 
-        audit.push(DiscourseAudit { round, moves: dr.moves });
+        audit.push(DiscourseAudit {
+            round,
+            moves: dr.moves,
+        });
 
         if round == max_rounds {
             break;
@@ -180,16 +191,30 @@ pub fn run(
             .sum();
 
         let (status, reason) = if net >= VOTE_THRESHOLD {
-            ("CONFIRMED".to_string(), format!("discourse 라운드 소진, confidence-weighted vote로 확정(net={net:.2})"))
+            (
+                "CONFIRMED".to_string(),
+                format!("discourse 라운드 소진, confidence-weighted vote로 확정(net={net:.2})"),
+            )
         } else if net <= -VOTE_THRESHOLD {
-            ("REJECTED".to_string(), format!("discourse 라운드 소진, confidence-weighted vote로 기각(net={net:.2})"))
+            (
+                "REJECTED".to_string(),
+                format!("discourse 라운드 소진, confidence-weighted vote로 기각(net={net:.2})"),
+            )
         } else {
-            ("UNCERTAIN".to_string(), format!("discourse 라운드 소진, 판정 없음(net={net:.2})"))
+            (
+                "UNCERTAIN".to_string(),
+                format!("discourse 라운드 소진, 판정 없음(net={net:.2})"),
+            )
         };
 
         resolved.insert(
             f.id.clone(),
-            Resolution { finding_id: f.id.clone(), status, merged_into: String::new(), reason },
+            Resolution {
+                finding_id: f.id.clone(),
+                status,
+                merged_into: String::new(),
+                reason,
+            },
         );
     }
 
@@ -207,7 +232,7 @@ fn run_round_call(
     let v = llm
         .json(&prompt, Some(DISCOURSE_SYSTEM))
         .with_context(|| format!("discourse 라운드 {round} 실패"))?;
-    let dr: DiscourseRound =
-        serde_json::from_value(v).with_context(|| format!("discourse 라운드 {round} JSON 스키마 불일치"))?;
+    let dr: DiscourseRound = serde_json::from_value(v)
+        .with_context(|| format!("discourse 라운드 {round} JSON 스키마 불일치"))?;
     Ok(dr)
 }

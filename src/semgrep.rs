@@ -49,6 +49,10 @@ fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|dir| {
         let full = dir.join(bin);
-        if full.is_file() { Some(full) } else { None }
+        if full.is_file() {
+            Some(full)
+        } else {
+            None
+        }
     })
 }

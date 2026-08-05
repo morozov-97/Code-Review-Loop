@@ -129,8 +129,20 @@ fn build_llm(cli: &Cli) -> Result<(Llm, Llm)> {
     let cheap_model = cli.cheap_model.clone().or_else(|| cli.model.clone());
     let (main_llm, cheap_llm) = match cli.backend {
         Backend::Claude => (
-            Llm::claude_cli(cli.claude_bin.clone(), cli.model.clone(), cli.retries, cli.verbose, usage.clone()),
-            Llm::claude_cli(cli.claude_bin.clone(), cheap_model, cli.retries, cli.verbose, usage.clone()),
+            Llm::claude_cli(
+                cli.claude_bin.clone(),
+                cli.model.clone(),
+                cli.retries,
+                cli.verbose,
+                usage.clone(),
+            ),
+            Llm::claude_cli(
+                cli.claude_bin.clone(),
+                cheap_model,
+                cli.retries,
+                cli.verbose,
+                usage.clone(),
+            ),
         ),
         Backend::Openrouter => (
             Llm::openrouter(cli.model.clone(), cli.retries, cli.verbose, usage.clone())?,
@@ -145,11 +157,47 @@ fn real_main() -> Result<()> {
     let (llm, cheap_llm) = build_llm(&cli)?;
 
     match &cli.cmd {
-        Cmd::Review { spec, diff, requirements, conventions, deterministic_results, lenses, out, concurrency, max_rounds, prior, human_voice } => {
-            run_review(&llm, &cheap_llm, spec, diff, requirements, conventions, deterministic_results, lenses, out, *concurrency, *max_rounds, prior, *human_voice)
-        }
-        Cmd::Describe { spec, diff, requirements, conventions, out } => run_describe(&llm, spec, diff, requirements, conventions, out),
-        Cmd::Improve { spec, diff, requirements, conventions, out } => run_improve(&llm, spec, diff, requirements, conventions, out),
+        Cmd::Review {
+            spec,
+            diff,
+            requirements,
+            conventions,
+            deterministic_results,
+            lenses,
+            out,
+            concurrency,
+            max_rounds,
+            prior,
+            human_voice,
+        } => run_review(
+            &llm,
+            &cheap_llm,
+            spec,
+            diff,
+            requirements,
+            conventions,
+            deterministic_results,
+            lenses,
+            out,
+            *concurrency,
+            *max_rounds,
+            prior,
+            *human_voice,
+        ),
+        Cmd::Describe {
+            spec,
+            diff,
+            requirements,
+            conventions,
+            out,
+        } => run_describe(&llm, spec, diff, requirements, conventions, out),
+        Cmd::Improve {
+            spec,
+            diff,
+            requirements,
+            conventions,
+            out,
+        } => run_improve(&llm, spec, diff, requirements, conventions, out),
     }
 }
 
@@ -170,7 +218,12 @@ fn run_review(
     human_voice: bool,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
-    let mut inp = input::normalize(diff_path, requirements_path, conventions_path, deterministic_results_path)?;
+    let mut inp = input::normalize(
+        diff_path,
+        requirements_path,
+        conventions_path,
+        deterministic_results_path,
+    )?;
     // 하드 상한은 아님 — 렌즈/discourse/verify 호출마다 diff 전체가 재전송되므로
     // 큰 diff일수록 토큰 비용이 선형 이상으로 커진다는 것만 미리 알린다(silent truncation 없음).
     const DIFF_WARN_CHARS: usize = 300_000;
@@ -194,14 +247,25 @@ fn run_review(
     };
     let round = prior_state.as_ref().map(|s| s.round + 1).unwrap_or(1);
 
-    println!("리뷰 시작(round {}) — {} ({}개 파일, +{}/-{})", round, sp.name, inp.changed_files.len(), inp.added_lines, inp.removed_lines);
+    println!(
+        "리뷰 시작(round {}) — {} ({}개 파일, +{}/-{})",
+        round,
+        sp.name,
+        inp.changed_files.len(),
+        inp.added_lines,
+        inp.removed_lines
+    );
 
     // 1~2단계(입력 정규화·컨벤션 주입)는 input::normalize + 각 프롬프트 빌더에서 처리됨.
 
     // 4단계: 렌즈 선정
     let optional_selected: Vec<String> = match lenses_arg {
         Some(s) => {
-            let ids: Vec<String> = s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+            let ids: Vec<String> = s
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
             for id in &ids {
                 anyhow::ensure!(sp.lens_by_id(id).is_some(), "spec에 없는 렌즈 id: {id}");
             }
@@ -218,11 +282,17 @@ fn run_review(
     println!("선정 렌즈: {}", selected_ids.join(", "));
 
     // 7단계: 렌즈별 독립 리뷰(봉인 후 순차 공개 — 병렬 실행해도 서로 결과를 참조하지 않으므로 동일)
-    let lens_outputs: Vec<(String, lens::LensOutput)> = par_map(concurrency, selected_ids.clone(), |id| {
-        let out = lens::review_lens(llm, &sp, &inp, &id)?;
-        println!("  렌즈 완료: {} — finding {}건, 미검증 {}건", id, out.findings.len(), out.unverified.len());
-        Ok((id, out))
-    })?;
+    let lens_outputs: Vec<(String, lens::LensOutput)> =
+        par_map(concurrency, selected_ids.clone(), |id| {
+            let out = lens::review_lens(llm, &sp, &inp, &id)?;
+            println!(
+                "  렌즈 완료: {} — finding {}건, 미검증 {}건",
+                id,
+                out.findings.len(),
+                out.unverified.len()
+            );
+            Ok((id, out))
+        })?;
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
@@ -255,7 +325,12 @@ fn run_review(
         let prior_confirmed: Vec<Finding> = ps
             .findings
             .iter()
-            .filter(|f| ps.resolved.get(&f.id).map(|r| r.status == "CONFIRMED").unwrap_or(false))
+            .filter(|f| {
+                ps.resolved
+                    .get(&f.id)
+                    .map(|r| r.status == "CONFIRMED")
+                    .unwrap_or(false)
+            })
             .cloned()
             .collect();
         fix_results = fixcheck::run(cheap_llm, &sp, &inp, &prior_confirmed)?;
@@ -288,10 +363,23 @@ fn run_review(
     let req_results = requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs)?;
 
     // 10단계: 정량 요약 + verdict
-    let quant = quantify::summarize(&inp, &findings, &resolved, &policies, &req_results, selected_ids.len());
+    let quant = quantify::summarize(
+        &inp,
+        &findings,
+        &resolved,
+        &policies,
+        &req_results,
+        selected_ids.len(),
+    );
 
     let hv = if human_voice {
-        Some(humanvoice::rewrite(llm, &sp, &inp, &confirmed_refs, &good_things)?)
+        Some(humanvoice::rewrite(
+            llm,
+            &sp,
+            &inp,
+            &confirmed_refs,
+            &good_things,
+        )?)
     } else {
         None
     };
@@ -315,16 +403,33 @@ fn run_review(
         human_voice: hv.as_deref(),
     })?;
 
-    state::write(&out_dir, &state::State { round, findings: findings.clone(), resolved: resolved.clone() })?;
+    state::write(
+        &out_dir,
+        &state::State {
+            round,
+            findings: findings.clone(),
+            resolved: resolved.clone(),
+        },
+    )?;
 
-    println!("\n종료 — verdict={} score={}/100", quant.verdict, quant.score);
+    println!(
+        "\n종료 — verdict={} score={}/100",
+        quant.verdict, quant.score
+    );
     println!("리포트: {}", path.display());
     println!("다음 라운드: --prior {}", out_dir.display());
     println!("{}", llm.usage().summary());
     Ok(())
 }
 
-fn run_describe(llm: &Llm, spec_path: &PathBuf, diff_path: &PathBuf, requirements_path: &Option<PathBuf>, conventions_path: &Option<PathBuf>, out: &PathBuf) -> Result<()> {
+fn run_describe(
+    llm: &Llm,
+    spec_path: &PathBuf,
+    diff_path: &PathBuf,
+    requirements_path: &Option<PathBuf>,
+    conventions_path: &Option<PathBuf>,
+    out: &PathBuf,
+) -> Result<()> {
     let sp = Spec::load(spec_path)?;
     let inp = input::normalize(diff_path, requirements_path, conventions_path, &None)?;
     let out_dir = prepare_out(out)?;
@@ -336,19 +441,31 @@ fn run_describe(llm: &Llm, spec_path: &PathBuf, diff_path: &PathBuf, requirement
     Ok(())
 }
 
-fn run_improve(llm: &Llm, spec_path: &PathBuf, diff_path: &PathBuf, requirements_path: &Option<PathBuf>, conventions_path: &Option<PathBuf>, out: &PathBuf) -> Result<()> {
+fn run_improve(
+    llm: &Llm,
+    spec_path: &PathBuf,
+    diff_path: &PathBuf,
+    requirements_path: &Option<PathBuf>,
+    conventions_path: &Option<PathBuf>,
+    out: &PathBuf,
+) -> Result<()> {
     let sp = Spec::load(spec_path)?;
     let inp = input::normalize(diff_path, requirements_path, conventions_path, &None)?;
     let out_dir = prepare_out(out)?;
     let suggestions = improve::run(llm, &sp, &inp)?;
     let path = report::write_improve(&out_dir, &suggestions)?;
-    println!("improve 완료: 제안 {}건 — {}", suggestions.len(), path.display());
+    println!(
+        "improve 완료: 제안 {}건 — {}",
+        suggestions.len(),
+        path.display()
+    );
     println!("{}", llm.usage().summary());
     Ok(())
 }
 
 fn prepare_out(p: &PathBuf) -> Result<PathBuf> {
-    std::fs::create_dir_all(p).with_context(|| format!("출력 디렉터리 생성 실패: {}", p.display()))?;
+    std::fs::create_dir_all(p)
+        .with_context(|| format!("출력 디렉터리 생성 실패: {}", p.display()))?;
     Ok(p.clone())
 }
 
@@ -359,22 +476,26 @@ where
     R: Send,
     F: Fn(T) -> Result<R> + Sync,
 {
-        let c = concurrency.max(1);
-        let mut out: Vec<R> = Vec::new();
-        let mut rest = items;
-        while !rest.is_empty() {
-            let take = c.min(rest.len());
-            let chunk: Vec<T> = rest.drain(..take).collect();
-            let results: Vec<Result<R>> = std::thread::scope(|s| {
-                let handles: Vec<_> = chunk.into_iter().map(|item| s.spawn(|| f(item))).collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().map_err(|_| anyhow!("worker thread panicked")).and_then(|r| r))
-                    .collect()
-            });
-            for r in results {
-                out.push(r?);
-            }
+    let c = concurrency.max(1);
+    let mut out: Vec<R> = Vec::new();
+    let mut rest = items;
+    while !rest.is_empty() {
+        let take = c.min(rest.len());
+        let chunk: Vec<T> = rest.drain(..take).collect();
+        let results: Vec<Result<R>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk.into_iter().map(|item| s.spawn(|| f(item))).collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .map_err(|_| anyhow!("worker thread panicked"))
+                        .and_then(|r| r)
+                })
+                .collect()
+        });
+        for r in results {
+            out.push(r?);
         }
+    }
     Ok(out)
 }

@@ -21,7 +21,16 @@ pub fn write(out_dir: &Path, state: &State) -> Result<PathBuf> {
 }
 
 pub fn load(dir: &Path) -> Result<State> {
-    let path = if dir.is_dir() { dir.join("state.json") } else { dir.to_path_buf() };
-    let s = std::fs::read_to_string(&path).with_context(|| format!("{} 읽기 실패 (--prior는 이전 --out 디렉터리)", path.display()))?;
+    let path = if dir.is_dir() {
+        dir.join("state.json")
+    } else {
+        dir.to_path_buf()
+    };
+    let s = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "{} 읽기 실패 (--prior는 이전 --out 디렉터리)",
+            path.display()
+        )
+    })?;
     serde_json::from_str(&s).with_context(|| format!("{} 파싱 실패", path.display()))
 }

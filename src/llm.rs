@@ -28,10 +28,19 @@ pub struct Usage {
 
 impl Usage {
     pub fn summary(&self) -> String {
-        let cost = if self.cost_usd > 0.0 { format!(", cost ${:.4}", self.cost_usd) } else { String::new() };
+        let cost = if self.cost_usd > 0.0 {
+            format!(", cost ${:.4}", self.cost_usd)
+        } else {
+            String::new()
+        };
         format!(
             "LLM 호출 {}회 — input {} / output {} / cache_read {} / cache_write {}{}",
-            self.calls, self.input_tokens, self.output_tokens, self.cache_read_tokens, self.cache_creation_tokens, cost
+            self.calls,
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_creation_tokens,
+            cost
         )
     }
 }
@@ -65,12 +74,29 @@ impl Llm {
         Arc::new(Mutex::new(Usage::default()))
     }
 
-    pub fn claude_cli(bin: String, model: Option<String>, retries: u32, verbose: bool, usage: Arc<Mutex<Usage>>) -> Self {
-        Llm { provider: Provider::ClaudeCli { bin }, model, retries, verbose, usage }
+    pub fn claude_cli(
+        bin: String,
+        model: Option<String>,
+        retries: u32,
+        verbose: bool,
+        usage: Arc<Mutex<Usage>>,
+    ) -> Self {
+        Llm {
+            provider: Provider::ClaudeCli { bin },
+            model,
+            retries,
+            verbose,
+            usage,
+        }
     }
 
     /// `OPENROUTER_API_KEY` 환경변수 필요. model 미지정 시 120B 오픈모델 기본값 사용.
-    pub fn openrouter(model: Option<String>, retries: u32, verbose: bool, usage: Arc<Mutex<Usage>>) -> Result<Self> {
+    pub fn openrouter(
+        model: Option<String>,
+        retries: u32,
+        verbose: bool,
+        usage: Arc<Mutex<Usage>>,
+    ) -> Result<Self> {
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .context("OPENROUTER_API_KEY 환경변수 없음 (export OPENROUTER_API_KEY=...)")?;
         Ok(Llm {
@@ -100,7 +126,9 @@ impl Llm {
 
     fn call_once(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
         match &self.provider {
-            Provider::ClaudeCli { bin } => call_claude(bin, self.model.as_deref(), ctx, task, system),
+            Provider::ClaudeCli { bin } => {
+                call_claude(bin, self.model.as_deref(), ctx, task, system)
+            }
             Provider::OpenRouter { api_key } => {
                 call_openrouter(api_key, self.model.as_deref(), ctx, task, system)
             }
@@ -127,7 +155,11 @@ impl Llm {
             if self.verbose {
                 match last.as_ref() {
                     Some(error) => eprintln!("[retry {}/{}] {error}", attempt + 1, self.retries),
-                    None => eprintln!("[retry {}/{}] unknown retry error", attempt + 1, self.retries),
+                    None => eprintln!(
+                        "[retry {}/{}] unknown retry error",
+                        attempt + 1,
+                        self.retries
+                    ),
                 }
             }
         }
@@ -140,7 +172,12 @@ impl Llm {
     }
 
     /// [`Llm::text_ctx`]의 JSON 강제 버전.
-    pub fn json_ctx(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<serde_json::Value> {
+    pub fn json_ctx(
+        &self,
+        ctx: Option<&str>,
+        task: &str,
+        system: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..=self.retries {
             let raw = match self.call_once(ctx, task, system) {
@@ -152,9 +189,15 @@ impl Llm {
                     last = Some(e);
                     if self.verbose {
                         match last.as_ref() {
-                            Some(error) => eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries),
+                            Some(error) => {
+                                eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries)
+                            }
                             None => {
-                                eprintln!("[json retry {}/{}] unknown json retry error", attempt + 1, self.retries);
+                                eprintln!(
+                                    "[json retry {}/{}] unknown json retry error",
+                                    attempt + 1,
+                                    self.retries
+                                );
                             }
                         }
                     }
@@ -167,9 +210,15 @@ impl Llm {
                     last = Some(e);
                     if self.verbose {
                         match last.as_ref() {
-                            Some(error) => eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries),
+                            Some(error) => {
+                                eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries)
+                            }
                             None => {
-                                eprintln!("[json retry {}/{}] unknown json retry error", attempt + 1, self.retries);
+                                eprintln!(
+                                    "[json retry {}/{}] unknown json retry error",
+                                    attempt + 1,
+                                    self.retries
+                                );
                             }
                         }
                     }
@@ -182,7 +231,13 @@ impl Llm {
 
 /// 프롬프트는 stdin으로 전달(인자 길이 제한 회피). 서브프로세스 호출이라 캐싱은 적용되지
 /// 않으므로 ctx+task를 그냥 이어붙인다(순서만: 안정적 맥락 먼저, 가변 지시문 나중).
-fn call_claude(bin: &str, model: Option<&str>, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
+fn call_claude(
+    bin: &str,
+    model: Option<&str>,
+    ctx: Option<&str>,
+    task: &str,
+    system: Option<&str>,
+) -> Result<CallResult> {
     let mut cmd = Command::new(bin);
     cmd.arg("-p").arg("--output-format").arg("json");
     if let Some(m) = model {
@@ -191,13 +246,18 @@ fn call_claude(bin: &str, model: Option<&str>, ctx: Option<&str>, task: &str, sy
     if let Some(s) = system {
         cmd.arg("--append-system-prompt").arg(s);
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("`{bin}` 실행 실패 (설치 및 PATH 확인)"))?;
     {
-        let stdin = child.stdin.as_mut().ok_or_else(|| anyhow!("stdin 열기 실패"))?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("stdin 열기 실패"))?;
         if let Some(c) = ctx {
             stdin.write_all(c.as_bytes())?;
         }
@@ -227,7 +287,12 @@ fn call_claude(bin: &str, model: Option<&str>, ctx: Option<&str>, task: &str, sy
     // usage/cost 필드는 claude CLI 버전에 따라 존재 여부·이름이 다를 수 있어 관대하게 파싱한다
     // (없으면 0으로 두고 실패시키지 않음 — result 필드만 계약으로 취급).
     let usage_obj = v.get("usage");
-    let get_u64 = |key: &str| usage_obj.and_then(|u| u.get(key)).and_then(|x| x.as_u64()).unwrap_or(0);
+    let get_u64 = |key: &str| {
+        usage_obj
+            .and_then(|u| u.get(key))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+    };
     let cost_usd = v
         .get("total_cost_usd")
         .or_else(|| v.get("cost_usd"))
@@ -255,7 +320,13 @@ fn supports_prompt_caching(model: &str) -> bool {
 /// OpenRouter 채팅 완성 API 1회 호출. ctx가 주어지고 대상 모델이 Claude 계열이면 별도
 /// content 블록으로 분리해 cache_control(ephemeral)을 붙인다 — 동일 ctx로 반복 호출될 때
 /// (예: 렌즈별 리뷰) 캐시 히트를 노리는 최적화. 그 외에는 기존처럼 단일 문자열 content를 보낸다.
-fn call_openrouter(api_key: &str, model: Option<&str>, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
+fn call_openrouter(
+    api_key: &str,
+    model: Option<&str>,
+    ctx: Option<&str>,
+    task: &str,
+    system: Option<&str>,
+) -> Result<CallResult> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(s) = system {
         messages.push(serde_json::json!({"role": "system", "content": s}));
@@ -291,25 +362,36 @@ fn call_openrouter(api_key: &str, model: Option<&str>, ctx: Option<&str>, task: 
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
-            return Err(anyhow!("openrouter 응답 코드 {code}: {}", truncate(&body, 400)));
+            return Err(anyhow!(
+                "openrouter 응답 코드 {code}: {}",
+                truncate(&body, 400)
+            ));
         }
         Err(e) => return Err(anyhow!("openrouter 호출 실패: {e}")),
     };
 
-    let v: serde_json::Value = resp
-        .into_json()
-        .context("openrouter 응답 JSON 파싱 실패")?;
+    let v: serde_json::Value = resp.into_json().context("openrouter 응답 JSON 파싱 실패")?;
     let content = v
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| anyhow!("openrouter 응답에 content 없음: {}", truncate(&v.to_string(), 400)))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "openrouter 응답에 content 없음: {}",
+                truncate(&v.to_string(), 400)
+            )
+        })?;
 
     // OpenAI 호환 usage 스키마(prompt_tokens/completion_tokens). cost는 응답에 없어 0으로 둔다.
     let usage_obj = v.get("usage");
-    let get_u64 = |key: &str| usage_obj.and_then(|u| u.get(key)).and_then(|x| x.as_u64()).unwrap_or(0);
+    let get_u64 = |key: &str| {
+        usage_obj
+            .and_then(|u| u.get(key))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+    };
     Ok(CallResult {
         text: content.to_string(),
         usage: CallUsage {

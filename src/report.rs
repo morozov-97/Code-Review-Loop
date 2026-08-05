@@ -43,7 +43,10 @@ fn deterministic_table(spec: &Spec, results: &Option<serde_json::Value>) -> Stri
                 (status, evidence)
             }
         };
-        md.push_str(&format!("| {} | {} | {} | {} |\n", c.title, c.tool, status, evidence));
+        md.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            c.title, c.tool, status, evidence
+        ));
     }
     md
 }
@@ -69,13 +72,29 @@ pub struct ReportCtx<'a> {
 
 pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     let ReportCtx {
-        out_dir, spec, input, selected_lenses, round, findings, resolved, unverified, good_things,
-        policies, requirements, audit, quant, fix_results, human_voice,
+        out_dir,
+        spec,
+        input,
+        selected_lenses,
+        round,
+        findings,
+        resolved,
+        unverified,
+        good_things,
+        policies,
+        requirements,
+        audit,
+        quant,
+        fix_results,
+        human_voice,
     } = ctx;
 
     let mut md = String::new();
 
-    md.push_str(&format!("# 코드 리뷰 — {} (round {})\n\n", spec.name, round));
+    md.push_str(&format!(
+        "# 코드 리뷰 — {} (round {})\n\n",
+        spec.name, round
+    ));
     md.push_str(&format!(
         "**Verdict: {}**  ·  Score: {}/100  ·  Effort: {}/5  ·  변경 파일 {}개 (+{}/-{})\n\n",
         quant.verdict,
@@ -90,14 +109,22 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     if !fix_results.is_empty() {
         md.push_str("## 이전 라운드 대비\n\n| Finding | Status | Evidence |\n|---|---|---|\n");
         for f in fix_results {
-            md.push_str(&format!("| {} | {} | {} |\n", f.finding_id, f.status, f.evidence));
+            md.push_str(&format!(
+                "| {} | {} | {} |\n",
+                f.finding_id, f.status, f.evidence
+            ));
         }
         md.push('\n');
     }
 
     md.push_str("## Policy checks\n\n| Policy | Status | Evidence |\n|---|---|---|\n");
     for p in policies {
-        md.push_str(&format!("| {} | {} | {} |\n", p.title, p.status.label(), p.evidence));
+        md.push_str(&format!(
+            "| {} | {} | {} |\n",
+            p.title,
+            p.status.label(),
+            p.evidence
+        ));
     }
     md.push('\n');
 
@@ -123,7 +150,10 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         Some(reqs) => {
             md.push_str("| Requirement | Status | Evidence or gap |\n|---|---|---|\n");
             for r in reqs {
-                md.push_str(&format!("| {} | {} | {} |\n", r.requirement, r.status, r.evidence));
+                md.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    r.requirement, r.status, r.evidence
+                ));
             }
             md.push('\n');
         }
@@ -143,7 +173,17 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         let discourse_result = r.map(|r| r.reason.as_str()).unwrap_or("");
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {}:{} | {} | {} | {} | {} |\n",
-            f.id, f.severity, f.label, f.lens, f.reviewer, f.file, f.line, f.evidence, f.impact, f.recommendation, discourse_result
+            f.id,
+            f.severity,
+            f.label,
+            f.lens,
+            f.reviewer,
+            f.file,
+            f.line,
+            f.evidence,
+            f.impact,
+            f.recommendation,
+            discourse_result
         ));
     }
     md.push('\n');
@@ -156,7 +196,10 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         md.push_str("### 기각된 후보\n\n");
         for f in &rejected {
             let reason = resolved.get(&f.id).map(|r| r.reason.as_str()).unwrap_or("");
-            md.push_str(&format!("- {} ({}:{}) — {}\n", f.id, f.file, f.line, reason));
+            md.push_str(&format!(
+                "- {} ({}:{}) — {}\n",
+                f.id, f.file, f.line, reason
+            ));
         }
         md.push('\n');
     }
@@ -175,7 +218,10 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     } else {
         md.push_str("| File:line | Good practice | Why it should be preserved |\n|---|---|---|\n");
         for g in good_things {
-            md.push_str(&format!("| {} | {} | {} |\n", g.file_line, g.practice, g.why));
+            md.push_str(&format!(
+                "| {} | {} | {} |\n",
+                g.file_line, g.practice, g.why
+            ));
         }
         md.push('\n');
     }
@@ -185,7 +231,9 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     md.push('\n');
 
     md.push_str("## Discourse audit\n\n");
-    md.push_str("| Round | Move | Lens | Target | Detail | New evidence |\n|---|---|---|---|---|---|\n");
+    md.push_str(
+        "| Round | Move | Lens | Target | Detail | New evidence |\n|---|---|---|---|---|---|\n",
+    );
     for a in audit {
         for m in &a.moves {
             md.push_str(&format!(
@@ -214,7 +262,10 @@ pub fn write_describe(out_dir: &Path, d: &Describe, todos: &[String]) -> Result<
         md.push_str(&format!("- {}\n", w));
     }
     md.push_str(&format!("\n## Labels\n\n{}\n\n", d.labels.join(", ")));
-    md.push_str(&format!("## can_be_split\n\n{} — {}\n\n", d.can_be_split, d.can_be_split_note));
+    md.push_str(&format!(
+        "## can_be_split\n\n{} — {}\n\n",
+        d.can_be_split, d.can_be_split_note
+    ));
     md.push_str("## TODO/FIXME (신규 라인, 결정론적 스캔)\n\n");
     if todos.is_empty() {
         md.push_str("없음\n");
@@ -235,13 +286,21 @@ pub fn write_improve(out_dir: &Path, suggestions: &[Suggestion]) -> Result<PathB
         md.push_str("제안 없음\n");
     }
     for s in suggestions {
-        md.push_str(&format!("## {} — {} [{}]\n\n", s.relevant_file, s.one_sentence_summary, s.label));
+        md.push_str(&format!(
+            "## {} — {} [{}]\n\n",
+            s.relevant_file, s.one_sentence_summary, s.label
+        ));
         md.push_str(&format!("{}\n\n", s.suggestion_content));
-        md.push_str(&format!("```{}\n// before\n{}\n```\n\n", s.language, s.existing_code));
-        md.push_str(&format!("```{}\n// after\n{}\n```\n\n", s.language, s.improved_code));
+        md.push_str(&format!(
+            "```{}\n// before\n{}\n```\n\n",
+            s.language, s.existing_code
+        ));
+        md.push_str(&format!(
+            "```{}\n// after\n{}\n```\n\n",
+            s.language, s.improved_code
+        ));
     }
     let path = out_dir.join("improve.md");
     std::fs::write(&path, md).with_context(|| format!("{} 쓰기 실패", path.display()))?;
     Ok(path)
 }
-

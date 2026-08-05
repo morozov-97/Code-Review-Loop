@@ -41,7 +41,9 @@ pub fn run(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<Suggestion>> {
          \"label\":<허용값 중 하나>}}]}}\n",
         labels = spec.labels_prompt(),
     );
-    let v = llm.json_ctx(Some(&ctx), &task, Some(IMPROVE_SYSTEM)).context("improve 실패")?;
+    let v = llm
+        .json_ctx(Some(&ctx), &task, Some(IMPROVE_SYSTEM))
+        .context("improve 실패")?;
     let out: ImproveOutput = serde_json::from_value(v).context("improve JSON 스키마 불일치")?;
     Ok(out.suggestions)
 }

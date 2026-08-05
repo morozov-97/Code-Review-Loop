@@ -34,7 +34,10 @@ fn score(findings: &[Finding], resolved: &HashMap<String, Resolution>) -> (i64, 
         if resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED") {
             let p = severity_penalty(&f.severity);
             total -= p;
-            deductions.push(format!("[{}] {}:{} -{}점 — {}", f.severity, f.file, f.line, p, f.claim));
+            deductions.push(format!(
+                "[{}] {}:{} -{}점 — {}",
+                f.severity, f.file, f.line, p, f.claim
+            ));
         }
     }
     (total.max(0), deductions)
@@ -63,7 +66,12 @@ fn effort_and_time(input: &Input, lens_count: usize) -> (u8, u32, u32, u32) {
     (effort, best, average, worst)
 }
 
-fn verdict(findings: &[Finding], resolved: &HashMap<String, Resolution>, policies: &[PolicyResult], requirements: &Option<Vec<RequirementCheck>>) -> String {
+fn verdict(
+    findings: &[Finding],
+    resolved: &HashMap<String, Resolution>,
+    policies: &[PolicyResult],
+    requirements: &Option<Vec<RequirementCheck>>,
+) -> String {
     let confirmed: Vec<&Finding> = findings
         .iter()
         .filter(|f| resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED"))
@@ -79,7 +87,10 @@ fn verdict(findings: &[Finding], resolved: &HashMap<String, Resolution>, policie
         return "COMMENT".to_string();
     }
     if let Some(reqs) = requirements {
-        if reqs.iter().any(|r| r.status == "MISSING" || r.status == "AMBIGUOUS") {
+        if reqs
+            .iter()
+            .any(|r| r.status == "MISSING" || r.status == "AMBIGUOUS")
+        {
             return "NEEDS_CONTEXT".to_string();
         }
     }
