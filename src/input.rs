@@ -31,7 +31,9 @@ fn parse_diff_stats(diff: &str) -> (Vec<String>, usize, usize) {
     let mut removed = 0usize;
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("+++ ") {
-            let path = rest.trim_start_matches("b/");
+            // trim_start_matches("b/")는 반복 제거라 실제 경로가 b/로 시작하는 레포(예: 최상위
+            // 디렉터리명이 b)에서 diff 마커 b/까지 잘못 두 번 벗겨낸다 — strip_prefix로 1회만 제거.
+            let path = rest.strip_prefix("b/").unwrap_or(rest);
             if path != "/dev/null" && !files.contains(&path.to_string()) {
                 files.push(path.to_string());
             }
@@ -87,4 +89,35 @@ pub fn normalize(
         conventions,
         deterministic_results,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_diff_stats_preserves_real_path_starting_with_b_slash() {
+        let diff = "diff --git a/b/foo.txt b/b/foo.txt\n\
+                     --- a/b/foo.txt\n\
+                     +++ b/b/foo.txt\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+        let (files, added, removed) = parse_diff_stats(diff);
+        assert_eq!(files, vec!["b/foo.txt".to_string()]);
+        assert_eq!(added, 1);
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn parse_diff_stats_strips_normal_b_prefix() {
+        let diff = "diff --git a/src/main.rs b/src/main.rs\n\
+                     --- a/src/main.rs\n\
+                     +++ b/src/main.rs\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+        let (files, _, _) = parse_diff_stats(diff);
+        assert_eq!(files, vec!["src/main.rs".to_string()]);
+    }
 }
