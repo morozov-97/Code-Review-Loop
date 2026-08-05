@@ -5,6 +5,17 @@ use std::process::Command;
 /// 없거나 실행/파싱에 실패하면 None — 호출부는 기존 NOT_RUN 경로로 폴백한다(추측 결과를 지어내지 않음).
 /// dependency_sca/dataflow_taint/api_deprecation은 `--config=auto` 기본 룰셋만으로는
 /// 못 채우므로 건드리지 않는다(NOT_RUN 유지).
+/// `changed_files`는 리뷰 대상 PR 작성자가 완전히 통제하는 값이다 — 파일 경로가
+/// `-`로 시작하면(예: `--config=http://attacker.example/evil.yml`이라는 이름의 실제 파일)
+/// `--` 구분자 없이 그대로 넘길 경우 semgrep 자체 인자 파서가 이를 플래그로 오인해
+/// 스캔 설정(룰셋 출처 등)을 공격자가 override할 수 있다. `--`로 이후 전부를
+/// 위치 인자로 강제 고정한다.
+fn build_args<'a>(existing: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--config=auto", "--json", "--quiet", "--"];
+    args.extend_from_slice(existing);
+    args
+}
+
 pub fn try_run(changed_files: &[String]) -> Option<serde_json::Value> {
     let bin = which("semgrep")?;
     let existing: Vec<&str> = changed_files
@@ -17,10 +28,7 @@ pub fn try_run(changed_files: &[String]) -> Option<serde_json::Value> {
     }
 
     let output = Command::new(&bin)
-        .arg("--config=auto")
-        .arg("--json")
-        .arg("--quiet")
-        .args(&existing)
+        .args(build_args(&existing))
         .output()
         .ok()?;
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
@@ -118,5 +126,35 @@ mod tests {
         assert_eq!(find_executable(&dir, "semgrep"), Some(bin_path));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod build_args_tests {
+    use super::*;
+
+    #[test]
+    fn build_args_places_separator_before_file_list() {
+        let existing = vec!["src/main.rs", "src/lib.rs"];
+        let args = build_args(&existing);
+        let sep = args
+            .iter()
+            .position(|a| *a == "--")
+            .expect("-- separator missing");
+        assert!(
+            args[..sep].iter().all(|a| a.starts_with('-')),
+            "everything before -- must be a real flag"
+        );
+        assert_eq!(&args[sep + 1..], existing.as_slice());
+    }
+
+    #[test]
+    fn build_args_keeps_flag_like_filename_as_positional() {
+        // PR이 만든 실제 파일명이 플래그처럼 생긴 경우 — -- 뒤에 있으면 semgrep이
+        // 위치 인자로만 해석해야 한다(파서 오인으로 인한 설정 탈취 방지).
+        let existing = vec!["--config=http://attacker.example/evil.yml"];
+        let args = build_args(&existing);
+        let sep = args.iter().position(|a| *a == "--").unwrap();
+        assert_eq!(&args[sep + 1..], existing.as_slice());
     }
 }
