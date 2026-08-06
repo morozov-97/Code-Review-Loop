@@ -92,6 +92,23 @@ pub struct Llm {
     usage: Arc<Mutex<Usage>>,
 }
 
+/// #119: retries used to fire back-to-back with no delay — fine against a one-off blip, but
+/// against a 429 or a provider having a bad moment, hammering the same endpoint immediately
+/// doesn't help. `attempt` is 0-indexed (the attempt that just failed); backoff doubles per
+/// attempt, capped at 6 doublings (~32s base) so a high --retries count doesn't produce
+/// absurd waits. No `rand` dependency — jitter comes from the current time's nanosecond
+/// component, which is plenty for spreading retries across concurrent callers, not for
+/// cryptographic use.
+fn backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 500u64.saturating_mul(1u64 << attempt.min(6));
+    let jitter_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jitter_ms = u64::from(jitter_seed % (base_ms / 2).max(1) as u32);
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
 impl Llm {
     /// Share this across multiple Llm instances to track aggregated usage for the whole run.
     pub fn new_usage_tracker() -> Arc<Mutex<Usage>> {
@@ -213,6 +230,9 @@ impl Llm {
                     ),
                 }
             }
+            if attempt < self.retries {
+                std::thread::sleep(backoff_delay(attempt));
+            }
         }
         Err(last.unwrap_or_else(|| anyhow!("unknown failure")))
     }
@@ -263,6 +283,9 @@ impl Llm {
                             }
                         }
                     }
+                    if attempt < self.retries {
+                        std::thread::sleep(backoff_delay(attempt));
+                    }
                     continue;
                 }
             };
@@ -286,6 +309,9 @@ impl Llm {
                                 );
                             }
                         }
+                    }
+                    if attempt < self.retries {
+                        std::thread::sleep(backoff_delay(attempt));
                     }
                 }
             }
@@ -608,6 +634,28 @@ pub fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_delay_grows_with_attempt_number() {
+        // #119: exponential-ish growth, not a fixed delay every time.
+        assert!(backoff_delay(0) < backoff_delay(3));
+        assert!(backoff_delay(3) < backoff_delay(6));
+    }
+
+    #[test]
+    fn backoff_delay_growth_is_capped_so_high_retry_counts_stay_bounded() {
+        // attempt.min(6) caps the exponent — attempt 6 and attempt 20 must produce the same
+        // base delay (jitter aside), not an absurdly long wait for a high --retries value.
+        let at_cap = backoff_delay(6).as_millis();
+        let past_cap = backoff_delay(20).as_millis();
+        // Both draw jitter from a base of the same size, so they should land in the same
+        // order of magnitude — this just guards against unbounded exponent growth, not exact
+        // equality (jitter differs run to run).
+        assert!(
+            past_cap < at_cap * 2,
+            "attempt 20's delay ({past_cap}ms) should be capped near attempt 6's ({at_cap}ms), not keep doubling"
+        );
+    }
 
     #[test]
     fn wait_with_timeout_returns_output_when_process_finishes_in_time() {

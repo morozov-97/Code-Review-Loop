@@ -52,6 +52,7 @@ fn real_main() -> Result<()> {
             prior,
             human_voice,
             lang,
+            deadline_minutes,
         } => run_review(
             &llm,
             &cheap_llm,
@@ -68,6 +69,7 @@ fn real_main() -> Result<()> {
                 prior,
                 human_voice: *human_voice,
                 lang,
+                deadline_minutes: *deadline_minutes,
             },
         ),
         Cmd::Describe {

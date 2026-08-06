@@ -71,6 +71,13 @@ pub(crate) enum Cmd {
         /// Unset means English. report.md's own labels/headers are unaffected — only LLM-generated text.
         #[arg(long)]
         lang: Option<String>,
+        /// Overall wall-clock budget across every remaining stage (discourse, fix check,
+        /// requirements, human-voice). Each LLM call already has its own per-call timeout —
+        /// this bounds the whole run instead, for automation waiting on this process. Checked
+        /// between stages, not mid-call: an in-flight call still finishes or hits its own
+        /// timeout first. Unset means no overall deadline (existing behavior, unchanged).
+        #[arg(long)]
+        deadline_minutes: Option<u64>,
     },
     /// PR title/summary/walkthrough/labels/splittability + TODO scan
     Describe {

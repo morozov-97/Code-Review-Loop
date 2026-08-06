@@ -31,6 +31,17 @@ pub(crate) struct ReviewArgs<'a> {
     pub(crate) prior: &'a Option<PathBuf>,
     pub(crate) human_voice: bool,
     pub(crate) lang: &'a Option<String>,
+    /// #119: overall wall-clock budget across every remaining stage. None = no deadline
+    /// (existing behavior). Checked between stages, not mid-call.
+    pub(crate) deadline_minutes: Option<u64>,
+}
+
+/// True once `started.elapsed()` has passed `deadline_minutes` — always false when unset.
+fn deadline_exceeded(started: std::time::Instant, deadline_minutes: Option<u64>) -> bool {
+    match deadline_minutes {
+        None => false,
+        Some(m) => started.elapsed() > std::time::Duration::from_secs(m * 60),
+    }
 }
 
 type LensReviewResults = (
@@ -39,6 +50,7 @@ type LensReviewResults = (
 );
 
 pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<()> {
+    let started = std::time::Instant::now();
     let sp = Spec::load(args.spec_path)?;
     let mut inp = input::normalize(
         args.diff_path,
@@ -193,12 +205,31 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     };
 
     // Steps 8-9: discourse rounds
+    // #117: discourse used to propagate failure via `?`, aborting the whole run (no report.md
+    // at all) even though every lens result up to this point is otherwise usable. Falls back to
+    // "nothing resolved" on error instead — every finding just stays effectively UNCERTAIN
+    // (unresolved), so none of it can be wrongly CONFIRMED off a failed round; verdict/score
+    // simply don't count anything from this stage, same fail-safe direction as a missing
+    // resolution already gets treated everywhere else in this function.
     let (audit, mut resolved) = if findings.is_empty() {
         println!("No findings — skipping discourse");
         (Vec::new(), std::collections::HashMap::new())
+    } else if deadline_exceeded(started, args.deadline_minutes) {
+        eprintln!(
+            "Warning: --deadline-minutes exceeded — skipping discourse and every stage after it"
+        );
+        stage_errors.push("discourse: skipped, --deadline-minutes exceeded".to_string());
+        (Vec::new(), std::collections::HashMap::new())
     } else {
         println!("Starting discourse (up to {} rounds)", args.max_rounds);
-        discourse::run(llm, &sp, &inp, &mut findings, args.max_rounds, round)?
+        match discourse::run(llm, &sp, &inp, &mut findings, args.max_rounds, round) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Warning: discourse failed — {e:#}");
+                stage_errors.push(format!("discourse: {e:#}"));
+                (Vec::new(), std::collections::HashMap::new())
+            }
+        }
     };
 
     // Compared to the previous round (--prior): determine whether previously confirmed findings
@@ -228,13 +259,29 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
                     .unwrap_or(false)
             })
             .collect();
-        fix_results = fixcheck::run(
-            cheap_llm,
-            &sp,
-            &inp,
-            &prior_confirmed,
-            &this_round_confirmed,
-        )?;
+        // #117: on failure, just skip re-folding for this round (fix_results stays empty)
+        // instead of aborting the whole run via `?` — a --prior fixcheck failure shouldn't
+        // discard every lens/discourse result already computed above.
+        fix_results = if deadline_exceeded(started, args.deadline_minutes) {
+            eprintln!("Warning: --deadline-minutes exceeded — skipping fix check");
+            stage_errors.push("fixcheck: skipped, --deadline-minutes exceeded".to_string());
+            Vec::new()
+        } else {
+            match fixcheck::run(
+                cheap_llm,
+                &sp,
+                &inp,
+                &prior_confirmed,
+                &this_round_confirmed,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Warning: fix check failed — {e:#}");
+                    stage_errors.push(format!("fixcheck: {e:#}"));
+                    Vec::new()
+                }
+            }
+        };
         // Since re-folding runs after discourse::run (above), it doesn't go through this round's
         // discourse verification (intentional — fixcheck itself is responsible for judging
         // "still open"). Only guards against duplicate re-folding of the same id: discourse
@@ -278,17 +325,44 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // stage_errors so the two aren't conflated — since requirements factors into the verdict's
     // NEEDS_CONTEXT judgment, this beats silently letting it pass, but this single stage still
     // doesn't kill the whole review the way a lens failure would.
-    let req_results = match requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Warning: requirements verification failed — {e:#}");
-            stage_errors.push(format!("requirements: {e:#}"));
-            None
+    let req_results = if deadline_exceeded(started, args.deadline_minutes) {
+        eprintln!("Warning: --deadline-minutes exceeded — skipping requirements verification");
+        stage_errors.push("requirements: skipped, --deadline-minutes exceeded".to_string());
+        None
+    } else {
+        match requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Warning: requirements verification failed — {e:#}");
+                stage_errors.push(format!("requirements: {e:#}"));
+                None
+            }
+        }
+    };
+
+    // #117: human-voice doesn't read `quant` at all, so it can run before summarize() — moved
+    // up from after it so a failure here (now caught instead of propagated via `?`) is already
+    // reflected in stage_errors by the time summarize()/report::write need it, instead of
+    // landing after the verdict was already computed.
+    let hv = if !args.human_voice {
+        None
+    } else if deadline_exceeded(started, args.deadline_minutes) {
+        eprintln!("Warning: --deadline-minutes exceeded — skipping human-voice rewrite");
+        stage_errors.push("human_voice: skipped, --deadline-minutes exceeded".to_string());
+        None
+    } else {
+        match humanvoice::rewrite(llm, &sp, &inp, &confirmed_refs, &good_things) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("Warning: human-voice rewrite failed — {e:#}");
+                stage_errors.push(format!("human_voice: {e:#}"));
+                None
+            }
         }
     };
 
     // Step 10: quantitative summary + verdict
-    let quant = quantify::summarize(
+    let mut quant = quantify::summarize(
         &sp.scoring,
         &inp,
         &findings,
@@ -297,18 +371,13 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         &req_results,
         selected_ids.len(),
     );
-
-    let hv = if args.human_voice {
-        Some(humanvoice::rewrite(
-            llm,
-            &sp,
-            &inp,
-            &confirmed_refs,
-            &good_things,
-        )?)
-    } else {
-        None
-    };
+    // #115: every stage that could have failed by this point (lens/good_things/discourse/
+    // fixcheck/requirements/human-voice) already recorded into stage_errors — this is the
+    // single place that turns "did anything fail" into the structured signal on QuantSummary
+    // itself, not just the rendered report.md text.
+    if !stage_errors.is_empty() {
+        quant.completeness = quantify::ReviewCompleteness::Partial;
+    }
 
     // Step 12: output
     let path = report::write(report::ReportCtx {
@@ -424,6 +493,7 @@ always = true
                 prior: &None,
                 human_voice: false,
                 lang: &None,
+                deadline_minutes: None,
             },
         )
         .expect("run_review should complete end-to-end against the fixture LLM");
@@ -445,6 +515,173 @@ always = true
         assert!(
             std::fs::metadata(out_dir.join("state.json")).is_ok(),
             "state.json should be written for --prior to pick up next round"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_survives_a_discourse_failure_instead_of_aborting_the_whole_run() {
+        // #117: discourse::run used to propagate via `?`, aborting run_review entirely (no
+        // report.md at all) even though the lens review that ran just before it succeeded. A
+        // malformed discourse response (invalid JSON) should now degrade to "nothing resolved"
+        // and still produce a report — marked PARTIAL (#112/#115) since stage_errors is non-empty.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-discourse-failure-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "e2e test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "test_lens"
+title = "Test Lens"
+guide = "test"
+always = true
+"#,
+        );
+
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+
+        let out_dir = dir.join("out");
+
+        let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"10","claim":"test claim","evidence":"test evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
+        // Malformed on purpose — retries=0 below means json_ctx_typed fails after one attempt,
+        // so discourse::run returns Err without consuming any further fixture responses.
+        let broken_discourse_response = "this is not json".to_string();
+
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(
+            vec![lens_response, broken_discourse_response],
+            0,
+            usage.clone(),
+        );
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: None,
+            },
+        )
+        .expect("run_review must still succeed despite the discourse failure");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            report.contains("discourse"),
+            "the discourse failure must be recorded in stage_errors:\n{report}"
+        );
+        let verdict_line = report
+            .lines()
+            .find(|l| l.starts_with("**Verdict:"))
+            .unwrap();
+        assert!(
+            verdict_line.contains("PARTIAL"),
+            "verdict line must be marked partial when discourse failed:\n{verdict_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_skips_discourse_once_deadline_minutes_is_exceeded() {
+        // #119: an overall deadline must actually stop remaining stages from starting, not just
+        // exist as an unused flag. deadline_minutes: Some(0) is exceeded almost immediately, so
+        // discourse must be skipped even though findings exist — proven by the fixture queue
+        // having only the lens response: if discourse::run were still called, Llm::fixture would
+        // panic with "fixture response queue is empty".
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-deadline-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "e2e test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "test_lens"
+title = "Test Lens"
+guide = "test"
+always = true
+"#,
+        );
+
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+
+        let out_dir = dir.join("out");
+        let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"10","claim":"test claim","evidence":"test evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
+
+        let usage = Llm::new_usage_tracker();
+        // Only one response queued — if discourse ran anyway, the fixture would panic
+        // ("more LLM calls than expected") instead of run_review returning cleanly.
+        let llm = Llm::fixture(vec![lens_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: Some(0),
+            },
+        )
+        .expect("run_review must still succeed when the deadline is already exceeded");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            report.contains("deadline"),
+            "the deadline skip must be recorded in stage_errors:\n{report}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -507,6 +744,7 @@ always = true
                 prior: &None,
                 human_voice: false,
                 lang: &None,
+                deadline_minutes: None,
             },
         )
         .expect_err("manually selecting an always lens must be rejected");

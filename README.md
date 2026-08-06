@@ -332,6 +332,11 @@ sequenceDiagram
 
 ## Limits and known caveats
 
+- the diff (plus any `--requirements`/`--conventions` content) is sent to whichever LLM
+  provider is configured, verbatim — neither backend redacts secrets or PII before sending. A
+  hardcoded credential the review is supposed to flag goes out in the same request that's
+  meant to catch it. A one-line warning prints to stderr on every run as a reminder; don't run
+  this against code containing secrets or restricted data unless that's acceptable for your org.
 - heuristic-only policy signals for behavior vs surface changes can produce false
   positives depending on project structure.
 - severity penalties are heuristic defaults (P0: 25, P1: 12, P2: 5, P3: 1) — configurable per

@@ -488,6 +488,7 @@ mod tests {
             time_best_min: 5,
             time_average_min: 15,
             time_worst_min: 40,
+            completeness: crate::quantify::ReviewCompleteness::Complete,
         }
     }
 

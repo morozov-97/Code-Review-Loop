@@ -6,6 +6,18 @@ use crate::requirements::RequirementCheck;
 use crate::spec::ScoringConfig;
 use std::collections::HashMap;
 
+/// #115: whether every stage that could have contributed to `verdict`/`score` actually ran
+/// successfully. `report.rs` already renders a "(PARTIAL)" marker on the verdict line when this
+/// is `Partial`, but that's markdown text — this field exists so a programmatic consumer
+/// (future structured output, a CI script reading state.json, anything matching on
+/// `QuantSummary` directly instead of parsing the rendered report) gets the same signal without
+/// having to parse a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewCompleteness {
+    Complete,
+    Partial,
+}
+
 pub struct QuantSummary {
     pub verdict: String, // APPROVE|COMMENT|REQUEST_CHANGES|NEEDS_CONTEXT
     pub score: i64,      // 0-100
@@ -14,6 +26,7 @@ pub struct QuantSummary {
     pub time_best_min: u32,
     pub time_average_min: u32,
     pub time_worst_min: u32,
+    pub completeness: ReviewCompleteness,
 }
 
 fn severity_penalty(scoring: &ScoringConfig, severity: &str) -> i64 {
@@ -127,12 +140,47 @@ pub fn summarize(
         time_best_min: best,
         time_average_min: average,
         time_worst_min: worst,
+        // Caller sets this to Partial when stage_errors is non-empty (see pipeline/review.rs) —
+        // summarize() itself has no visibility into stages outside its own inputs, so Complete
+        // is just the default absent that outside signal, not a claim this stage succeeded.
+        completeness: ReviewCompleteness::Complete,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::RunConfig;
+
+    fn test_input() -> Input {
+        Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: RunConfig::default(),
+        }
+    }
+
+    #[test]
+    fn summarize_defaults_completeness_to_complete() {
+        // #115: summarize() itself has no visibility into stages outside its own inputs, so it
+        // always returns Complete — the caller (run_review) is responsible for downgrading to
+        // Partial when stage_errors is non-empty, not this function.
+        let quant = summarize(
+            &ScoringConfig::default(),
+            &test_input(),
+            &[],
+            &HashMap::new(),
+            &[],
+            &None,
+            1,
+        );
+        assert_eq!(quant.completeness, ReviewCompleteness::Complete);
+    }
 
     fn finding(id: &str, severity: &str) -> Finding {
         Finding {

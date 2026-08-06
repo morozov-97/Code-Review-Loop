@@ -195,6 +195,38 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Truncates `text` (a single file-block) to at most `max_bytes`, preferring to cut right
+/// before the first `@@` hunk header that would no longer fully fit, instead of at a raw byte
+/// offset (see #116). A byte-offset cut can land mid-function, mid-string-literal, mid-hunk, or
+/// after removed lines but before their corresponding added lines — a structurally broken
+/// fragment framed as a complete diff. Cutting at a hunk boundary means every hunk the LLM
+/// sees is at least internally complete, even though later hunks in the same file are missing
+/// entirely (same as before — that's still visible via the caller's truncation note).
+///
+/// Falls back to `truncate_at_char_boundary` (a raw byte cut) only when even the header plus
+/// the first hunk alone exceeds `max_bytes`, or the block has no `@@` hunk markers at all
+/// (e.g. a binary-file or pure-rename diff) — there's no better cut point available then.
+fn truncate_at_hunk_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut hunk_starts: Vec<usize> = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("@@") {
+            hunk_starts.push(offset);
+        }
+        offset += line.len();
+    }
+    let best_cut = hunk_starts
+        .into_iter()
+        .rfind(|&start| start > 0 && start <= max_bytes);
+    match best_cut {
+        Some(cut) => &text[..cut],
+        None => truncate_at_char_boundary(text, max_bytes),
+    }
+}
+
 /// Reorders file-blocks so noisy/generated ones (see `is_noisy_path`) sort after everything
 /// else, stable within each group — pure reordering, no information loss, always applied. If
 /// the diff is still over DIFF_HARD_CAP_CHARS afterward, drops the lowest-priority blocks from
@@ -239,7 +271,7 @@ fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
 
     let mut truncated = false;
     if kept.len() == 1 && kept[0].len() > DIFF_HARD_CAP_CHARS {
-        kept[0] = truncate_at_char_boundary(&kept[0], DIFF_HARD_CAP_CHARS).to_string();
+        kept[0] = truncate_at_hunk_boundary(&kept[0], DIFF_HARD_CAP_CHARS).to_string();
         truncated = true;
     }
 
@@ -441,6 +473,57 @@ mod tests {
         assert_eq!(files, vec![".gitkeep".to_string()]);
     }
 
+    // --- truncate_at_hunk_boundary() ---
+
+    #[test]
+    fn truncate_at_hunk_boundary_cuts_before_the_first_hunk_that_no_longer_fully_fits() {
+        // #116: must not land inside hunk 2's body — the cut has to fall exactly at the start
+        // of hunk 2's "@@" line, keeping hunk 1 (and the header before it) fully intact.
+        let header = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n";
+        let hunk1 = "@@ -1,2 +1,2 @@\n-old1\n+new1\n";
+        let hunk2 = "@@ -10,2 +10,2 @@\n-old2\n+new2\n";
+        let text = format!("{header}{hunk1}{hunk2}");
+        // Budget covers header+hunk1 exactly, but not header+hunk1+hunk2.
+        let budget = header.len() + hunk1.len();
+        let out = truncate_at_hunk_boundary(&text, budget);
+        assert_eq!(out, format!("{header}{hunk1}"));
+        assert!(
+            !out.contains("@@ -10"),
+            "hunk 2 must not appear at all, not even partially"
+        );
+    }
+
+    #[test]
+    fn truncate_at_hunk_boundary_falls_back_to_byte_cut_when_even_the_first_hunk_does_not_fit() {
+        let header = "diff --git a/x.rs b/x.rs\n";
+        let huge_hunk = format!("@@ -1,1 +1,1 @@\n+{}\n", "x".repeat(1000));
+        let text = format!("{header}{huge_hunk}");
+        let budget = header.len() + 50; // far smaller than the single hunk alone
+        let out = truncate_at_hunk_boundary(&text, budget);
+        assert!(
+            out.len() <= budget,
+            "must still respect the byte budget via the byte-cut fallback"
+        );
+        assert!(out.starts_with("diff --git a/x.rs"));
+    }
+
+    #[test]
+    fn truncate_at_hunk_boundary_falls_back_to_byte_cut_when_there_are_no_hunks_at_all() {
+        // A binary-file or pure-rename diff has no "@@" markers to cut at.
+        let text = format!(
+            "diff --git a/logo.png b/logo.png\nBinary files differ\n{}",
+            "x".repeat(1000)
+        );
+        let out = truncate_at_hunk_boundary(&text, 50);
+        assert!(out.len() <= 50);
+    }
+
+    #[test]
+    fn truncate_at_hunk_boundary_is_a_no_op_when_already_within_budget() {
+        let text = "diff --git a/x.rs b/x.rs\n@@ -1,1 +1,1 @@\n+x\n";
+        assert_eq!(truncate_at_hunk_boundary(text, text.len() + 100), text);
+    }
+
     // --- is_noisy_path() ---
 
     #[test]
@@ -582,5 +665,45 @@ mod tests {
             out.contains("[NOTE:") && out.contains("truncated"),
             "truncation must be visible, not silent"
         );
+    }
+
+    #[test]
+    fn prioritize_and_cap_diff_truncation_never_splits_a_hunk_in_half() {
+        // #116, end to end through prioritize_and_cap_diff (not just the helper directly):
+        // build one oversized file with many small, complete hunks and confirm every hunk that
+        // survives truncation is whole — never cut off partway through its body.
+        let header = "diff --git a/src/big.rs b/src/big.rs\n--- a/src/big.rs\n+++ b/src/big.rs\n";
+        let hunk = |n: usize| format!("@@ -{n},1 +{n},1 @@\n-old{n}\n+new{n}\n");
+        let mut diff = header.to_string();
+        // Enough ~30-byte hunks to comfortably exceed DIFF_HARD_CAP_CHARS.
+        for n in 0..(DIFF_HARD_CAP_CHARS / 25 + 100) {
+            diff.push_str(&hunk(n));
+        }
+
+        let (out, dropped) = prioritize_and_cap_diff(&diff);
+        assert!(
+            dropped.is_empty(),
+            "single oversized file must never be dropped"
+        );
+        assert!(out.contains("[NOTE:") && out.contains("truncated"));
+
+        // Every "@@" line in the output must be followed by both of its body lines — if a hunk
+        // got cut mid-body, a "-oldN"/"+newN" pair would be incomplete or missing.
+        let content_before_note = out.split("\n\n[NOTE:").next().unwrap();
+        let mut lines = content_before_note.lines().peekable();
+        let mut hunk_count = 0;
+        while let Some(line) = lines.next() {
+            if line.starts_with("@@") {
+                hunk_count += 1;
+                let removed = lines.next();
+                let added = lines.next();
+                assert!(
+                    removed.is_some_and(|l| l.starts_with('-'))
+                        && added.is_some_and(|l| l.starts_with('+')),
+                    "hunk starting at {line:?} is missing its body — truncation cut mid-hunk"
+                );
+            }
+        }
+        assert!(hunk_count > 0, "at least some hunks should have survived");
     }
 }
