@@ -72,4 +72,26 @@ mod par_map_tests {
         sorted.sort();
         assert_eq!(sorted, vec![2, 4, 6, 8, 10]);
     }
+
+    #[test]
+    fn par_map_converts_a_genuine_worker_panic_into_an_err_instead_of_propagating_it() {
+        // #113: this is what the outer lens_handle/good_things_handle .join() in
+        // pipeline/review.rs relies on being true one layer down — an actual panic!(), not
+        // just a returned Err, must not take the whole test process down.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // suppress the panic backtrace noise in test output
+        let items = vec![1, 2, 3];
+        let results = par_map(2, items, |i| {
+            if i == 2 {
+                panic!("boom on {i}");
+            }
+            Ok::<_, anyhow::Error>(i * 10)
+        });
+        std::panic::set_hook(default_hook);
+
+        assert_eq!(results.len(), 3);
+        let (oks, errs): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+        assert_eq!(oks.len(), 2);
+        assert_eq!(errs.len(), 1);
+    }
 }

@@ -146,9 +146,19 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             .is_some()
             .then(|| s.spawn(|| lens::review_good_things(cheap_llm, &sp, &inp)));
 
-        let lens_results = lens_handle.join().expect("lens review thread panicked");
-        let good_things_result =
-            good_things_handle.map(|h| h.join().expect("good_things thread panicked"));
+        // #113: par_map already isolates per-item worker panics into a Result — this thread
+        // itself panicking (outside per-item processing) shouldn't be treated any differently
+        // and take the whole CLI down with it. A single synthetic error entry composes with the
+        // existing "for r in lens_results { ... Err(e) => stage_errors.push(...) }" loop below
+        // exactly like a normal per-lens failure would.
+        let lens_results: Vec<Result<(String, lens::LensOutput)>> = match lens_handle.join() {
+            Ok(r) => r,
+            Err(_) => vec![Err(anyhow::anyhow!("lens review thread panicked"))],
+        };
+        let good_things_result = good_things_handle.map(|h| {
+            h.join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("good_things thread panicked")))
+        });
         (lens_results, good_things_result)
     });
 

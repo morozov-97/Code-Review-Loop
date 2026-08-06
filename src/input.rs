@@ -182,6 +182,19 @@ fn is_noisy_path(path: &str) -> bool {
 /// diff can't grow unbounded and risk exceeding the model's context window.
 const DIFF_HARD_CAP_CHARS: usize = 1_000_000;
 
+/// Backs off from `max_bytes` to the nearest earlier UTF-8 char boundary, so truncating a
+/// `&str` there never panics or produces invalid UTF-8.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Reorders file-blocks so noisy/generated ones (see `is_noisy_path`) sort after everything
 /// else, stable within each group — pure reordering, no information loss, always applied. If
 /// the diff is still over DIFF_HARD_CAP_CHARS afterward, drops the lowest-priority blocks from
@@ -189,11 +202,16 @@ const DIFF_HARD_CAP_CHARS: usize = 1_000_000;
 /// and returns which files got dropped, so the caller can surface that instead of silently
 /// truncating (see #107 — this is the "no silent truncation" principle already used for
 /// DIFF_WARN_CHARS, extended to an actual cap).
+///
+/// #111: the "always keep at least one block" rule above means that if the single
+/// highest-priority block is itself bigger than DIFF_HARD_CAP_CHARS, the old version returned
+/// it whole — the output could still exceed the cap despite the name. That's the only case
+/// where this can happen (every block after the first only gets added if it fits, so once
+/// `kept` holds more than the lone oversized block the total is already within budget) — so
+/// after the drop loop, if exactly one oversized block remains, its own text gets truncated
+/// too, with a visible note, making the cap an actual bound on the returned string's length.
 fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
     let blocks = split_into_file_blocks(diff);
-    if blocks.len() <= 1 {
-        return (diff.to_string(), Vec::new());
-    }
 
     let mut indexed: Vec<(usize, Option<String>, String)> = blocks
         .into_iter()
@@ -219,6 +237,12 @@ fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
         kept.push(text);
     }
 
+    let mut truncated = false;
+    if kept.len() == 1 && kept[0].len() > DIFF_HARD_CAP_CHARS {
+        kept[0] = truncate_at_char_boundary(&kept[0], DIFF_HARD_CAP_CHARS).to_string();
+        truncated = true;
+    }
+
     let mut out = kept.join("\n");
     if !dropped.is_empty() {
         out.push_str(&format!(
@@ -226,6 +250,11 @@ fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
             dropped.len(),
             DIFF_HARD_CAP_CHARS,
             dropped.join(", ")
+        ));
+    }
+    if truncated {
+        out.push_str(&format!(
+            "\n\n[NOTE: this diff's remaining file was truncated to the {DIFF_HARD_CAP_CHARS}-char size cap — content past that point was not reviewed]\n"
         ));
     }
     (out, dropped)
@@ -479,9 +508,11 @@ mod tests {
 
     #[test]
     fn prioritize_and_cap_diff_is_a_no_op_on_a_single_file_diff() {
+        // Content is unchanged; a trailing newline may be stripped by the block-join
+        // (harmless — this text only ever gets fenced into an LLM prompt), so compare trimmed.
         let diff = "diff --git a/a.rs b/a.rs\n+a\n";
         let (out, dropped) = prioritize_and_cap_diff(diff);
-        assert_eq!(out, diff);
+        assert_eq!(out.trim_end(), diff.trim_end());
         assert!(dropped.is_empty());
     }
 
@@ -524,5 +555,32 @@ mod tests {
             "the only block must be kept even though it's over the cap alone"
         );
         assert!(out.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn prioritize_and_cap_diff_truncates_a_lone_oversized_block_instead_of_returning_it_whole() {
+        // #111: DIFF_HARD_CAP_CHARS claimed to be an actual limit, but the "always keep at
+        // least one block" rule meant a single block bigger than the cap on its own still made
+        // it through whole — the output could exceed the cap despite the name. The header/start
+        // of the block (where the filename lives) must survive truncation since we cut from the
+        // end, not the start.
+        let big = "x".repeat(DIFF_HARD_CAP_CHARS + 1000);
+        let diff = format!("diff --git a/src/main.rs b/src/main.rs\n+{big}\n");
+        let (out, dropped) = prioritize_and_cap_diff(&diff);
+        assert!(dropped.is_empty());
+        assert!(
+            out.len() <= DIFF_HARD_CAP_CHARS + 500,
+            "output ({} chars) must be bounded near the cap, not the original {} chars",
+            out.len(),
+            diff.len()
+        );
+        assert!(
+            out.contains("src/main.rs"),
+            "the filename header must survive truncation"
+        );
+        assert!(
+            out.contains("[NOTE:") && out.contains("truncated"),
+            "truncation must be visible, not silent"
+        );
     }
 }

@@ -321,6 +321,12 @@ sequenceDiagram
   lens count + discourse + requirements + optional prior fix-check + optional human-voice.
 - For large diffs, concurrency is configurable; the current implementation can parallelize
   lens review tasks.
+- The diff is reordered before it's sent anywhere: noisy/generated file-blocks (lockfiles,
+  `vendor`/`dist`/`build`/`node_modules` paths, minified assets) sort after everything else, so
+  they're the first to go if the diff needs trimming. Past a 1,000,000-character hard cap, the
+  lowest-priority blocks are dropped from the tail — visibly, with a warning and an in-diff note
+  listing what got dropped, never silently. `report.md`'s file/line-count stats still reflect the
+  full original diff regardless of what got trimmed from what's actually sent to the LLM.
 - `claude -p` runtime depends on repository size and prompt density; expect seconds to
   minutes per run.
 

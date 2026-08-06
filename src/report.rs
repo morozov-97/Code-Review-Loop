@@ -110,9 +110,20 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         "# Code Review — {} (round {})\n\n",
         spec.name, round
     ));
+    // #112: verdict/score are computed purely from whatever findings survived — if a stage
+    // failed (a lens erroring out, etc.), that's recorded in stage_errors but was previously
+    // never reflected in the verdict itself, so a partial review could read as a clean,
+    // fully-confident one unless you scrolled down to the separate stage-errors section below.
+    // This puts the reliability signal right on the verdict line, where it's actually seen.
+    let partial_marker = if stage_errors.is_empty() {
+        String::new()
+    } else {
+        " (PARTIAL — see ⚠ below)".to_string()
+    };
     md.push_str(&format!(
-        "**Verdict: {}**  ·  Score: {}/100  ·  Effort: {}/5  ·  {} files changed (+{}/-{})\n\n",
+        "**Verdict: {}{}**  ·  Score: {}/100  ·  Effort: {}/5  ·  {} files changed (+{}/-{})\n\n",
         quant.verdict,
+        partial_marker,
         quant.score,
         quant.estimated_effort_1_5,
         input.changed_files.len(),
@@ -579,6 +590,87 @@ mod tests {
         assert!(
             md.contains("Merged into security-r1-1"),
             "MERGED reason should show the merge target"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_marks_the_verdict_line_partial_when_a_stage_failed() {
+        // #112: verdict/score are computed purely from whatever findings survived a partial
+        // run — this must be visible right on the verdict line itself, not only in the
+        // separate stage-errors section further down where a quick glance would miss it.
+        let spec = test_spec();
+        let input = test_input();
+        let quant = test_quant();
+        let dir = std::env::temp_dir().join("codereview-loop-report-partial-verdict-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["security".to_string()],
+            round: 1,
+            findings: &[],
+            resolved: &HashMap::new(),
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &[],
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &["lens review failed: security".to_string()],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        let verdict_line = md.lines().find(|l| l.starts_with("**Verdict:")).unwrap();
+        assert!(
+            verdict_line.contains("(PARTIAL"),
+            "verdict line must carry a partial-review marker when stage_errors is non-empty:\n{verdict_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_leaves_the_verdict_line_unmarked_when_no_stage_failed() {
+        let spec = test_spec();
+        let input = test_input();
+        let quant = test_quant();
+        let dir = std::env::temp_dir().join("codereview-loop-report-clean-verdict-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["security".to_string()],
+            round: 1,
+            findings: &[],
+            resolved: &HashMap::new(),
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &[],
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &[],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        let verdict_line = md.lines().find(|l| l.starts_with("**Verdict:")).unwrap();
+        assert!(
+            !verdict_line.contains("PARTIAL"),
+            "verdict line must not be marked partial when no stage failed:\n{verdict_line}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
