@@ -348,7 +348,7 @@ replacement for their judgment:
 
 - Post the report as a PR comment or check-run **annotation**, not a required status check that
   blocks merge on its own.
-- Findings that assert something is *absent* from the diff (`"~가 diff에 없다"`,
+- Findings that assert something is *absent* from the diff (`"not in the diff"`,
   `"not present"`, `"missing"`) are the most failure-prone category — discourse now has the actual
   diff to verify these against (previously it didn't; see `src/discourse.rs`'s `ctx` handling), but
   an LLM can still be confidently wrong. Spot-check high-impact absence claims against the diff

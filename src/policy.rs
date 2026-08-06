@@ -35,11 +35,12 @@ fn is_word_boundary_char(c: char) -> bool {
     !c.is_alphanumeric()
 }
 
-/// 순수 substring 매칭은 패턴이 다른 단어 중간에서 우연히 매치되는 걸 못 막는다 — 예:
-/// "tests"(트레일링 슬래시를 빠뜨린 흔한 오타)가 "contests/foo.rs"의 "con[tests]/..."처럼
-/// 단어 중간에서 매치돼 테스트 파일이 아닌 걸 테스트 파일로 오판한다. 패턴 자신의 첫/끝
-/// 글자가 이미 구두점(밑줄·점 등)이면 그 자체가 경계 역할을 하므로("_test.", "README" 뒤에
-/// 오는 ".md") path 쪽 인접 글자가 영숫자일 때만 매치를 무효화한다.
+/// Plain substring matching can't prevent a pattern from accidentally matching in the middle of
+/// a different word — e.g. "tests" (a common typo for a trailing-slash-less pattern) matches
+/// inside "contests/foo.rs" as "con[tests]/...", misclassifying a non-test file as a test file.
+/// If the pattern's own first/last character is already punctuation (underscore, dot, etc.),
+/// that itself acts as a boundary (e.g. "_test.", the ".md" following "README"), so the match is
+/// only invalidated when the adjacent character on the path side is alphanumeric.
 fn matches_word_boundary(path: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return false;
@@ -64,9 +65,9 @@ fn matches_word_boundary(path: &str, pattern: &str) -> bool {
     })
 }
 
-/// "test/"처럼 슬래시로 끝나는(디렉터리 스타일) 패턴은 경로 세그먼트 경계에서만 매치되게
-/// 강제한다 — 안 그러면 "test/"가 "contest/practice.rs"의 "con[test/]..."처럼 단어 중간에서
-/// 우연히 매치돼 테스트/문서 파일이 아닌 것을 테스트 파일로 오판한다.
+/// Patterns ending in a slash (directory-style), like "test/", are forced to match only at path
+/// segment boundaries — otherwise "test/" would accidentally match mid-word inside
+/// "contest/practice.rs" as "con[test/]...", misclassifying a non-test/doc file as a test file.
 fn matches_one(path: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return false;
@@ -81,8 +82,9 @@ fn matches_one(path: &str, pattern: &str) -> bool {
     }
 }
 
-/// 테스트 동반 여부. spec.test_path_patterns 미설정 시 NOT_CONFIGURED.
-/// 가정: 테스트/문서 패턴 둘 다 아닌 파일 변경 = "동작 변경"으로 간주(설계 판단, 불확실).
+/// Whether tests accompany the change. NOT_CONFIGURED when spec.test_path_patterns is unset.
+/// Assumption: a file change matching neither the test nor doc patterns is treated as a
+/// "behavior change" (design choice, uncertain).
 fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
     if spec.test_path_patterns.is_empty() {
         return PolicyResult {
@@ -169,8 +171,9 @@ fn diff_size(spec: &Spec, input: &Input) -> PolicyResult {
     }
 }
 
-/// 문서/변경이력 동반 여부. spec.doc_path_patterns 미설정 시 NOT_CONFIGURED.
-/// 가정: "공개 API/설정 변경"을 테스트·문서 패턴 둘 다 아닌 파일 변경으로 근사(설계 판단, 불확실).
+/// Whether docs/changelog accompany the change. NOT_CONFIGURED when spec.doc_path_patterns is unset.
+/// Assumption: "public API/config change" is approximated as a file change matching neither the
+/// test nor doc patterns (design choice, uncertain).
 fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
     if spec.doc_path_patterns.is_empty() {
         return PolicyResult {
@@ -254,8 +257,8 @@ mod tests {
 
     #[test]
     fn matches_one_rejects_mid_word_substring_for_bare_word_patterns_without_trailing_slash() {
-        // 트레일링 슬래시를 빠뜨린 흔한 오타("test/" 대신 "tests") — 이미 고친
-        // 슬래시-종료 패턴 버그와 동일 클래스가 이 스펠링에도 재현되면 안 된다.
+        // A common typo omitting the trailing slash ("tests" instead of "test/") — this spelling
+        // must not reproduce the same class of bug already fixed for slash-terminated patterns.
         assert!(!matches_one("src/contests/foo.rs", "tests"));
         assert!(!matches_one("src/latest.rs", "test"));
     }

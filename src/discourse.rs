@@ -21,11 +21,12 @@ finding의 claim/evidence는 원본 리뷰어가 남긴 요약일 뿐 진실이 
 diff에 실제로 존재하는 코드를 없다고 하는 주장은 반박(CHALLENGE, challenge_axis=existence) 또는 기각(REJECTED) 대상이다. \
 반드시 지정된 JSON 스키마로만 응답한다.";
 
-/// 필드 전부 `#[serde(default)]` — 실전에서 LLM이 이 중 하나(주로 detail)를 빠뜨리면
-/// discourse 라운드 전체가 스키마 불일치로 죽고 리포트 자체가 안 나오는 걸 직접 겪었다
-/// (canary_flutter 실사용 테스트). kind/target이 비면 해당 move는 어차피 어떤 finding도
-/// 못 겨냥해 투표/카운트에서 조용히 무효표가 될 뿐이라(quantify 로직상 안전), 필드 하나
-/// 없다고 라운드 전체를 죽이는 것보다 낫다.
+/// All fields use `#[serde(default)]` — we hit a real case where the LLM omitted one of
+/// these (usually `detail`) and it killed the entire discourse round with a schema mismatch,
+/// so no report came out at all (canary_flutter production test). If `kind`/`target` is empty,
+/// that move can't target any finding anyway, so it just becomes a silent no-op in the
+/// vote/count (safe per the quantify logic) — better than letting a missing field kill the
+/// whole round.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Move {
     #[serde(rename = "move", default)]
@@ -39,21 +40,22 @@ pub struct Move {
     #[serde(default)]
     pub new_evidence: String,
     #[serde(default)]
-    pub confidence: String, // high|medium|low (AGREE/CHALLENGE에만 의미 있음)
-    /// CHALLENGE에만 의미 있음: existence|severity. 정규화는 normalize_challenge_axis 참고.
+    pub confidence: String, // high|medium|low (only meaningful for AGREE/CHALLENGE)
+    /// Only meaningful for CHALLENGE: existence|severity. See normalize_challenge_axis for normalization.
     #[serde(default)]
     pub challenge_axis: String,
 }
 
 const VALID_CHALLENGE_AXES: [&str; 2] = ["EXISTENCE", "SEVERITY"];
 
-/// 실전에서 발견: 4개 렌즈가 독립적으로 같은 SQL injection을 잡았는데, "심각도가
-/// 과대평가"라는 취지의 CHALLENGE 하나가 existence 반박과 동일한 투표 가중치로 집계되며
-/// finding이 UNCERTAIN까지 밀려 리포트에서 완전히 사라졌다(#75). challenge_axis가
-/// 없거나 스키마 밖 값이면 "SEVERITY"(투표에 영향 없음)로 안전하게 떨어뜨린다 —
-/// 이 세션 전체가 따른 "실패는 finding을 못 놓치는 방향으로" 원칙과 같은 이유:
-/// existence로 잘못 기본값을 주면 LLM이 이 신규 필드를 못 채울 때마다 예전의
-/// "심각도 이견이 finding을 지운다" 버그가 조용히 재현된다.
+/// Found in production: 4 lenses independently caught the same SQL injection, but a single
+/// CHALLENGE meaning "severity is overstated" got tallied with the same vote weight as an
+/// existence dispute, pushing the finding to UNCERTAIN and making it vanish from the report
+/// entirely (#75). If challenge_axis is missing or outside the schema, we safely fall back to
+/// "SEVERITY" (no effect on the vote) — the same reasoning behind this whole session's
+/// principle of "fail in the direction that can't lose a finding": defaulting to existence
+/// instead would silently reproduce the old "a severity disagreement erases the finding" bug
+/// every time the LLM fails to fill in this new field.
 fn normalize_challenge_axis(raw: &str) -> String {
     let upper = raw.trim().to_ascii_uppercase();
     if VALID_CHALLENGE_AXES.contains(&upper.as_str()) {
@@ -63,21 +65,22 @@ fn normalize_challenge_axis(raw: &str) -> String {
     }
 }
 
-/// ReConcile식 confidence bucket → 가중치. 라운드 소진 후 잔여 UNCERTAIN을
-/// 판정 없이 버리는 대신 AGREE/CHALLENGE 누적으로 최종 판정한다.
+/// ReConcile-style confidence bucket → weight. Instead of discarding leftover UNCERTAIN
+/// findings without a verdict once rounds run out, we make a final call from accumulated
+/// AGREE/CHALLENGE votes.
 fn confidence_weight(c: &str) -> f64 {
     match c {
         "high" => 1.0,
         "low" => 0.3,
-        _ => 0.6, // medium 및 미기재
+        _ => 0.6, // medium and unspecified
     }
 }
 
 const VOTE_THRESHOLD: f64 = 0.6;
 
-/// finding 하나에 직접 겨냥된 AGREE/CHALLENGE(existence)만 집계한다(merge_vote_weight
-/// 자체는 포함 안 함 — merge_vote_weight가 이 함수를 재귀적으로 부를 때 "이 finding
-/// 자체가 얼마나 신뢰받았는지"만 따로 떼어보기 위함).
+/// Tallies only the AGREE/CHALLENGE(existence) votes that directly target one finding
+/// (excludes merge_vote_weight itself — this lets merge_vote_weight, when it calls this
+/// function recursively, isolate just "how much this finding itself was trusted").
 fn direct_vote_net(audit: &[DiscourseAudit], target_id: &str) -> f64 {
     audit
         .iter()
@@ -91,17 +94,19 @@ fn direct_vote_net(audit: &[DiscourseAudit], target_id: &str) -> f64 {
         .sum()
 }
 
-/// finding X가 Y로 MERGED되면 discourse는 "X와 Y는 같은 문제"라 판단한 것이지 X가
-/// 가짜라는 뜻이 아니다 — 그런데 MERGE 자체는 생존자(Y)를 겨냥한 AGREE/CHALLENGE 투표가
-/// 아니라서, Y를 직접 겨냥하는 투표가 하나도 없으면 Y는 아무 투표 없이 UNCERTAIN으로
-/// 남아 점수에 전혀 반영되지 않는다(두 렌즈가 독립적으로 잡은 버그가 점수 0으로 증발).
-/// MERGED 판정 자체를 high-confidence AGREE 1표와 동등하게 취급해 생존자 쪽 집계에 더한다.
+/// When finding X gets MERGED into Y, discourse has decided "X and Y are the same issue,"
+/// not that X is fake — but the MERGE itself isn't an AGREE/CHALLENGE vote targeting the
+/// survivor (Y), so if nothing directly targets Y, it's left with no votes at all and stays
+/// UNCERTAIN, never factoring into the score (two lenses independently catching the same bug
+/// then evaporates to a score of 0). We treat the MERGED verdict itself as equivalent to one
+/// high-confidence AGREE vote and add it to the survivor's tally.
 ///
-/// 단, X 자체가 existence 축 CHALLENGE로 순 투표가 음수(반박이 우세)인 채로 MERGED됐다면
-/// 그 반박 신호를 무시하고 생존자를 세탁 확정시키면 안 된다 — 그런 병합은 credit하지
-/// 않는다(0, 페널티는 아님 — 병합 자체가 틀렸다는 뜻은 아니므로). 체인(A→B→C)도
-/// 재귀적으로 따라가며 각 홉을 독립적으로 같은 기준으로 판정한다 — 사이클은 방문
-/// 집합으로 방지한다.
+/// However, if X itself was MERGED while its net vote was negative from an existence-axis
+/// CHALLENGE (i.e. the dispute against it was winning), we must not ignore that dispute signal
+/// and launder the survivor into a confirmation — such a merge earns no credit (0, not a
+/// penalty — the merge itself isn't necessarily wrong). Chains (A→B→C) are also followed
+/// recursively, judging each hop independently by the same standard — a visited set guards
+/// against cycles.
 fn merge_vote_weight(
     resolved: &HashMap<String, Resolution>,
     audit: &[DiscourseAudit],
@@ -117,7 +122,7 @@ fn merge_vote_weight(
                 continue;
             }
             if !visited.insert(r.finding_id.clone()) {
-                continue; // 사이클(이미 방문) — 다시 안 셈
+                continue; // cycle (already visited) — don't count it again
             }
             if direct_vote_net(audit, &r.finding_id) >= 0.0 {
                 total += confidence_weight("high");
@@ -128,9 +133,10 @@ fn merge_vote_weight(
     total
 }
 
-/// 필드 전부 `#[serde(default)]` — 바로 위 Move와 동일 이유(실전에서 필드 하나 빠지면
-/// 라운드 전체가 죽는 걸 겪음)가 여기도 그대로 적용된다. status는 정규화되지 않은 값
-/// (빈 문자열 포함)이 들어와도 `normalize_status`가 UNCERTAIN으로 안전하게 떨어뜨린다.
+/// All fields use `#[serde(default)]` — same reason as Move above (we've seen one missing
+/// field kill an entire round in production) applies here too. Even if status arrives
+/// unnormalized (including an empty string), `normalize_status` safely falls back to
+/// UNCERTAIN.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {
     #[serde(default)]
@@ -145,10 +151,11 @@ pub struct Resolution {
 
 const VALID_RESOLUTION_STATUSES: [&str; 4] = ["CONFIRMED", "REJECTED", "MERGED", "UNCERTAIN"];
 
-/// severity/requirements.status와 동일 문제: quantify.rs/report.rs가 이 필드를 정확
-/// 문자열 매칭하므로, LLM이 대소문자·공백을 벗어나면 score/verdict/report 세 군데서
-/// 동시에 조용히 사라진다(CONFIRMED도 REJECTED도 아니게 되어 아예 안 보임). 실패는
-/// 안전한 방향(UNCERTAIN — 다음 라운드에 재판정 대상)으로 나야 한다.
+/// Same issue as severity/requirements.status: quantify.rs/report.rs match this field with
+/// an exact string comparison, so if the LLM strays on case or whitespace, it silently
+/// disappears from all three of score/verdict/report at once (neither CONFIRMED nor REJECTED,
+/// so it's invisible entirely). Failure must land on the safe side (UNCERTAIN — eligible for
+/// re-judgment in the next round).
 fn normalize_status(raw: &str) -> String {
     let upper = raw.trim().to_ascii_uppercase();
     if VALID_RESOLUTION_STATUSES.contains(&upper.as_str()) {
@@ -158,10 +165,10 @@ fn normalize_status(raw: &str) -> String {
     }
 }
 
-/// lens.rs::finding_id와 동일한 이유: outer_round(--prior로 이어지는 전체 파이프라인
-/// 라운드)를 넣지 않으면, discourse 내부 round는 매 outer_round 호출마다 다시 1부터
-/// 시작하므로 서로 다른 outer_round에서 우연히 같은 (round, index)가 나와 완전히 다른
-/// finding이 같은 id를 공유한다.
+/// Same reason as lens.rs::finding_id: without including outer_round (the overall pipeline
+/// round carried across via --prior), the discourse-internal round restarts from 1 on every
+/// outer_round call, so two different outer_rounds can coincidentally produce the same
+/// (round, index) pair and end up with two completely different findings sharing one id.
 fn surface_id(outer_round: usize, round: usize, index: usize) -> String {
     format!("surface-o{outer_round}-r{round}-{index}")
 }
@@ -181,10 +188,10 @@ pub struct DiscourseAudit {
     pub moves: Vec<Move>,
 }
 
-/// lens/reviewer는 의도적으로 노출하지 않는다 — 어떤 페르소나가 냈는지 알면
-/// discourse가 근거가 아니라 "권위"로 기울 수 있다(담합/편향 연구 근거).
-/// 원래 lens는 finding.id의 접두어(예: design-1)에 이미 남아있어 최종 리포트
-/// 매핑에는 지장 없다.
+/// lens/reviewer are deliberately not exposed here — knowing which persona raised a finding
+/// could tip discourse toward deferring to "authority" instead of evidence (based on research
+/// on collusion/bias). The original lens is already preserved in finding.id's prefix (e.g.
+/// design-1), so this doesn't hurt final report mapping.
 fn findings_catalog(findings: &[Finding], resolved: &HashMap<String, Resolution>) -> String {
     findings
         .iter()
@@ -235,21 +242,24 @@ fn build_round_prompt(
          \"severity\":\"P0|P1|P2|P3\",\"label\":<허용값 중 하나>,\"confidence\":\"high|medium|low\",\"recommendation\":\"...\"}}]}}\n",
         round = round,
         lenses = spec.lenses.iter().map(|l| l.id.as_str()).collect::<Vec<_>>().join(", "),
-        // claim/evidence는 diff 원문을 그대로 인용하는 게 정상 동작이다 — 첫 호출의
-        // shared_context에서 fenced()로 막았던 인젝션 payload가 discourse라는 2차 호출에
-        // 무방비로 재유입되지 않게 여기서도 fenced 처리.
+        // It's expected behavior for claim/evidence to quote the raw diff verbatim — fenced()
+        // is applied here too so an injection payload that was blocked by fenced() in the
+        // first call's shared_context can't sneak back in unguarded through this second call,
+        // discourse.
         catalog = fenced("findings", &findings_catalog(findings, resolved)),
     )
 }
 
-/// discourse 라운드 반복. 미해결/UNCERTAIN finding이 없어지거나 max_rounds에 도달하면 종료.
-/// 매 라운드 CHALLENGE 누락 시 1회 재요청.
+/// Iterates discourse rounds. Stops once there are no unresolved/UNCERTAIN findings left, or
+/// max_rounds is reached. Retries once per round if a round comes back with no CHALLENGE.
 ///
-/// `outer_round`는 `--prior`로 이어지는 전체 파이프라인 라운드(lens.rs::finding_id가 쓰는
-/// 것과 동일한 번호)다. discourse 내부 루프의 `round`(항상 1부터 다시 시작)만으로 SURFACE
-/// id를 만들면, 서로 다른 outer_round 호출에서 우연히 같은 (round, index) 조합이 나와
-/// 완전히 다른 finding이 같은 id를 공유하게 된다 — score 이중 집계·discourse 판정 덮어씀의
-/// 원인. lens.rs와 동일하게 outer_round를 id에 넣어 막는다.
+/// `outer_round` is the overall pipeline round carried across via `--prior` (the same number
+/// used by lens.rs::finding_id). If SURFACE ids were built from only the discourse-internal
+/// loop's `round` (which always restarts from 1), two different outer_round calls could
+/// coincidentally produce the same (round, index) pair, causing two completely different
+/// findings to share an id — the source of double-counted scores and overwritten discourse
+/// verdicts. We guard against this the same way lens.rs does, by folding outer_round into
+/// the id.
 pub fn run(
     llm: &Llm,
     spec: &Spec,
@@ -261,10 +271,11 @@ pub fn run(
     let max_rounds = max_rounds.max(1);
     let mut resolved: HashMap<String, Resolution> = HashMap::new();
     let mut audit: Vec<DiscourseAudit> = Vec::new();
-    // 예전엔 discourse가 findings_catalog(리뷰어가 남긴 claim/evidence 텍스트)만 보고
-    // diff 원문은 아예 못 봤다 — "diff에 없다"는 부재 주장을 실제로 대조해서 반박할 방법이
-    // 없었다(오탐 사례: dispose에 cancel 호출이 diff에 그대로 있는데 "없다"고 확정한 것).
-    // ctx를 실제로 붙여서 diff를 매 라운드 판정 근거로 쓸 수 있게 한다.
+    // Discourse used to see only findings_catalog (the claim/evidence text left by reviewers)
+    // and never the raw diff at all — there was no way to actually cross-check and refute an
+    // absence claim like "not in the diff" (a false-positive case: it confirmed a cancel call
+    // was "missing" from dispose even though it was right there in the diff). Attaching ctx
+    // lets every round use the actual diff as evidence when making a verdict.
     let ctx = shared_context(spec, input);
 
     for round in 1..=max_rounds {
@@ -286,8 +297,9 @@ pub fn run(
 
         for (i, sf) in dr.surfaced.iter_mut().enumerate() {
             sf.id = surface_id(outer_round, round, i + 1);
-            // lens는 코드가 항상 권위있게 채운다 — 일반 finding(lens.rs:221)과 동일 원칙.
-            // LLM이 스키마에 없는 lens 값을 자체적으로 채워 보내도 그대로 살아남지 않게 한다.
+            // The code always sets lens authoritatively — same principle as regular findings
+            // (lens.rs:221). Prevents any out-of-schema lens value the LLM sends from
+            // surviving as-is.
             sf.lens = "discourse".to_string();
             if sf.line.trim().is_empty() {
                 sf.line = "UNKNOWN".to_string();
@@ -317,8 +329,9 @@ pub fn run(
         }
     }
 
-    // 라운드 소진 후 남은 UNCERTAIN/미판정 finding: 그냥 버리지 않고
-    // 전체 라운드에 걸친 AGREE/CHALLENGE를 confidence-weighted vote로 집계해 최종 판정한다.
+    // UNCERTAIN/unjudged findings left after rounds run out: instead of just discarding them,
+    // tally the AGREE/CHALLENGE votes across all rounds as a confidence-weighted vote for a
+    // final verdict.
     for f in findings.iter() {
         let still_uncertain = resolved
             .get(&f.id)
@@ -334,8 +347,9 @@ pub fn run(
             .filter(|m| m.target == f.id)
             .map(|m| match m.kind.as_str() {
                 "AGREE" => confidence_weight(&m.confidence),
-                // severity 축 CHALLENGE는 finding 존재 자체를 반박하지 않으므로 투표에서
-                // 제외한다(CONNECT/SURFACE와 동일하게 0표) — existence 축만 기각 방향으로 집계.
+                // A severity-axis CHALLENGE doesn't dispute the finding's existence, so it's
+                // excluded from the vote (0 votes, same as CONNECT/SURFACE) — only the
+                // existence axis counts toward rejection.
                 "CHALLENGE" if m.challenge_axis == "EXISTENCE" => -confidence_weight(&m.confidence),
                 _ => 0.0,
             })
@@ -396,7 +410,8 @@ mod tests {
 
     #[test]
     fn move_deserializes_when_detail_is_missing() {
-        // 실전 재현: canary_flutter 리뷰에서 LLM이 detail 필드를 빠뜨려 라운드 전체가 죽었다.
+        // Production repro: in a canary_flutter review, the LLM omitted the detail field and
+        // it killed the entire round.
         let json = serde_json::json!({
             "move": "CHALLENGE",
             "lens": "tests",
@@ -419,8 +434,8 @@ mod tests {
 
     #[test]
     fn discourse_round_survives_resolution_missing_status() {
-        // Move.detail과 동일 계열 실패: resolutions 배열 원소 하나가 status를 빠뜨리면
-        // moves/surfaced까지 포함한 라운드 전체 파싱이 죽었다.
+        // Same class of failure as Move.detail: if one element of the resolutions array is
+        // missing status, parsing dies for the whole round, including moves/surfaced.
         let json = serde_json::json!({
             "moves": [],
             "resolutions": [{"finding_id": "security-r1-1"}],
@@ -452,8 +467,9 @@ mod tests {
 
     #[test]
     fn surface_id_differs_across_outer_prior_rounds_for_the_same_position() {
-        // 고침 전: discourse 내부 round는 매 --prior 호출마다 다시 1부터 시작해서,
-        // outer_round 1과 2의 (round=1, index=1)이 똑같이 "surface-r1-1"이 됐다.
+        // Before the fix: the discourse-internal round restarted from 1 on every --prior
+        // call, so outer_round 1 and 2's (round=1, index=1) both produced the same
+        // "surface-r1-1".
         assert_ne!(surface_id(1, 1, 1), surface_id(2, 1, 1));
     }
 
@@ -538,10 +554,11 @@ mod tests {
 
     #[test]
     fn run_confirms_merge_survivor_even_with_zero_direct_votes() {
-        // 실전 시나리오: 두 렌즈(design, security)가 같은 버그를 독립적으로 잡았다.
-        // discourse가 design 쪽을 security 쪽으로 MERGED 처리하지만, security 쪽을
-        // 직접 겨냥하는 AGREE/CHALLENGE는 이번 라운드에 하나도 없다 — 고치기 전에는
-        // security 쪽이 투표 0표로 UNCERTAIN에 머물러 점수에 전혀 반영 안 됐다.
+        // Production scenario: two lenses (design, security) independently caught the same
+        // bug. discourse MERGEs the design side into the security side, but there isn't a
+        // single AGREE/CHALLENGE directly targeting the security side this round — before the
+        // fix, the security side stayed at UNCERTAIN with zero votes and never factored into
+        // the score at all.
         let mut findings = vec![
             test_finding("설계 관점에서도 같은 버그", "evidence A"),
             test_finding("보안 관점에서 SQL 인젝션", "evidence B"),
@@ -584,17 +601,19 @@ mod tests {
 
     #[test]
     fn normalize_challenge_axis_falls_back_to_severity_on_unknown_or_empty_value() {
-        // "심각도만 문제 삼는 반박"이 기본값이어야 finding 존재 자체가 조용히 부정되지
-        // 않는다 — 이 필드를 LLM이 안 채워도(스키마 밖 값이어도) 안전한 쪽으로 떨어진다.
+        // The default has to be "a dispute that only takes issue with severity" so the
+        // finding's existence isn't silently negated — this falls to the safe side even if
+        // the LLM leaves the field unfilled (or sends an out-of-schema value).
         assert_eq!(normalize_challenge_axis(""), "SEVERITY");
         assert_eq!(normalize_challenge_axis("scope"), "SEVERITY");
     }
 
     #[test]
     fn run_confirms_finding_despite_severity_only_challenge() {
-        // 실전 재현(#75): 4개 렌즈가 독립 확인한 SQL injection이 "심각도 과대평가"
-        // 취지의 CHALLENGE 하나 때문에 UNCERTAIN까지 밀려 리포트에서 사라졌다. 고치기
-        // 전이었다면 이 테스트의 net은 AGREE(1.0) + CHALLENGE(-1.0) = 0.0으로 UNCERTAIN.
+        // Production repro (#75): an SQL injection independently confirmed by 4 lenses got
+        // pushed to UNCERTAIN and vanished from the report because of a single CHALLENGE
+        // meaning "severity is overstated." Before the fix, this test's net would have been
+        // AGREE(1.0) + CHALLENGE(-1.0) = 0.0, i.e. UNCERTAIN.
         let mut findings = vec![test_finding("SQL injection 발견", "evidence")];
         findings[0].id = "security-r1-1".to_string();
 
@@ -629,7 +648,8 @@ mod tests {
 
     #[test]
     fn run_still_lets_existence_challenge_suppress_confirmation() {
-        // 회귀 방지: severity 축을 투표에서 뺐다고 existence 축까지 무력화되면 안 된다.
+        // Regression guard: excluding the severity axis from the vote must not neutralize the
+        // existence axis too.
         let mut findings = vec![test_finding("가짜일 수 있는 주장", "evidence")];
         findings[0].id = "security-r1-1".to_string();
 
@@ -697,8 +717,8 @@ mod tests {
 
     #[test]
     fn merge_vote_weight_does_not_credit_a_disputed_source() {
-        // #87: A가 existence 축 CHALLENGE로 순 투표 음수인 채로 B에 MERGED되면, 그
-        // 반박을 무시하고 B를 세탁 확정시키면 안 된다.
+        // #87: if A gets MERGED into B while its net vote is negative from an existence-axis
+        // CHALLENGE, that dispute must not be ignored to launder B into a confirmation.
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), merged_resolution("a", "b"));
         let audit = vec![DiscourseAudit {
@@ -716,7 +736,7 @@ mod tests {
     fn merge_vote_weight_still_credits_an_undisputed_source() {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), merged_resolution("a", "b"));
-        let audit = Vec::new(); // 반박 없음
+        let audit = Vec::new(); // no disputes
         assert_eq!(
             merge_vote_weight(&resolved, &audit, "b"),
             confidence_weight("high")
@@ -725,7 +745,7 @@ mod tests {
 
     #[test]
     fn merge_vote_weight_propagates_through_a_merge_chain() {
-        // #88: A→B→C로 두 단계 병합되면 A의 신호도 C까지 전달돼야 한다.
+        // #88: if A→B→C merges across two hops, A's signal must propagate all the way to C too.
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), merged_resolution("a", "b"));
         resolved.insert("b".to_string(), merged_resolution("b", "c"));
@@ -746,15 +766,16 @@ mod tests {
         resolved.insert("a".to_string(), merged_resolution("a", "b"));
         resolved.insert("b".to_string(), merged_resolution("b", "a"));
         let audit = Vec::new();
-        // 무한루프 없이 끝나기만 하면 충분 — 정확한 값보다 종료가 핵심.
+        // It's enough that this terminates without an infinite loop — termination matters more
+        // than the exact value.
         let _ = merge_vote_weight(&resolved, &audit, "a");
     }
 
     #[test]
     fn run_does_not_launder_a_disputed_finding_via_merge() {
-        // #87 재현(run() 레벨): design-r1-1은 existence 축 CHALLENGE를 받고
-        // security-r1-1로 MERGED된다. security-r1-1 자체는 직접 투표가 하나도 없다 —
-        // 고치기 전이었다면 merge_vote_weight만으로 1.0을 받아 확정됐다.
+        // #87 repro (at the run() level): design-r1-1 receives an existence-axis CHALLENGE and
+        // gets MERGED into security-r1-1. security-r1-1 itself has zero direct votes — before
+        // the fix, it would have gotten confirmed off merge_vote_weight's 1.0 alone.
         let mut findings = vec![
             test_finding("의심스러운 SQL injection 주장", "evidence A"),
             test_finding("약한 보안 관련 지적", "evidence B"),

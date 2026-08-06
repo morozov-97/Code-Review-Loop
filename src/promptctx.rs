@@ -1,9 +1,10 @@
 use crate::input::Input;
 use crate::spec::Spec;
 
-/// `content` 안 최장 연속 백틱보다 긴 펜스로 감싼다. diff(신뢰할 수 없는 외부 입력) 안에
-/// 백틱 3개 이상 시퀀스를 넣어 코드펜스를 조기 종료시키고 그 뒤에 가짜 지시문을 이어붙이는
-/// prompt-injection을 막는다 — 고정 ``` 펜스는 content가 그 시퀀스를 포함하면 무력화된다.
+/// Wraps content in a fence longer than the longest run of consecutive backticks inside `content`.
+/// This prevents prompt injection where a diff (untrusted external input) contains a sequence of
+/// 3+ backticks to prematurely close the code fence and append fake instructions after it —
+/// a fixed ``` fence is defeated if content contains that same sequence.
 pub(crate) fn fenced(lang: &str, content: &str) -> String {
     let max_run = content
         .as_bytes()
@@ -15,7 +16,7 @@ pub(crate) fn fenced(lang: &str, content: &str) -> String {
     format!("{fence}{lang}\n{content}\n{fence}")
 }
 
-/// 모든 LLM 호출이 공유하는 컨텍스트 블록(맥락·컨벤션·요구사항·diff).
+/// Context block shared by all LLM calls (context, conventions, requirements, diff).
 pub fn shared_context(spec: &Spec, input: &Input) -> String {
     let mut c = String::new();
     c.push_str(
@@ -83,8 +84,8 @@ mod tests {
 
     #[test]
     fn shared_context_fences_conventions_and_requirements_like_diff() {
-        // shared_context 자신의 경고 문구는 diff/컨벤션/요구사항을 동등하게 "신뢰 못 할
-        // 외부 입력"이라 선언하는데, 실제로는 diff만 fenced()를 거쳤다 — 셋 다 거쳐야 한다.
+        // shared_context's own warning text declares diff/conventions/requirements as equally
+        // "untrusted external input", but in reality only diff went through fenced() — all three must.
         let input = Input {
             diff: "+ line".to_string(),
             changed_files: vec!["x".to_string()],
@@ -95,9 +96,9 @@ mod tests {
             deterministic_results: None,
         };
         let ctx = shared_context(&test_spec(), &input);
-        // 컨벤션/요구사항 안의 백틱 3개짜리 시퀀스가 그대로 최상위 펜스로 쓰였다면
-        // 그 뒤 텍스트가 "코드 블록 바깥"으로 탈출한다 — fenced()라면 더 긴 펜스로 감싸
-        // 안쪽 ``` 가 더 이상 블록을 끊지 못한다.
+        // If the 3-backtick sequence inside conventions/requirements were used as the top-level
+        // fence as-is, the text after it would escape "outside the code block" — fenced() wraps
+        // it in a longer fence so the inner ``` can no longer break the block.
         assert!(ctx.contains("````conventions\n"));
         assert!(ctx.contains("````requirements\n"));
     }

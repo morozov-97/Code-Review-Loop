@@ -5,15 +5,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// state.json 스키마 버전. 필드 추가/제거/의미 변경 시 올린다 — 그래야 옛 --out 디렉터리를
-/// 새 바이너리로 --prior 했을 때 조용히 잘못 해석되는 대신 명확한 에러로 알 수 있다.
+/// state.json schema version. Bump this when fields are added/removed/change meaning —
+/// that way, running an old --out directory through --prior with a new binary gives a clear
+/// error instead of silently misinterpreting it.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
-/// 라운드 종료 시점의 findings·판정 스냅샷. 다음 라운드(--prior)가 이어받는다.
+/// Snapshot of findings and verdicts at the end of a round. Picked up by the next round (--prior).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
-    /// 버저닝 도입 전(v1 미만) state.json에는 이 필드가 없었으므로 0으로 기본값 처리 —
-    /// load()에서 이 값이 STATE_SCHEMA_VERSION과 다르면 명시적으로 거부한다.
+    /// state.json files from before versioning was introduced (below v1) lacked this field,
+    /// so it defaults to 0 — load() explicitly rejects it if this differs from STATE_SCHEMA_VERSION.
     #[serde(default)]
     pub schema_version: u32,
     pub round: usize,
@@ -78,7 +79,7 @@ mod tests {
         let dir = std::env::temp_dir().join("codereview-loop-state-schema-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // schema_version 필드 자체가 없는(버저닝 도입 전) state.json을 흉내낸다.
+        // Simulates a state.json that predates versioning and lacks the schema_version field entirely.
         std::fs::write(
             dir.join("state.json"),
             r#"{"round":1,"findings":[],"resolved":{}}"#,

@@ -24,9 +24,9 @@ use std::path::PathBuf;
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum Backend {
-    /// claude -p 서브프로세스
+    /// claude -p subprocess
     Claude,
-    /// OpenRouter REST API (OPENROUTER_API_KEY 필요)
+    /// OpenRouter REST API (requires OPENROUTER_API_KEY)
     Openrouter,
 }
 
@@ -43,8 +43,8 @@ struct Cli {
     backend: Backend,
     #[arg(long, global = true)]
     model: Option<String>,
-    /// 렌즈 선정·good things·요구사항 검증·fix check 등 단순 판정 단계에 쓸 저비용 모델.
-    /// 미지정 시 --model과 동일(기존 동작 유지).
+    /// Low-cost model used for simple judgment stages like lens selection, good things,
+    /// requirements verification, fix check, etc. Defaults to --model when unset (preserves existing behavior).
     #[arg(long, global = true)]
     cheap_model: Option<String>,
     #[arg(long, default_value_t = 2, global = true)]
@@ -58,7 +58,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// 렌즈별 독립 리뷰 + discourse 교차검증(기본 파이프라인)
+    /// Independent per-lens review + discourse cross-verification (default pipeline)
     Review {
         #[arg(long)]
         spec: PathBuf,
@@ -70,26 +70,26 @@ enum Cmd {
         conventions: Option<PathBuf>,
         #[arg(long)]
         deterministic_results: Option<PathBuf>,
-        /// 렌즈 수동 지정(콤마 구분). 미지정 시 LLM이 diff 성격 보고 선정.
+        /// Manually specify lenses (comma-separated). If unset, the LLM picks based on the diff's nature.
         #[arg(long)]
         lenses: Option<String>,
         #[arg(long, default_value = "runs")]
         out: PathBuf,
-        /// 렌즈별 리뷰(review_lens)는 서로 독립이라 병렬 실행 가능 — 기본값을 3으로 둬서
-        /// (선정 렌즈 1~3개 + always 렌즈 1개 규모에 맞춤) 기본 실행이 직렬로 도는 걸 피한다.
+        /// Per-lens reviews (review_lens) are independent of each other and can run in parallel —
+        /// default is 3 (sized for 1-3 selected lenses + 1 always lens) to avoid running serially by default.
         #[arg(long, default_value_t = 3)]
         concurrency: usize,
-        /// discourse 최대 라운드 수
+        /// Maximum number of discourse rounds
         #[arg(long, default_value_t = 2)]
         max_rounds: usize,
-        /// 이전 라운드 --out 디렉터리(state.json). 지정 시 이전 확정 finding의 FIXED/STILL_OPEN 판정 추가.
+        /// Previous round's --out directory (state.json). When set, adds FIXED/STILL_OPEN verdicts for previously confirmed findings.
         #[arg(long)]
         prior: Option<PathBuf>,
-        /// 확정 findings·good things를 사람 리뷰 코멘트 톤으로 재작성해 리포트에 첨부
+        /// Rewrite confirmed findings/good things in a human reviewer comment tone and attach to the report
         #[arg(long)]
         human_voice: bool,
     },
-    /// PR 제목·요약·walkthrough·라벨·분리 가능 여부 + TODO 스캔
+    /// PR title/summary/walkthrough/labels/splittability + TODO scan
     Describe {
         #[arg(long)]
         spec: PathBuf,
@@ -102,7 +102,7 @@ enum Cmd {
         #[arg(long, default_value = "runs")]
         out: PathBuf,
     },
-    /// 구체적 코드 개선안(diff 스니펫 기반)
+    /// Concrete code improvement suggestions (based on diff snippets)
     Improve {
         #[arg(long)]
         spec: PathBuf,
@@ -124,8 +124,8 @@ fn main() {
     }
 }
 
-/// (본 모델, 저비용 모델) 쌍. `--cheap-model` 미지정 시 저비용 모델은 본 모델과 동일해
-/// 기존 동작을 그대로 유지한다. 둘 다 하나의 usage tracker를 공유해 합산 사용량을 낸다.
+/// A (main model, cheap model) pair. If `--cheap-model` isn't specified, the cheap model is the
+/// same as the main model, preserving existing behavior. Both share a single usage tracker to produce combined usage totals.
 fn build_llm(cli: &Cli) -> Result<(Llm, Llm)> {
     let usage = Llm::new_usage_tracker();
     let cheap_model = cli.cheap_model.clone().or_else(|| cli.model.clone());
@@ -226,8 +226,8 @@ fn run_review(
         conventions_path,
         deterministic_results_path,
     )?;
-    // 하드 상한은 아님 — 렌즈/discourse/verify 호출마다 diff 전체가 재전송되므로
-    // 큰 diff일수록 토큰 비용이 선형 이상으로 커진다는 것만 미리 알린다(silent truncation 없음).
+    // Not a hard cap — since the full diff is resent on every lens/discourse/verify call, this
+    // just gives an early warning that token cost grows more than linearly with diff size (no silent truncation).
     const DIFF_WARN_CHARS: usize = 300_000;
     if inp.diff.len() > DIFF_WARN_CHARS {
         eprintln!(
@@ -258,13 +258,13 @@ fn run_review(
         inp.removed_lines
     );
 
-    // 1~2단계(입력 정규화·컨벤션 주입)는 input::normalize + 각 프롬프트 빌더에서 처리됨.
+    // Steps 1-2 (input normalization, convention injection) are handled by input::normalize + each prompt builder.
 
-    // 4단계: 렌즈 선정
+    // Step 4: lens selection
     let optional_selected: Vec<String> = match lenses_arg {
         Some(s) => {
-            // 중복 지정("--lenses design,design")을 걸러낸다 — review_lens는 렌즈별로
-            // 한 번만 불려야 finding id(위치 기반 번호)가 그 안에서 서로 겹치지 않는다.
+            // Filters out duplicate specifications ("--lenses design,design") — review_lens must
+            // be called only once per lens so finding ids (position-based numbers) don't collide within it.
             let mut seen = std::collections::HashSet::new();
             let ids: Vec<String> = s
                 .split(',')
@@ -287,12 +287,15 @@ fn run_review(
     }
     println!("선정 렌즈: {}", selected_ids.join(", "));
 
-    // 7단계: 렌즈별 독립 리뷰(봉인 후 순차 공개 — 병렬 실행해도 서로 결과를 참조하지 않으므로 동일).
-    // 렌즈 하나가 실패해도(LLM 호출 에러 등) 나머지 렌즈 결과는 살리고, 실패는 리포트에
-    // 남긴다 — 렌즈 하나 때문에 리뷰 전체가 부분결과 없이 중단되는 걸 피한다.
-    // good_things는 findings에 의존하지 않는 독립 LLM 호출(diff/spec만 필요)인데도 예전엔
-    // 렌즈 리뷰가 다 끝난 뒤 순차로 실행됐다 — 별 이유 없이 리뷰 하나 분량의 왕복시간이
-    // 그대로 critical path에 더해짐. 별 스레드로 렌즈 par_map과 동시에 돌린다.
+    // Step 7: independent per-lens review (seal-then-reveal in sequence — equivalent to parallel
+    // execution since results never reference each other).
+    // Even if one lens fails (LLM call error, etc.), the remaining lens results are kept and the
+    // failure is recorded in the report — avoids aborting the whole review without partial
+    // results just because of one lens.
+    // good_things is an independent LLM call that doesn't depend on findings (only needs
+    // diff/spec), yet it used to run sequentially after all lens reviews finished — adding one
+    // review's worth of round-trip time to the critical path for no real reason. Now it runs
+    // concurrently with the lens par_map on a separate thread.
     let (lens_results, good_things_result): (
         Vec<Result<(String, lens::LensOutput)>>,
         Option<Result<lens::GoodThingsOutput>>,
@@ -338,8 +341,8 @@ fn run_review(
         }
     }
 
-    // good_things는 findings/score/verdict에 영향 없는 부가 정보라, 실패해도 핵심 리뷰 결과를
-    // 통째로 날릴 이유가 없다 — 경고만 남기고 빈 목록으로 계속 진행한다.
+    // good_things is supplementary info that doesn't affect findings/score/verdict, so there's no
+    // reason for its failure to discard the core review result entirely — just log a warning and continue with an empty list.
     let good_things = match good_things_result {
         Some(Ok(out)) => out.good_things,
         Some(Err(e)) => {
@@ -350,7 +353,7 @@ fn run_review(
         None => Vec::new(),
     };
 
-    // 8~9단계: discourse 라운드
+    // Steps 8-9: discourse rounds
     let (audit, mut resolved) = if findings.is_empty() {
         println!("finding 없음 — discourse 생략");
         (Vec::new(), std::collections::HashMap::new())
@@ -359,8 +362,8 @@ fn run_review(
         discourse::run(llm, &sp, &inp, &mut findings, max_rounds, round)?
     };
 
-    // 이전 라운드(--prior) 대비: 확정됐던 finding이 이번 diff에서 고쳐졌는지 판정.
-    // STILL_OPEN이면 이번 라운드 작업셋에 재편입(score/verdict에 계속 반영).
+    // Compared to the previous round (--prior): determine whether previously confirmed findings
+    // were fixed in this diff. If STILL_OPEN, re-fold them into this round's working set (keeps affecting score/verdict).
     let mut fix_results: Vec<fixcheck::FixStatus> = Vec::new();
     if let Some(ps) = &prior_state {
         let prior_confirmed: Vec<Finding> = ps
@@ -374,9 +377,9 @@ fn run_review(
             })
             .cloned()
             .collect();
-        // 이번 라운드 자체가 이미 CONFIRMED한 findings를 fixcheck에 참고자료로 준다 —
-        // prior finding이 여전히 안 고쳐졌는데 이번 라운드가 동일 근본 원인을 새 id로
-        // 다시 잡았다면 SUPERSEDED로 판정해 아래서 재편입(이중 집계)하지 않는다.
+        // Give fixcheck the findings this round itself already CONFIRMED as reference material —
+        // if a prior finding still hasn't been fixed but this round caught the same root cause
+        // under a new id, it's judged SUPERSEDED so it isn't re-folded below (double counting).
         let this_round_confirmed: Vec<&Finding> = findings
             .iter()
             .filter(|f| {
@@ -393,12 +396,13 @@ fn run_review(
             &prior_confirmed,
             &this_round_confirmed,
         )?;
-        // 재편입은 discourse::run(위)보다 뒤에 실행되므로 이번 라운드 discourse 검증을
-        // 거치지 않는다(의도됨 — fixcheck 자체가 "여전히 열려있는지" 판정 담당). id 자체의
-        // 중복 재편입만 막는다: discourse SURFACE id는 outer_round로 스코핑돼 이제 라운드
-        // 간 충돌은 없지만, 같은 id가 이 루프에서 두 번 안 들어가게 방어적으로 확인한다.
-        // SUPERSEDED는 애초에 STILL_OPEN이 아니므로 아래 조건에서 자연히 재편입되지 않는다
-        // (fixcheck가 LLM 판단으로 SUPERSEDED를 잘못 매기는 경우까지는 못 잡는 잔여 한계).
+        // Since re-folding runs after discourse::run (above), it doesn't go through this round's
+        // discourse verification (intentional — fixcheck itself is responsible for judging
+        // "still open"). Only guards against duplicate re-folding of the same id: discourse
+        // SURFACE ids are now scoped by outer_round so there's no cross-round collision, but we
+        // still defensively check the same id doesn't get added twice in this loop. SUPERSEDED
+        // isn't STILL_OPEN to begin with, so it's naturally excluded from re-folding below
+        // (residual limitation: doesn't catch cases where fixcheck's LLM judgment mislabels something as SUPERSEDED).
         for fr in &fix_results {
             if fr.status == "STILL_OPEN" {
                 if let Some(orig) = prior_confirmed.iter().find(|f| f.id == fr.finding_id) {
@@ -420,17 +424,18 @@ fn run_review(
         }
     }
 
-    // 6단계: 정책 렌즈(로컬 결정론)
+    // Step 6: policy lens (local, deterministic)
     let policies = policy::check_all(&sp, &inp);
 
-    // 11단계: 요구사항 검증
+    // Step 11: requirements verification
     let confirmed_refs: Vec<&Finding> = findings
         .iter()
         .filter(|f| resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED"))
         .collect();
-    // 실패 시 "요구사항 미제공"(None)과 같은 취급으로 넘어가되, 그 둘을 헷갈리지 않도록
-    // stage_errors에 남긴다 — requirements가 verdict의 NEEDS_CONTEXT 판정에 관여하므로
-    // 조용히 통과시키는 것보다야 낫지만, 렌즈 실패처럼 이 단계 하나로 리뷰 전체를 죽이진 않는다.
+    // On failure, treated the same as "requirements not provided" (None), but recorded in
+    // stage_errors so the two aren't conflated — since requirements factors into the verdict's
+    // NEEDS_CONTEXT judgment, this beats silently letting it pass, but this single stage still
+    // doesn't kill the whole review the way a lens failure would.
     let req_results = match requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs) {
         Ok(r) => r,
         Err(e) => {
@@ -440,7 +445,7 @@ fn run_review(
         }
     };
 
-    // 10단계: 정량 요약 + verdict
+    // Step 10: quantitative summary + verdict
     let quant = quantify::summarize(
         &inp,
         &findings,
@@ -462,7 +467,7 @@ fn run_review(
         None
     };
 
-    // 12단계: 출력
+    // Step 12: output
     let path = report::write(report::ReportCtx {
         out_dir: &out_dir,
         spec: &sp,
@@ -544,10 +549,10 @@ fn prepare_out(p: &PathBuf) -> Result<PathBuf> {
     Ok(p.clone())
 }
 
-/// concurrency 만큼 스레드를 묶어 순차 실행(청크 단위 배리어).
-/// 항목별 결과를 개별 Result로 모은다(하나 실패해도 나머지는 계속 처리) — 호출부가
-/// 부분 실패를 그대로 무시할지, 에러만 걸러내 계속 진행할지 결정한다. 과거엔 첫 실패에서
-/// 전체를 중단시켰는데, 렌즈 리뷰처럼 서로 독립적인 항목엔 과함(다른 렌즈까지 다 날아감).
+/// Groups threads by concurrency and runs them in sequence (chunk-wise barrier).
+/// Collects each item's result as an individual Result (processing continues even if one fails) —
+/// the caller decides whether to ignore partial failures as-is or filter out errors and continue.
+/// It used to abort everything on the first failure, which is excessive for independent items like lens reviews (would wipe out the other lenses too).
 fn par_map<T, R, F>(concurrency: usize, items: Vec<T>, f: F) -> Vec<Result<R>>
 where
     T: Send,
@@ -607,11 +612,11 @@ mod par_map_tests {
     }
 }
 
-/// 실제 API 없이 12단계 파이프라인이 실제로 맞물려 도는지 확인하는 최소 E2E 테스트.
-/// Llm::fixture는 호출 순서대로 응답을 꺼내므로 concurrency=1(직렬)로만 결정적이다 —
-/// 시나리오도 그에 맞춰 렌즈 1개(always만, optional 없음 → 렌즈 선정 LLM 호출 자체가
-/// 생략됨)·good_things 렌즈 없음·requirements 없음·--prior 없음·human-voice 없음으로
-/// 최소화해서, 정확히 두 번의 LLM 호출(렌즈 리뷰 1회 + discourse 1라운드)만 필요하게 짰다.
+/// A minimal E2E test verifying that the 12-step pipeline actually meshes together, without a
+/// real API. Llm::fixture pulls responses out in call order, so it's only deterministic with
+/// concurrency=1 (serial) — the scenario is minimized to match: 1 lens (always only, no
+/// optional → the lens-selection LLM call itself is skipped), no good_things lens, no
+/// requirements, no --prior, no human-voice, so exactly two LLM calls are needed (1 lens review + 1 discourse round).
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
@@ -660,10 +665,10 @@ always = true
 
         let out_dir = dir.join("out");
 
-        // 1) review_lens("test_lens", round=1) 응답 — id는 review_lens가 덮어쓰므로 임의값으로 둬도 됨.
+        // 1) review_lens("test_lens", round=1) response — id can be left arbitrary since review_lens overwrites it.
         let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"10","claim":"test claim","evidence":"test evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
-        // 2) discourse round 1 응답 — CHALLENGE를 포함해야 자동 재요청(3번째 호출)이 안 붙는다.
-        //    target id는 review_lens가 실제로 부여하는 "test_lens-r1-1"과 맞춰야 resolutions가 먹는다.
+        // 2) discourse round 1 response — must include a CHALLENGE, or an automatic re-request (3rd call) gets attached.
+        //    the target id must match "test_lens-r1-1", the id review_lens actually assigns, for resolutions to take effect.
         let discourse_response = r#"{"moves":[{"move":"CHALLENGE","lens":"reviewer","target":"test_lens-r1-1","detail":"needs more evidence","new_evidence":"","confidence":"medium"}],"resolutions":[{"finding_id":"test_lens-r1-1","status":"CONFIRMED","merged_into":"","reason":"confirmed for e2e test"}],"surfaced":[]}"#.to_string();
 
         let usage = Llm::new_usage_tracker();
@@ -672,7 +677,7 @@ always = true
 
         run_review(
             &llm, &cheap_llm, &spec_path, &diff_path, &None, &None, &None, &None, &out_dir,
-            1, // concurrency=1: fixture 큐 순서가 곧 호출 순서가 되도록 강제
+            1, // concurrency=1: forces the fixture queue order to match the call order
             1, // max_rounds
             &None, false,
         )

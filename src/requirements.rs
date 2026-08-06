@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 pub const REQ_SYSTEM: &str = "당신은 요구사항 충족 여부를 diff와 대조해 판정한다. \
 근거가 없으면 MET으로 판정하지 않는다. 반드시 지정된 JSON 스키마로만 응답한다.";
 
-/// 필드 전부 `#[serde(default)]` — discourse::Move/Resolution, fixcheck::FixStatus와
-/// 동일 이유(필드 하나 누락이 배열 전체 파싱을 죽이는 걸 방지). status 누락은
-/// normalize_status가 AMBIGUOUS로 안전하게 떨어뜨린다.
+/// All fields are `#[serde(default)]` — same reason as discourse::Move/Resolution and
+/// fixcheck::FixStatus (prevents a single missing field from killing the parse of the whole
+/// array). A missing status is safely dropped to AMBIGUOUS by normalize_status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequirementCheck {
     #[serde(default)]
@@ -30,9 +30,9 @@ struct RequirementsOutput {
 
 const VALID_STATUSES: [&str; 4] = ["MET", "MISSING", "AMBIGUOUS", "N/A"];
 
-/// severity와 동일한 문제: quantify.rs가 이 필드를 정확 문자열 매칭하므로, LLM이
-/// 지정된 리터럴에서 벗어나면 조용히 무시된다. 실패는 AMBIGUOUS(사람이 다시 봐야 함)
-/// 쪽으로 나야지, 조용히 검증을 통과한 것처럼 새면 안 된다.
+/// Same issue as severity: quantify.rs does exact string matching on this field, so if the LLM
+/// strays from the specified literals it gets silently ignored. Failures must surface as
+/// AMBIGUOUS (needs human re-review), not silently leak through as if validation passed.
 fn normalize_status(raw: &str) -> String {
     let upper = raw.trim().to_ascii_uppercase();
     if VALID_STATUSES.contains(&upper.as_str()) {
@@ -43,8 +43,8 @@ fn normalize_status(raw: &str) -> String {
 }
 
 fn build_task(findings_summary: &str) -> String {
-    // claim은 diff 원문을 인용할 수 있다 — shared_context에서 fenced()로 막았던
-    // 인젝션 payload가 이 2차 호출에 무방비로 재유입되지 않게 여기서도 fenced 처리.
+    // claim can quote the raw diff — apply fenced() here too so an injection payload that was
+    // blocked by fenced() in shared_context doesn't sneak back in unprotected in this second call.
     let fs = if findings_summary.is_empty() {
         "(없음)".to_string()
     } else {
@@ -59,7 +59,7 @@ fn build_task(findings_summary: &str) -> String {
     )
 }
 
-/// requirements 미제공 시 None 반환(검증 대상 없음, N/A 나열하지 않음).
+/// Returns None when requirements aren't provided (nothing to verify, no N/A listing).
 pub fn verify(
     llm: &Llm,
     spec: &Spec,
@@ -74,8 +74,8 @@ pub fn verify(
         .map(|f| format!("- [{}] {}:{} — {}", f.severity, f.file, f.line, f.claim))
         .collect::<Vec<_>>()
         .join("\n");
-    // shared_context에 요구사항·컨벤션·diff가 이미 포함됨 — 다른 호출과 동일한 ctx라
-    // OpenRouter 백엔드에서 캐시 재사용 대상이 된다.
+    // shared_context already includes requirements, conventions, and diff — since it's the same
+    // ctx as other calls, it becomes eligible for cache reuse on the OpenRouter backend.
     let ctx = shared_context(spec, input);
     let task = build_task(&findings_summary);
     let v = llm

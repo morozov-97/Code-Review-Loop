@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# promptfoo exec provider가 호출하는 래퍼. 인자로 받은 diff 파일 하나를 실제 codereview
-# 바이너리(--backend openrouter)로 리뷰하고, report.md 전체를 표준출력으로 낸다 —
-# assert-report.cjs가 그 텍스트를 보고 verdict/키워드를 판정한다.
+# Wrapper invoked by the promptfoo exec provider. Reviews a single diff file (passed as an argument)
+# with the actual codereview binary (--backend openrouter) and prints the entire report.md to stdout —
+# assert-report.cjs then reads that text to judge the verdict/keywords.
 set -euo pipefail
 
 diff_file="$1"

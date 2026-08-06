@@ -2,48 +2,48 @@
 
 ### What changed
 
-- [ ] 코드
-- [ ] 문서
-- [ ] 설정/도구
+- [ ] Code
+- [ ] Documentation
+- [ ] Configuration/tooling
 
 ### Why
 
-- 목적:
-- 해결하는 문제:
+- Purpose:
+- Problem being solved:
 
 ### Validation
 
-- 실행한 검증:
-  - [ ] 테스트
-  - [ ] 빌드
-  - [ ] 수동 점검
-  - 명령:
+- Validation performed:
+  - [ ] Tests
+  - [ ] Build
+  - [ ] Manual check
+  - Command:
 
 ### Impact
 
-- 영향을 받는 파일/영역:
-- 예상 리스크:
-- 롤백 방법:
+- Affected files/areas:
+- Expected risk:
+- Rollback method:
 
 ### Governance check
 
-- 커밋 메시지 형식 준수:
-- PR 체크리스트 항목 완료:
-- 공개판 동기화 필요 여부: [필요 / 불필요]
-  - 필요 시 동기화 항목:
-- 공개 미러(`full-review-benchmark-public`) 동기화 필요:
-- 설정/도구 미러(`claude-config`) 동기화 필요:
-  - 동기화 실행:
-    - 자동 경로: `full-review-benchmark-public/.github/workflows/sync-to-claude-config.yml`
+- Commit message format compliance:
+- PR checklist items completed:
+- Public-release sync required: [Required / Not required]
+  - Sync items if required:
+- Public mirror (`full-review-benchmark-public`) sync required:
+- Config/tooling mirror (`claude-config`) sync required:
+  - Sync execution:
+    - Automatic path: `full-review-benchmark-public/.github/workflows/sync-to-claude-config.yml`
       (main push / workflow_dispatch)
-    - 수동 실행: `full-review-benchmark-public/scripts/sync-to-claude-config-pr.sh`
-      (PR 생성/업데이트)
-- 가버넌스 스크립트 결과:
-  - `./scripts/gov-sync-check.sh --base origin/main --head HEAD` 실행 결과:
-  - `공개판 동기화 필요 여부`:
-  - 확인 필요/완료 항목:
+    - Manual execution: `full-review-benchmark-public/scripts/sync-to-claude-config-pr.sh`
+      (PR creation/update)
+- Governance script result:
+  - `./scripts/gov-sync-check.sh --base origin/main --head HEAD` execution result:
+  - `Public-release sync required`:
+  - Items needing confirmation/completed:
 
 ### Notes
 
-- 관련 링크(이슈/토론/기존 PR):
-- 추가 코멘트:
+- Related links (issue/discussion/prior PR):
+- Additional comments:

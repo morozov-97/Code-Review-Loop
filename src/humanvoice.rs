@@ -27,9 +27,10 @@ fn fence_or_none(s: &str, lang: &str) -> String {
 }
 
 fn build_task(findings_text: &str, good_text: &str) -> String {
-    // findings_text/good_text는 claim/evidence를 그대로 포함하고, evidence는 diff 원문을
-    // 인용하는 게 정상 동작이다(lens.rs 프롬프트가 그렇게 요구함) — 첫 호출에서 fenced()로
-    // 막았던 인젝션 payload가 이 2차 호출에 무방비로 재유입될 수 있어 여기서도 fenced 처리.
+    // findings_text/good_text include claim/evidence as-is, and it's expected behavior for
+    // evidence to quote the raw diff (lens.rs's prompt requires this) — an injection payload
+    // blocked by fenced() in the first call could sneak back in unguarded through this second
+    // call, so fenced() is applied here too.
     let findings_text = fence_or_none(findings_text, "findings");
     let good_text = fence_or_none(good_text, "good-things");
     format!(
@@ -43,7 +44,8 @@ fn build_task(findings_text: &str, good_text: &str) -> String {
     )
 }
 
-/// 확정 findings·good things를 사람이 PR에 직접 남기는 리뷰 코멘트 톤으로 재작성.
+/// Rewrites confirmed findings and good things in the tone of a review comment a human would
+/// leave directly on a PR.
 pub fn rewrite(
     llm: &Llm,
     spec: &Spec,
@@ -87,8 +89,9 @@ mod tests {
 
     #[test]
     fn format_good_things_includes_why_not_just_practice() {
-        // report.rs는 practice와 why를 둘 다 렌더링하는데, human-voice 리라이트는 why를
-        // 빠뜨려서 사람이 실제로 PR에 붙여넣는 버전에서 근거가 사라졌었다.
+        // report.rs renders both practice and why, but the human-voice rewrite used to drop
+        // why, so the reasoning disappeared from the version a human actually pastes into
+        // the PR.
         let good_things = vec![GoodThing {
             file_line: "src/x.rs:10".to_string(),
             practice: "명시적 에러 처리".to_string(),

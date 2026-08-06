@@ -6,22 +6,25 @@ use std::time::Duration;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
-/// ureq는 타임아웃 기본값이 무제한이라 명시적으로 안 걸면 네트워크 정체 시 프로세스가
-/// 영원히 블록될 수 있다. CI 등 자동화 환경에서 특히 치명적 — DNS부터 응답 본문 수신까지
-/// 전체를 하나의 상한으로 묶는 게(개별 구간별 상한보다) "절대 이 시간 넘게 안 멈춘다"는
-/// 보장이 더 직접적이라 timeout_global 하나로 건다.
+/// ureq's default timeout is unlimited, so without setting one explicitly, the process can block
+/// forever under network congestion. Especially fatal in automated environments like CI — tying
+/// everything from DNS to receiving the response body to a single cap (rather than per-phase
+/// caps) gives a more direct guarantee that "this will never hang past this duration", so we set
+/// just one timeout_global.
 ///
-/// 90초는 evals/ 골든셋을 실제 OpenRouter로 돌리다 라이브로 재현됨 — discourse 라운드
-/// 호출 하나가 90초를 넘겨 "json: timeout: global"로 전체 리뷰가 실패했다(재시도 후에도).
-/// 같은 "LLM 응답 하나 기다리기"란 목적의 CLAUDE_CLI_TIMEOUT(600초)과 맞춰 완화한다 —
-/// 서브프로세스 백엔드보다 유독 타이트해야 할 이유가 없다.
+/// 90 seconds was reproduced live while running the evals/ golden set against real OpenRouter —
+/// a single discourse round call exceeded 90 seconds and failed the whole review with "json:
+/// timeout: global" (even after retries). Relaxed to match CLAUDE_CLI_TIMEOUT (600s), which
+/// serves the same purpose of "waiting for one LLM response" — there's no reason this needs to be
+/// particularly tighter than the subprocess backend.
 const HTTP_TIMEOUT_GLOBAL: Duration = Duration::from_secs(600);
-/// claude -p 서브프로세스도 network 콜과 마찬가지로 무제한 대기 위험이 있다(외부 CLI가
-/// hang하면 리뷰 전체가 영원히 멈춤) — README상 "초 단위~분 단위" 소요를 감안해 넉넉히 잡음.
+/// The claude -p subprocess carries the same unlimited-wait risk as network calls (if the
+/// external CLI hangs, the whole review stalls forever) — set generously to account for the
+/// README's stated "seconds to minutes" duration.
 const CLAUDE_CLI_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// LLM 호출 백엔드. ClaudeCli = `claude -p` 서브프로세스, OpenRouter = REST API,
-/// Fixture = 테스트 전용(네트워크/서브프로세스 없이 미리 정해둔 응답을 순서대로 반환).
+/// LLM call backend. ClaudeCli = `claude -p` subprocess, OpenRouter = REST API,
+/// Fixture = test-only (returns pre-set responses in order, no network/subprocess).
 #[derive(Clone, Debug)]
 pub enum Provider {
     ClaudeCli {
@@ -34,8 +37,8 @@ pub enum Provider {
     Fixture(Arc<Mutex<std::collections::VecDeque<String>>>),
 }
 
-/// 누적 토큰/비용 사용량. 여러 Llm 인스턴스(예: 본 모델 + 저비용 모델)가
-/// 같은 Arc를 공유하면 실행 전체 기준 합산치를 얻는다.
+/// Cumulative token/cost usage. If multiple Llm instances (e.g. main model + cheap model) share
+/// the same Arc, you get totals aggregated across the whole run.
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub calls: u64,
@@ -43,7 +46,7 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
-    /// claude CLI가 제공하는 경우만 채워짐(OpenRouter 응답엔 없음).
+    /// Only populated when the claude CLI provides it (absent from OpenRouter responses).
     pub cost_usd: f64,
 }
 
@@ -90,7 +93,7 @@ pub struct Llm {
 }
 
 impl Llm {
-    /// 여러 Llm 인스턴스에 공유시켜 실행 전체의 합산 사용량을 추적한다.
+    /// Share this across multiple Llm instances to track aggregated usage for the whole run.
     pub fn new_usage_tracker() -> Arc<Mutex<Usage>> {
         Arc::new(Mutex::new(Usage::default()))
     }
@@ -111,7 +114,7 @@ impl Llm {
         }
     }
 
-    /// `OPENROUTER_API_KEY` 환경변수 필요. model 미지정 시 120B 오픈모델 기본값 사용.
+    /// Requires the `OPENROUTER_API_KEY` env var. Defaults to the 120B open model when model is unspecified.
     pub fn openrouter(
         model: Option<String>,
         retries: u32,
@@ -129,9 +132,9 @@ impl Llm {
         })
     }
 
-    /// 테스트 전용 — `responses`를 호출 순서대로 하나씩 반환한다(네트워크/서브프로세스 없음).
-    /// concurrency=1일 때만 호출 순서가 소스 코드 순서와 일치해 결정적이므로, E2E 테스트는
-    /// 반드시 concurrency=1로 돌려야 한다.
+    /// Test-only — returns `responses` one by one in call order (no network/subprocess).
+    /// Only deterministic when concurrency=1, since call order then matches source code order,
+    /// so E2E tests must run with concurrency=1.
     #[cfg(test)]
     pub fn fixture(responses: Vec<String>, retries: u32, usage: Arc<Mutex<Usage>>) -> Self {
         Llm {
@@ -143,8 +146,8 @@ impl Llm {
         }
     }
 
-    /// 현재까지 누적된 사용량 스냅샷(공유 tracker 기준). 다른 스레드가 lock을 쥔 채
-    /// panic해 poison되어도(누적치가 잘못될 수는 있어도) 여기서 또 panic하지는 않는다.
+    /// Snapshot of usage accumulated so far (from the shared tracker). Even if another thread
+    /// panics while holding the lock and poisons it (the accumulated total could be wrong), this doesn't panic again here.
     pub fn usage(&self) -> Usage {
         self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -181,10 +184,11 @@ impl Llm {
         }
     }
 
-    /// `ctx`(여러 호출에서 반복되는 안정적 프리픽스: 프로젝트 맥락·컨벤션·요구사항·diff)를
-    /// `task`(호출별로 달라지는 지시문)와 분리해서 받는다. OpenRouter 백엔드에서는 ctx에
-    /// cache_control(ephemeral)을 붙여 동일 ctx로 반복 호출될 때 캐시 히트를 노린다.
-    /// claude-cli 백엔드는 매 호출이 새 서브프로세스라 캐싱 효과가 없어 단순 이어붙인다.
+    /// Takes `ctx` (a stable prefix repeated across multiple calls: project context,
+    /// conventions, requirements, diff) separately from `task` (the instruction that varies per
+    /// call). On the OpenRouter backend, cache_control(ephemeral) is attached to ctx to aim for
+    /// cache hits when the same ctx is called repeatedly. The claude-cli backend gets no caching
+    /// benefit since each call is a fresh subprocess, so it just concatenates them.
     pub fn text_ctx(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<String> {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..=self.retries {
@@ -212,7 +216,7 @@ impl Llm {
         Err(last.unwrap_or_else(|| anyhow!("알 수 없는 실패")))
     }
 
-    /// [`Llm::text_ctx`]의 JSON 강제 버전.
+    /// JSON-enforcing variant of [`Llm::text_ctx`].
     pub fn json_ctx(
         &self,
         ctx: Option<&str>,
@@ -270,9 +274,9 @@ impl Llm {
     }
 }
 
-/// `child.wait_with_output()`은 self를 소비해서 폴링 루프와 못 섞는다 — stdout/stderr를
-/// 먼저 별도 스레드로 읽어들이고(파이프가 꽉 차 자식이 블록되는 걸 방지), `try_wait()`으로
-/// 폴링하다 타임아웃되면 kill한다.
+/// `child.wait_with_output()` consumes self, so it can't be mixed with a polling loop — read
+/// stdout/stderr on separate threads first (to prevent the child from blocking on a full pipe),
+/// then poll with `try_wait()` and kill on timeout.
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
@@ -323,11 +327,12 @@ fn wait_with_timeout(
     })
 }
 
-/// wait_with_timeout은 stdout/stderr를 poll 시작 전에 스레드로 미리 드레인해 파이프가
-/// 꽉 차 자식이 블록되는 걸 막는다 — stdin 쓰기(수백 KB까지 갈 수 있는 diff 전체 포함)를
-/// 그 poll이 시작되기도 전에 동기적으로 하면 동일한 보호를 못 받는다. 자식이 시작 지연
-/// 등으로 stdin을 즉시 안 읽으면 CLAUDE_CLI_TIMEOUT과 무관하게 write_all이 무기한 블록될
-/// 수 있어, stdout/stderr와 대칭으로 stdin 쓰기도 별도 스레드에서 한다.
+/// wait_with_timeout drains stdout/stderr on threads before polling starts, preventing the child
+/// from blocking on a full pipe — doing the stdin write (which can be up to several hundred KB,
+/// including the whole diff) synchronously before that poll even begins would not get the same
+/// protection. If the child doesn't read stdin right away due to startup delay etc., write_all
+/// could block indefinitely regardless of CLAUDE_CLI_TIMEOUT, so stdin writing is also done on a
+/// separate thread, symmetric with stdout/stderr.
 fn write_stdin_and_wait(
     mut child: std::process::Child,
     stdin_data: Vec<u8>,
@@ -341,9 +346,10 @@ fn write_stdin_and_wait(
         std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(&stdin_data) });
 
     let out = wait_with_timeout(child, timeout)?;
-    // 정상 종료 후(타임아웃 kill이 아닌 경우)에만 쓰기 오류를 진짜 문제로 취급한다.
-    // 타임아웃으로 죽은 뒤의 broken pipe는 예상된 결과라 별도 에러로 보고할 필요 없다
-    // (이미 위에서 타임아웃 자체가 에러로 반환됨) — join 안 해도 스레드는 곧 자연 종료.
+    // Only treat a write error as a real problem after a normal exit (i.e. not a timeout kill).
+    // A broken pipe after the process was killed by timeout is expected and doesn't need separate
+    // error reporting (the timeout itself was already returned as an error above) — even without
+    // joining, the thread will terminate naturally soon.
     match stdin_handle.join() {
         Ok(Ok(())) => Ok(out),
         Ok(Err(e)) => Err(anyhow!("stdin 쓰기 실패: {e}")),
@@ -351,8 +357,8 @@ fn write_stdin_and_wait(
     }
 }
 
-/// 프롬프트는 stdin으로 전달(인자 길이 제한 회피). 서브프로세스 호출이라 캐싱은 적용되지
-/// 않으므로 ctx+task를 그냥 이어붙인다(순서만: 안정적 맥락 먼저, 가변 지시문 나중).
+/// The prompt is passed via stdin (avoids argument length limits). Since this is a subprocess
+/// call, no caching applies, so ctx+task are simply concatenated (order only: stable context first, variable instructions after).
 fn call_claude(
     bin: &str,
     model: Option<&str>,
@@ -398,8 +404,8 @@ fn call_claude(
         .and_then(|r| r.as_str())
         .ok_or_else(|| anyhow!("응답에 result 필드 없음: {}", truncate(&stdout, 400)))?;
 
-    // usage/cost 필드는 claude CLI 버전에 따라 존재 여부·이름이 다를 수 있어 관대하게 파싱한다
-    // (없으면 0으로 두고 실패시키지 않음 — result 필드만 계약으로 취급).
+    // The usage/cost fields may or may not exist, and their names may differ, depending on the
+    // claude CLI version, so parse leniently (default to 0 instead of failing — only the result field is treated as a contract).
     let usage_obj = v.get("usage");
     let get_u64 = |key: &str| {
         usage_obj
@@ -424,16 +430,18 @@ fn call_claude(
     })
 }
 
-/// cache_control(ephemeral)은 Anthropic Messages API 확장이라 Claude 계열 모델에서만 의미가
-/// 있다 — 그 외 모델(OPENROUTER_DEFAULT_MODEL 포함)에서는 캐싱 이득이 없는데도 굳이 붙일
-/// 이유가 없으므로, 모델명에 "claude"가 없으면 기존과 동일한 단일 문자열 content로 보낸다.
+/// cache_control(ephemeral) is an Anthropic Messages API extension, so it's only meaningful for
+/// Claude-family models — for other models (including OPENROUTER_DEFAULT_MODEL) there's no
+/// caching benefit, so there's no reason to bother attaching it; if the model name doesn't
+/// contain "claude", send the same single-string content as before.
 fn supports_prompt_caching(model: &str) -> bool {
     model.to_ascii_lowercase().contains("claude")
 }
 
-/// OpenRouter 채팅 완성 API 1회 호출. ctx가 주어지고 대상 모델이 Claude 계열이면 별도
-/// content 블록으로 분리해 cache_control(ephemeral)을 붙인다 — 동일 ctx로 반복 호출될 때
-/// (예: 렌즈별 리뷰) 캐시 히트를 노리는 최적화. 그 외에는 기존처럼 단일 문자열 content를 보낸다.
+/// A single call to the OpenRouter chat completions API. If ctx is given and the target model is
+/// Claude-family, it's split into a separate content block with cache_control(ephemeral) attached
+/// — an optimization aiming for cache hits when the same ctx is called repeatedly (e.g. per-lens
+/// reviews). Otherwise, sends a single-string content as before.
 fn call_openrouter(
     api_key: &str,
     model: Option<&str>,
@@ -467,9 +475,10 @@ fn call_openrouter(
         "messages": messages,
     });
 
-    // ureq 3.x: AgentBuilder가 Config/ConfigBuilder로 바뀌었다. http_status_as_error(false)로
-    // 4xx/5xx도 Err가 아니라 Ok(response)로 받아서, 기존과 동일하게 상태코드+본문을 함께
-    // 우리 에러 메시지에 담을 수 있게 한다(기본값이면 본문 없이 Err만 와서 body를 못 읽음).
+    // ureq 3.x: AgentBuilder was replaced by Config/ConfigBuilder. http_status_as_error(false)
+    // makes 4xx/5xx come back as Ok(response) instead of Err, so we can still include both the
+    // status code and body in our own error message as before (with the default, you'd get only
+    // an Err with no body, unable to read it).
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(HTTP_TIMEOUT_GLOBAL))
         .http_status_as_error(false)
@@ -508,7 +517,7 @@ fn call_openrouter(
             )
         })?;
 
-    // OpenAI 호환 usage 스키마(prompt_tokens/completion_tokens). cost는 응답에 없어 0으로 둔다.
+    // OpenAI-compatible usage schema (prompt_tokens/completion_tokens). cost is absent from the response, so it's left at 0.
     let usage_obj = v.get("usage");
     let get_u64 = |key: &str| {
         usage_obj
@@ -528,7 +537,7 @@ fn call_openrouter(
     })
 }
 
-/// 코드펜스/잡설이 섞인 응답에서 JSON 오브젝트(또는 배열)만 추출.
+/// Extracts just the JSON object (or array) from a response mixed with code fences/chatter.
 pub fn extract_json(raw: &str) -> Result<serde_json::Value> {
     let t = raw.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
@@ -615,19 +624,19 @@ mod tests {
 
     #[test]
     fn write_stdin_and_wait_times_out_promptly_instead_of_blocking_on_a_large_write() {
-        // 회귀 방지: stdin 쓰기가 wait_with_timeout의 폴 루프보다 먼저(동기) 실행되면,
-        // stdin을 전혀 안 읽는 이 자식을 상대로 파이프 버퍼보다 큰 데이터를 쓸 때
-        // CLAUDE_CLI_TIMEOUT과 무관하게 무기한 블록된다. 고쳐졌다면 wait_with_timeout의
-        // 타임아웃(여기선 1초)이 정상적으로 먼저 개입해 전체 호출이 그 근처에서 끝나야 한다
-        // — 동기 쓰기로 회귀하면 자식의 sleep 10만큼(또는 그 이상) 블록된다.
+        // Regression guard: if stdin writing ran (synchronously) before wait_with_timeout's poll
+        // loop, writing data larger than the pipe buffer to this child, which never reads stdin
+        // at all, would block indefinitely regardless of CLAUDE_CLI_TIMEOUT. If fixed,
+        // wait_with_timeout's timeout (1 second here) should correctly kick in first and the
+        // whole call should end around there — if it regresses to a synchronous write, it blocks for the child's sleep 10 (or longer).
         let child = Command::new("sh")
-            .args(["-c", "sleep 10"]) // stdin을 전혀 읽지 않음
+            .args(["-c", "sleep 10"]) // never reads stdin
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let large_payload = vec![b'x'; 4 * 1024 * 1024]; // 4MB, 어떤 OS 파이프 버퍼보다 큼
+        let large_payload = vec![b'x'; 4 * 1024 * 1024]; // 4MB, larger than any OS pipe buffer
         let start = std::time::Instant::now();
         let err = write_stdin_and_wait(child, large_payload, Duration::from_secs(1))
             .expect_err("stdin을 안 읽는 프로세스는 타임아웃으로 종료돼야 함");

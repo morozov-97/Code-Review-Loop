@@ -11,10 +11,12 @@ pub const LENS_SYSTEM: &str = "당신은 코드 리뷰어 한 명이다. \
 이미 반영된 수정이나 독립적인 docstring·타입힌트·주석·unused import 제안은 하지 않는다. \
 반드시 지정된 JSON 스키마로만 응답한다.";
 
-/// 필드 전부 `#[serde(default)]` — findings는 JSON 배열이라 하나라도 필수 필드가
-/// 빠지면 serde가 그 원소에서 통째로 실패하고, `Vec<Finding>` 파싱은 원소 하나 실패로
-/// 전체가 죽는다(같은 lens가 낸 나머지 정상 findings까지 부분실패 경로로 드롭됨).
-/// line/confidence는 이미 이 문제를 실전에서 겪어 관대화했다 — 나머지 필드도 동일 위험.
+/// All fields use `#[serde(default)]` — findings is a JSON array, so if even one required
+/// field is missing on any element, serde fails that element outright, and parsing
+/// `Vec<Finding>` dies entirely from that one failure (dropping the same lens's other
+/// perfectly good findings along the partial-failure path). line/confidence were already
+/// loosened after hitting this problem in production — the remaining fields carry the same
+/// risk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     #[serde(default)]
@@ -30,7 +32,7 @@ pub struct Finding {
     #[serde(default)]
     pub impact: String,
     #[serde(default)]
-    pub severity: String, // P0-P3, normalize_severity가 빈 값도 P0로 안전하게 처리
+    pub severity: String, // P0-P3, normalize_severity safely treats an empty value as P0 too
     #[serde(default = "unknown")]
     pub label: String,
     #[serde(default = "unknown")]
@@ -39,7 +41,7 @@ pub struct Finding {
     pub recommendation: String,
     #[serde(default)]
     pub lens: String,
-    /// 이 렌즈의 페르소나 이름(spec에 없으면 빈 문자열).
+    /// This lens's persona name (empty string if not in the spec).
     #[serde(default)]
     pub reviewer: String,
 }
@@ -48,8 +50,9 @@ fn unknown() -> String {
     "UNKNOWN".to_string()
 }
 
-/// LLM이 `"line": 20`처럼 JSON 정수로 응답하는 경우가 실제로 관측됨(문자열만 받으면
-/// 스키마 불일치로 해당 렌즈 findings 전체가 부분실패 경로로 드롭됨) — 문자열/숫자 모두 허용.
+/// We've actually observed the LLM responding with a JSON integer like `"line": 20`
+/// (accepting only a string would cause a schema mismatch that drops that lens's entire
+/// findings along the partial-failure path) — accepts both strings and numbers.
 fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -68,10 +71,11 @@ where
 
 const VALID_SEVERITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
 
-/// LLM이 지정된 리터럴(P0-P3)에서 벗어난 값을 낼 수 있다(대소문자·공백·동의어 등,
-/// --cheap-model 경로에서 특히). quantify.rs/report.rs가 이 필드를 정확 문자열 매칭하므로
-/// 정규화하지 않은 값은 score/verdict에서 조용히 0점 취급된다 — 실패는 안전한 방향(P0,
-/// 더 엄격한 심사)으로 나야지 조용히 APPROVE 쪽으로 새면 안 된다.
+/// The LLM can produce values outside the specified literals (P0-P3) — case, whitespace,
+/// synonyms, etc., especially on the --cheap-model path. Since quantify.rs/report.rs match
+/// this field with an exact string comparison, an unnormalized value silently counts as a
+/// 0-point score/verdict — failure must land on the safe side (P0, stricter scrutiny), never
+/// quietly leak toward APPROVE.
 pub fn normalize_severity(raw: &str) -> String {
     let upper = raw.trim().to_ascii_uppercase();
     if VALID_SEVERITIES.contains(&upper.as_str()) {
@@ -102,7 +106,8 @@ pub struct GoodThingsOutput {
     pub good_things: Vec<GoodThing>,
 }
 
-/// 페르소나가 지정된 렌즈는 캐릭터 정체성을 시스템 프롬프트 앞단에 붙인다(동조성 억제).
+/// For a lens with a persona set, prepend the character identity to the front of the system
+/// prompt (to suppress conformity/sycophancy).
 fn persona_system(lens: &Lens) -> String {
     if lens.persona_name.is_empty() {
         LENS_SYSTEM.to_string()
@@ -114,11 +119,12 @@ fn persona_system(lens: &Lens) -> String {
     }
 }
 
-/// 프롬프트로 "1~3개"를 지시하지만 LLM이 그 지시를 안 지킬 수 있다 — 강제 상한이 없으면
-/// 렌즈 수만큼 호출이 그대로 늘어나 토큰 비용·지연이 급증한다. 코드에서 확실히 자른다.
+/// The prompt instructs "1-3", but the LLM may not follow that instruction — without a hard
+/// cap, calls would scale directly with the number of lenses, spiking token cost and latency.
+/// Enforce the cutoff in code to be sure.
 const MAX_AUTO_SELECTED_LENSES: usize = 3;
 
-/// 렌즈 후보(always 제외) 중 diff 성격에 맞는 1~3개를 LLM으로 선정한다.
+/// Uses the LLM to select 1-3 lenses (excluding always-on ones) that fit the diff's nature.
 pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String>> {
     let optional = spec.optional_lenses();
     if optional.is_empty() {
@@ -191,11 +197,13 @@ fn build_review_task(spec: &Spec, lens_title: &str, lens_guide: &str) -> String 
     )
 }
 
-/// `--prior` 재검토에서 이전 라운드 STILL_OPEN finding이 이번 라운드 findings/resolved에
-/// 그대로 재편입된다(src/main.rs). id에 라운드 번호가 없으면 같은 렌즈가 다음 라운드에도
-/// 선정될 때 위치 기반 번호("design-1" 등)가 그대로 재발급되어 서로 다른 finding이
-/// 같은 id를 갖게 된다 — score 이중 차감·리포트 중복의 원인. round을 id에 넣어
-/// (재편입되는 finding은 항상 더 이전 라운드 번호를 갖는다는 불변식으로) 충돌을 막는다.
+/// On `--prior` re-review, a previous round's STILL_OPEN finding is re-carried as-is into
+/// this round's findings/resolved (src/main.rs). Without a round number in the id, if the
+/// same lens gets selected again next round, the same position-based number (e.g. "design-1")
+/// gets reissued, causing two different findings to share an id — the source of double
+/// score deductions and duplicate reports. Folding round into the id prevents this collision
+/// (relying on the invariant that a re-carried finding always carries an earlier round
+/// number).
 fn finding_id(lens_id: &str, round: usize, index: usize) -> String {
     format!("{lens_id}-r{round}-{index}")
 }
@@ -210,8 +218,9 @@ pub fn review_lens(
     let lens = spec
         .lens_by_id(lens_id)
         .ok_or_else(|| anyhow::anyhow!("spec에 없는 렌즈: {lens_id}"))?;
-    // ctx(맥락·컨벤션·요구사항·diff)는 렌즈마다 동일 — OpenRouter 백엔드에서 별도 블록으로
-    // 캐싱되도록 task(렌즈별 지시문)와 분리해서 전달한다.
+    // ctx (context/conventions/requirements/diff) is identical across lenses — it's passed
+    // separately from task (the lens-specific instructions) so the OpenRouter backend can
+    // cache it as its own block.
     let ctx = shared_context(spec, input);
     let task = build_review_task(spec, &lens.title, &lens.guide);
     let system = persona_system(lens);
@@ -327,7 +336,7 @@ mod tests {
     fn select_lenses_caps_count_and_dedupes_even_if_llm_ignores_the_instruction() {
         let spec = test_spec(&["design", "complexity", "tests", "naming", "style"]);
         let inp = test_input();
-        // LLM이 "1~3개" 지시를 무시하고 5개(+중복 1개)를 돌려주는 상황을 흉내낸다.
+        // Simulates the LLM ignoring the "1-3" instruction and returning 5 (with 1 duplicate).
         let response =
             r#"{"selected":["design","complexity","design","tests","naming","style"]}"#.to_string();
         let usage = Llm::new_usage_tracker();
@@ -348,8 +357,9 @@ mod tests {
 
     #[test]
     fn finding_line_accepts_json_integer_like_live_every_line_response() {
-        // 실제 도그푸딩 run에서 every_line 렌즈가 "line": 20 (정수)로 응답해
-        // "invalid type: integer `20`, expected a string"로 렌즈 전체가 드롭됨.
+        // In a real dogfooding run, the every_line lens responded with "line": 20 (an
+        // integer), and the whole lens got dropped with "invalid type: integer `20`,
+        // expected a string".
         let json = r#"{"findings":[{"file":"x.dart","line":20,"claim":"c","evidence":"e","severity":"P3","label":"typo"}]}"#;
         let out: LensOutput = serde_json::from_str(json).unwrap();
         assert_eq!(out.findings[0].line, "20");
@@ -357,7 +367,7 @@ mod tests {
 
     #[test]
     fn finding_line_accepts_json_integer_like_live_functionality_response() {
-        // 동일 문제가 functionality 렌즈에서 "line": 21로 재현됨.
+        // Same problem reproduced in the functionality lens with "line": 21.
         let json = r#"{"findings":[{"file":"x.dart","line":21,"claim":"c","evidence":"e","severity":"P2","label":"possible bug"}]}"#;
         let out: LensOutput = serde_json::from_str(json).unwrap();
         assert_eq!(out.findings[0].line, "21");
@@ -379,8 +389,9 @@ mod tests {
 
     #[test]
     fn lens_output_survives_one_finding_missing_a_required_field() {
-        // 종합 리뷰에서 발견: file/claim/evidence/severity/label 중 하나라도 빠지면
-        // 전체 findings 배열이 통째로 파싱 실패해 이 lens의 다른 정상 finding까지 드롭됐다.
+        // Found during a full review: if even one of file/claim/evidence/severity/label is
+        // missing, the entire findings array fails to parse, dropping this lens's other
+        // perfectly good findings too.
         let json = r#"{"findings":[
             {"file":"a.rs","line":"1","claim":"ok","evidence":"e","severity":"P1","label":"possible bug"},
             {"file":"b.rs","line":"2","claim":"second finding"}

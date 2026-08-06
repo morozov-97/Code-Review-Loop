@@ -25,8 +25,8 @@ fn severity_penalty(severity: &str) -> i64 {
     }
 }
 
-/// 확인된(CONFIRMED) finding만으로 100점에서 감점. 감점 근거를 문자열로 함께 남긴다.
-/// 가정: 감점폭(P0=25/P1=12/P2=5/P3=1)은 설계 판단 — 실제 심각도 배분은 팀 정책에 맞춰 조정 필요(불확실).
+/// Deduct points from 100 using only CONFIRMED findings. Records the deduction reasons as strings alongside.
+/// Assumption: the deduction amounts (P0=25/P1=12/P2=5/P3=1) are a design choice — actual severity weighting should be adjusted per team policy (uncertain).
 fn score(findings: &[Finding], resolved: &HashMap<String, Resolution>) -> (i64, Vec<String>) {
     let mut total = 100i64;
     let mut deductions = Vec::new();
@@ -43,7 +43,7 @@ fn score(findings: &[Finding], resolved: &HashMap<String, Resolution>) -> (i64, 
     (total.max(0), deductions)
 }
 
-/// 변경 규모 기반 리뷰 노력 추정치. 가정: 임계값은 설계 판단(불확실), 팀 규모에 맞춰 조정 필요.
+/// Estimated review effort based on change size. Assumption: the thresholds are a design choice (uncertain), should be adjusted per team size.
 fn effort_and_time(input: &Input, lens_count: usize) -> (u8, u32, u32, u32) {
     let lines = input.added_lines + input.removed_lines;
     let mut effort: u8 = match lines {

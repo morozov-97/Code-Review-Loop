@@ -12,9 +12,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// 마크다운 테이블 셀에 넣기 전에 이스케이프한다 — 테이블은 파이프로 열을 나누고 줄 단위로
-/// 행을 나누므로, 셀 내용에 `|`가 있으면 열이 밀리고 개행이 있으면 행 자체가 깨진다.
-/// LLM/외부 도구가 만든 문자열(evidence, claim 등)은 이 두 문자를 포함할 수 있다.
+/// Escapes text before putting it in a markdown table cell — tables split columns on pipes and
+/// rows on lines, so a `|` in the cell content shifts columns and a newline breaks the row itself.
+/// Strings produced by the LLM/external tools (evidence, claim, etc.) may contain either character.
 fn escape_table_cell(s: &str) -> String {
     let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
     normalized.replace('|', "\\|").replace('\n', "<br>")
@@ -62,7 +62,7 @@ fn deterministic_table(spec: &Spec, results: &Option<serde_json::Value>) -> Stri
     md
 }
 
-/// review 서브커맨드 결과를 렌더링하는 데 필요한 모든 입력. 필드가 많아 구조체로 묶는다.
+/// All inputs needed to render the review subcommand's result. Grouped into a struct since there are many fields.
 pub struct ReportCtx<'a> {
     pub out_dir: &'a Path,
     pub spec: &'a Spec,
@@ -79,8 +79,8 @@ pub struct ReportCtx<'a> {
     pub quant: &'a QuantSummary,
     pub fix_results: &'a [FixStatus],
     pub human_voice: Option<&'a str>,
-    /// 렌즈 리뷰/good_things/requirements 등 부분 실패 허용 단계의 에러 메시지들 —
-    /// 조용히 무시하지 않고 리포트에 남긴다.
+    /// Error messages from stages that tolerate partial failure, like lens review/good_things/requirements —
+    /// kept in the report instead of silently ignored.
     pub stage_errors: &'a [String],
 }
 
@@ -136,9 +136,9 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     if !fix_results.is_empty() {
         md.push_str("## 이전 라운드 대비\n\n| Finding | Status | Evidence |\n|---|---|---|\n");
         for f in fix_results {
-            // superseded_by는 LLM 자유서술(evidence)에만 의존하지 않고 코드가 항상
-            // 명시적으로 붙인다 — evidence 문구가 없거나 애매해도 어떤 finding이
-            // 대체했는지는 리포트에서 항상 확인 가능해야 한다.
+            // superseded_by is always attached explicitly by the code rather than relying solely
+            // on the LLM's free-form text (evidence) — even if the evidence wording is missing
+            // or ambiguous, which finding replaced it must always be verifiable in the report.
             let evidence = if f.status == "SUPERSEDED" && !f.superseded_by.is_empty() {
                 format!("[{}로 대체됨] {}", f.superseded_by, f.evidence)
             } else {
@@ -251,12 +251,12 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         md.push('\n');
     }
 
-    // MERGED/UNCERTAIN(또는 미해결) finding은 score/verdict에 반영되지 않고, 예전엔
-    // 리포트 어디에도 안 보였다 — CONFIRMED/REJECTED 둘 다 아니라는 이유로 완전히
-    // 사라진 것. 하지만 여러 렌즈가 독립적으로 같은 문제를 지적했는데 discourse가
-    // 합의에 못 이른 경우(UNCERTAIN)나 다른 finding에 흡수된 경우(MERGED)는 오히려
-    // 사람이 직접 봐야 할 신호다 — 실전에서 SQL injection이 이 경로로 통째로
-    // 증발한 사례를 실제로 확인했다.
+    // MERGED/UNCERTAIN (or otherwise unresolved) findings aren't reflected in score/verdict, and
+    // used to be invisible everywhere in the report — they vanished entirely for being neither
+    // CONFIRMED nor REJECTED. But when multiple lenses independently flag the same issue and
+    // discourse fails to reach consensus (UNCERTAIN), or it gets absorbed into another finding
+    // (MERGED), that's actually a signal a human should look at directly — we've actually seen a
+    // real case where an SQL injection vanished entirely through this path.
     let needs_human_look: Vec<&Finding> = findings
         .iter()
         .filter(|f| {
@@ -491,8 +491,8 @@ mod tests {
 
     #[test]
     fn write_shows_uncertain_and_merged_findings_that_score_ignores() {
-        // 실전 재현: 4개 렌즈가 독립적으로 같은 SQL injection을 지적했지만 discourse가
-        // CONFIRMED도 REJECTED도 못 내려서 리포트 어디에도 안 보이던 문제.
+        // Real-world repro: 4 lenses independently flagged the same SQL injection, but discourse
+        // couldn't land on CONFIRMED or REJECTED, so it was invisible everywhere in the report.
         let findings = vec![
             test_finding("security-r1-1", "raw SQL injection"),
             test_finding("security-r1-2", "동일 SQL injection, 다른 렌즈"),

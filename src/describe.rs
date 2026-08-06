@@ -36,13 +36,14 @@ pub fn run(llm: &Llm, spec: &Spec, input: &Input) -> Result<Describe> {
     serde_json::from_value(v).context("describe JSON 스키마 불일치")
 }
 
-/// diff가 새로 추가한(+) 라인에서만 TODO/FIXME/XXX 스캔. 결정론적(LLM 미사용).
+/// Scans only lines newly added (+) by the diff for TODO/FIXME/XXX. Deterministic (no LLM used).
 ///
-/// `!l.starts_with("+++")`만으로 hunk body 줄과 파일 헤더를 구분하면, 추가된 줄의 내용
-/// 자체가 "++ "로 시작할 때(raw 줄이 "+++ ..."가 됨 — input.rs::parse_diff_stats가 겪은
-/// 것과 동일한 충돌) 진짜 TODO 줄이 헤더로 오인돼 스캔에서 빠진다. `@@`/`diff --git` 앵커로
-/// hunk body 여부를 명시적으로 추적하면 이 모호성이 없다(hunk body 줄은 항상 `+`/`-`/` `
-/// 마커로 시작해 이 앵커 문자열을 raw 상태로 흉내 낼 수 없음).
+/// If we distinguish hunk body lines from file headers using only `!l.starts_with("+++")`,
+/// then when an added line's own content starts with "++ " (making the raw line "+++ ...",
+/// the same collision that input.rs::parse_diff_stats ran into), a genuine TODO line gets
+/// mistaken for a header and dropped from the scan. Explicitly tracking hunk-body status via
+/// the `@@`/`diff --git` anchors removes this ambiguity (hunk body lines always start with a
+/// `+`/`-`/` ` marker, so they can never impersonate this anchor string in raw form).
 pub fn todo_sections(diff: &str) -> Vec<String> {
     let markers = ["TODO", "FIXME", "XXX"];
     let mut in_hunk_body = false;
@@ -87,8 +88,9 @@ mod tests {
 
     #[test]
     fn todo_sections_finds_todo_even_when_content_collides_with_a_file_header() {
-        // 한 단계 더 깊은 충돌: 추가된 줄 내용이 "++ "로 시작하면 raw 줄이 "+++ ..."가 되어
-        // (파일 헤더 자체와 구분 불가한 접두어) 예전엔 TODO 스캔에서 통째로 빠졌다.
+        // An even deeper collision: when an added line's content starts with "++ ", the raw
+        // line becomes "+++ ..." (a prefix indistinguishable from the file header itself),
+        // so it used to be dropped from the TODO scan entirely.
         let diff = "diff --git a/note.txt b/note.txt\n\
                      --- a/note.txt\n\
                      +++ b/note.txt\n\
