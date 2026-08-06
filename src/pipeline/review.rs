@@ -1,10 +1,11 @@
 use crate::discourse;
+use crate::evidence;
 use crate::fixcheck;
 use crate::humanvoice;
 use crate::input;
 use crate::lens::{self, Finding};
 use crate::llm::Llm;
-use crate::pipeline::{par_map, prepare_out};
+use crate::pipeline::{enforce_secret_scan, par_map, prepare_out};
 use crate::policy;
 use crate::quantify;
 use crate::report;
@@ -34,6 +35,8 @@ pub(crate) struct ReviewArgs<'a> {
     /// #119: overall wall-clock budget across every remaining stage. None = no deadline
     /// (existing behavior). Checked between stages, not mid-call.
     pub(crate) deadline_minutes: Option<u64>,
+    /// #122: skip the local secret scan's refuse-by-default behavior.
+    pub(crate) allow_sensitive_input: bool,
 }
 
 /// True once `started.elapsed()` has passed `deadline_minutes` — always false when unset.
@@ -68,6 +71,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         args.deterministic_results_path,
         args.lang.clone(),
     )?;
+    enforce_secret_scan(&inp.diff, args.allow_sensitive_input)?;
     // Not a hard cap — since the full diff is resent on every lens/discourse/verify call, this
     // just gives an early warning that token cost grows more than linearly with diff size (no silent truncation).
     const DIFF_WARN_CHARS: usize = 300_000;
@@ -205,6 +209,10 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
     }
+    // #123: local, deterministic check that each finding's file:line citation actually
+    // corresponds to a line the diff shows — before discourse spends LLM calls debating
+    // findings whose evidence may be hallucinated.
+    evidence::verify(&mut findings, &inp.diff);
 
     // good_things is supplementary info that doesn't affect findings/score/verdict, so there's no
     // reason for its failure to discard the core review result entirely — just log a warning and continue with an empty list.
@@ -514,6 +522,7 @@ always = true
                 human_voice: false,
                 lang: &None,
                 deadline_minutes: None,
+                allow_sensitive_input: false,
             },
         )
         .expect("run_review should complete end-to-end against the fixture LLM");
@@ -608,6 +617,7 @@ always = true
                 human_voice: false,
                 lang: &None,
                 deadline_minutes: None,
+                allow_sensitive_input: false,
             },
         )
         .expect("run_review must still succeed despite the discourse failure");
@@ -692,6 +702,7 @@ always = true
                 human_voice: false,
                 lang: &None,
                 deadline_minutes: None,
+                allow_sensitive_input: false,
             },
         )
         .expect("run_review must still succeed even when every lens fails");
@@ -773,6 +784,7 @@ always = true
                 human_voice: false,
                 lang: &None,
                 deadline_minutes: Some(0),
+                allow_sensitive_input: false,
             },
         )
         .expect("run_review must still succeed when the deadline is already exceeded");
@@ -845,6 +857,7 @@ always = true
                 human_voice: false,
                 lang: &None,
                 deadline_minutes: None,
+                allow_sensitive_input: false,
             },
         )
         .expect_err("manually selecting an always lens must be rejected");

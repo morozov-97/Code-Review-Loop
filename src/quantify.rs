@@ -203,6 +203,7 @@ mod tests {
             recommendation: String::new(),
             lens: "design".to_string(),
             reviewer: "Reviewer".to_string(),
+            evidence_unverified: false,
         }
     }
 

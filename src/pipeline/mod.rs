@@ -2,6 +2,7 @@ pub(crate) mod describe;
 pub(crate) mod improve;
 pub(crate) mod review;
 
+use crate::secretscan;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,30 @@ pub(crate) fn prepare_out(p: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(p)
         .with_context(|| format!("failed to create output directory: {}", p.display()))?;
     Ok(p.to_path_buf())
+}
+
+/// #122: called right after `input::normalize`, before any LLM call. Refuses to proceed (unless
+/// `allow_sensitive_input`) when the diff's added lines contain something that looks like a
+/// credential — the diff is about to be sent verbatim to an external LLM provider.
+pub(crate) fn enforce_secret_scan(diff: &str, allow_sensitive_input: bool) -> Result<()> {
+    let hits = secretscan::scan(diff);
+    if hits.is_empty() || allow_sensitive_input {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "refusing to send diff to the LLM: found {} value(s) that look like credentials in added lines:\n",
+        hits.len()
+    );
+    for h in &hits {
+        msg.push_str(&format!(
+            "  - {} in {}: {}\n",
+            h.pattern, h.file, h.redacted
+        ));
+    }
+    msg.push_str(
+        "Remove the secret(s) from the diff, or pass --allow-sensitive-input to send it anyway.",
+    );
+    Err(anyhow!(msg))
 }
 
 /// Groups threads by concurrency and runs them in sequence (chunk-wise barrier).

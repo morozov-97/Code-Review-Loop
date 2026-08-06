@@ -3,6 +3,7 @@ mod cli;
 mod core;
 mod describe;
 mod discourse;
+mod evidence;
 mod fixcheck;
 mod humanvoice;
 mod improve;
@@ -15,6 +16,7 @@ mod promptctx;
 mod quantify;
 mod report;
 mod requirements;
+mod secretscan;
 mod semgrep;
 mod spec;
 mod state;
@@ -36,8 +38,13 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
-    let (llm, cheap_llm) = build_llm(&cli)?;
 
+    // #125: build_llm() (which needs OPENROUTER_API_KEY set or a working `claude` CLI on PATH,
+    // depending on --backend) used to run unconditionally before this match, coupling every
+    // subcommand to having a working LLM backend even though only Review/Describe/Improve
+    // actually need one today. Every current command does need it, so this is a no-op change in
+    // practice — but it means a future command that doesn't (e.g. a spec-validation or
+    // diff-stats-only command) won't be forced to demand an API key/CLI for no reason.
     match &cli.cmd {
         Cmd::Review {
             spec,
@@ -53,25 +60,29 @@ fn real_main() -> Result<()> {
             human_voice,
             lang,
             deadline_minutes,
-        } => run_review(
-            &llm,
-            &cheap_llm,
-            &ReviewArgs {
-                spec_path: spec,
-                diff_path: diff,
-                requirements_path: requirements,
-                conventions_path: conventions,
-                deterministic_results_path: deterministic_results,
-                lenses_arg: lenses,
-                out,
-                concurrency: *concurrency,
-                max_rounds: *max_rounds,
-                prior,
-                human_voice: *human_voice,
-                lang,
-                deadline_minutes: *deadline_minutes,
-            },
-        ),
+        } => {
+            let (llm, cheap_llm) = build_llm(&cli)?;
+            run_review(
+                &llm,
+                &cheap_llm,
+                &ReviewArgs {
+                    spec_path: spec,
+                    diff_path: diff,
+                    requirements_path: requirements,
+                    conventions_path: conventions,
+                    deterministic_results_path: deterministic_results,
+                    lenses_arg: lenses,
+                    out,
+                    concurrency: *concurrency,
+                    max_rounds: *max_rounds,
+                    prior,
+                    human_voice: *human_voice,
+                    lang,
+                    deadline_minutes: *deadline_minutes,
+                    allow_sensitive_input: cli.allow_sensitive_input,
+                },
+            )
+        }
         Cmd::Describe {
             spec,
             diff,
@@ -79,7 +90,19 @@ fn real_main() -> Result<()> {
             conventions,
             out,
             lang,
-        } => run_describe(&llm, spec, diff, requirements, conventions, out, lang),
+        } => {
+            let (llm, _cheap_llm) = build_llm(&cli)?;
+            run_describe(
+                &llm,
+                spec,
+                diff,
+                requirements,
+                conventions,
+                out,
+                lang,
+                cli.allow_sensitive_input,
+            )
+        }
         Cmd::Improve {
             spec,
             diff,
@@ -87,6 +110,18 @@ fn real_main() -> Result<()> {
             conventions,
             out,
             lang,
-        } => run_improve(&llm, spec, diff, requirements, conventions, out, lang),
+        } => {
+            let (llm, _cheap_llm) = build_llm(&cli)?;
+            run_improve(
+                &llm,
+                spec,
+                diff,
+                requirements,
+                conventions,
+                out,
+                lang,
+                cli.allow_sensitive_input,
+            )
+        }
     }
 }

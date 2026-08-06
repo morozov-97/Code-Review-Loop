@@ -44,6 +44,12 @@ pub struct Finding {
     /// This lens's persona name (empty string if not in the spec).
     #[serde(default)]
     pub reviewer: String,
+    /// #123: set by `evidence::verify` after parsing, not by the LLM — true when `file`/`line`
+    /// could not be matched against an actual line in the diff (typos, hallucinated
+    /// files/lines, or evidence quoted from outside the changed hunks). Never trust this field
+    /// on a `Finding` built directly from LLM JSON; it's only meaningful after that pass runs.
+    #[serde(default)]
+    pub evidence_unverified: bool,
 }
 
 fn unknown() -> String {

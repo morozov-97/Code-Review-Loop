@@ -20,6 +20,22 @@ fn escape_table_cell(s: &str) -> String {
     normalized.replace('|', "\\|").replace('\n', "<br>")
 }
 
+/// #123: renders a finding's file:line cell, appending a visible marker when
+/// `evidence::verify` couldn't match the citation against an actual line in the diff — so a
+/// reader knows to double check that citation before trusting it.
+fn file_line_cell(f: &Finding) -> String {
+    let base = format!(
+        "{}:{}",
+        escape_table_cell(&f.file),
+        escape_table_cell(&f.line)
+    );
+    if f.evidence_unverified {
+        format!("{base} ⚠️ unverified")
+    } else {
+        base
+    }
+}
+
 fn severity_rank(s: &str) -> u8 {
     match s {
         "P0" => 0,
@@ -233,14 +249,13 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         let r = resolved.get(&f.id);
         let discourse_result = r.map(|r| r.reason.as_str()).unwrap_or("");
         md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {}:{} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             f.id,
             f.severity,
             escape_table_cell(&f.label),
             f.lens,
             escape_table_cell(&f.reviewer),
-            escape_table_cell(&f.file),
-            escape_table_cell(&f.line),
+            file_line_cell(f),
             escape_table_cell(&f.evidence),
             escape_table_cell(&f.impact),
             escape_table_cell(&f.recommendation),
@@ -307,12 +322,11 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
                 reason.to_string()
             };
             md.push_str(&format!(
-                "| {} | {} | {} | {}:{} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
                 f.id,
                 f.severity,
                 escape_table_cell(&f.label),
-                escape_table_cell(&f.file),
-                escape_table_cell(&f.line),
+                file_line_cell(f),
                 escape_table_cell(&f.claim),
                 escape_table_cell(status),
                 escape_table_cell(&reason)
@@ -512,6 +526,7 @@ mod tests {
             recommendation: String::new(),
             lens: "security".to_string(),
             reviewer: "Reviewer".to_string(),
+            evidence_unverified: false,
         }
     }
 

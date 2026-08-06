@@ -30,6 +30,11 @@ pub(crate) struct Cli {
     pub(crate) retries: u32,
     #[arg(long, global = true)]
     pub(crate) verbose: bool,
+    /// #122: the diff (and --requirements/--conventions) is sent verbatim to an external LLM
+    /// provider. By default, a local pattern-based scan refuses to run if it spots something
+    /// that looks like a credential in an added line. Pass this flag to send it anyway.
+    #[arg(long, global = true)]
+    pub(crate) allow_sensitive_input: bool,
 
     #[command(subcommand)]
     pub(crate) cmd: Cmd,

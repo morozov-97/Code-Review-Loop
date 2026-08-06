@@ -11,6 +11,25 @@ Default LLM backend is Claude Code CLI (`claude -p --output-format json`); an
 OpenRouter backend (`--backend openrouter` + `OPENROUTER_API_KEY`) is also available
 and does not require the `claude` CLI.
 
+## Quick start
+
+```bash
+cargo build --release
+git diff > diff.patch
+./target/release/codereview review --spec specs/default.toml --diff diff.patch --out runs/
+```
+
+Two things worth knowing before your first real run:
+
+- ⚠ the diff (and any `--requirements`/`--conventions` content) is sent verbatim to the
+  configured LLM provider, with no secret/PII redaction — see
+  [Limits and known caveats](#limits-and-known-caveats).
+- ⚠ don't wire `verdict` into a blocking/auto-merge CI check — see
+  [Recommended CI integration](#recommended-ci-integration).
+
+The rest of this README covers the pipeline, every flag, and the full list of caveats in
+more detail.
+
 ## Pipeline overview
 
 ```mermaid
@@ -334,9 +353,13 @@ sequenceDiagram
 
 - the diff (plus any `--requirements`/`--conventions` content) is sent to whichever LLM
   provider is configured, verbatim — neither backend redacts secrets or PII before sending. A
-  hardcoded credential the review is supposed to flag goes out in the same request that's
-  meant to catch it. A one-line warning prints to stderr on every run as a reminder; don't run
-  this against code containing secrets or restricted data unless that's acceptable for your org.
+  one-line warning prints to stderr on every run as a reminder; don't run this against code
+  containing secrets or restricted data unless that's acceptable for your org. Before sending, a
+  local pattern-based scan checks the diff's added lines for things that look like credentials
+  (AWS/GitHub/Slack tokens, PEM private keys, JWTs, `.env`-style secret assignments) and refuses
+  to proceed if it finds one — pass `--allow-sensitive-input` to send it anyway. This is a
+  best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
+  formats beyond the ones listed) — it catches the obvious cases, not everything.
 - heuristic-only policy signals for behavior vs surface changes can produce false
   positives depending on project structure.
 - severity penalties are heuristic defaults (P0: 25, P1: 12, P2: 5, P3: 1) — configurable per
