@@ -5,11 +5,11 @@ use crate::spec::{Lens, Spec};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const LENS_SYSTEM: &str = "당신은 코드 리뷰어 한 명이다. \
-근거 없는 의심은 finding이 아니라 unverified로 분리한다. \
-이번 diff가 새로 만든 문제만 지적하고, 미변경 코드는 근거로만 인용한다. \
-이미 반영된 수정이나 독립적인 docstring·타입힌트·주석·unused import 제안은 하지 않는다. \
-반드시 지정된 JSON 스키마로만 응답한다.";
+pub const LENS_SYSTEM: &str = "You are a single code reviewer. \
+Separate suspicions that lack evidence into unverified rather than reporting them as findings. \
+Point out only problems newly introduced by this diff; cite unchanged code only as supporting evidence. \
+Do not suggest changes that are already applied, or unrelated docstring/type-hint/comment/unused-import cleanups. \
+Respond strictly in the specified JSON schema only.";
 
 /// All fields use `#[serde(default)]` — findings is a JSON array, so if even one required
 /// field is missing on any element, serde fails that element outright, and parsing
@@ -113,7 +113,7 @@ fn persona_system(lens: &Lens) -> String {
         LENS_SYSTEM.to_string()
     } else {
         format!(
-            "당신은 \"{}\"이다. {}\n동의를 위한 동의를 하지 않는다 — 이 정체성의 관점에서 판단이 다르면 명확히 다르게 말한다.\n\n{}",
+            "You are \"{}\". {}\nDo not agree just to agree — if your judgment differs from this identity's perspective, say so clearly.\n\n{}",
             lens.persona_name, lens.persona_voice, LENS_SYSTEM
         )
     }
@@ -138,24 +138,27 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
             } else {
                 format!("{} ({})", l.title, l.persona_name)
             };
-            format!("- id=\"{}\" | {} — 선정 신호: {}", l.id, who, l.signal)
+            format!(
+                "- id=\"{}\" | {} — selection signal: {}",
+                l.id, who, l.signal
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
     let ctx = shared_context(spec, input);
     let task = format!(
-        "# 과제\n아래 diff 성격에 맞는 리뷰 렌즈를 1~3개 고른다(선정 이후 교체 없음).\n\n\
-         ## 렌즈 후보\n{catalog}\n\n\
-         ## 출력(JSON만)\n{{\"selected\":[\"id\", ...]}}\n",
+        "# Task\nChoose 1-3 review lenses that fit the nature of the diff below (no swapping after selection).\n\n\
+         ## Candidate lenses\n{catalog}\n\n\
+         ## Output (JSON only)\n{{\"selected\":[\"id\", ...]}}\n",
         catalog = catalog
     );
     let v = llm
         .json_ctx(
             Some(&ctx),
             &task,
-            Some("렌즈 선정만 수행하는 Tech Lead다. 반드시 JSON 스키마로만 응답한다."),
+            Some("You are a Tech Lead who only performs lens selection. Respond strictly in the JSON schema only."),
         )
-        .context("렌즈 선정 실패")?;
+        .context("Lens selection failed")?;
     let selected: Vec<String> = v
         .get("selected")
         .and_then(|s| s.as_array())
@@ -174,22 +177,22 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
         .collect();
     anyhow::ensure!(
         !valid.is_empty(),
-        "렌즈 선정 결과가 비어있거나 spec에 없는 id뿐"
+        "Lens selection result is empty, or contains only ids not present in the spec"
     );
     Ok(valid)
 }
 
 fn build_review_task(spec: &Spec, lens_title: &str, lens_guide: &str) -> String {
     format!(
-        "# 과제\n아래 diff를 \"{lens_title}\" 관점(다른 리뷰어 결과는 참조하지 않음)에서 독립적으로 리뷰한다.\n\n\
-         ## 이 렌즈의 초점\n{lens_guide}\n\n\
-         ## 리뷰 원칙\n\
-         - finding마다 file:line 근거 필수. 근거 없는 의심은 unverified로.\n\
-         - severity는 P0(치명)~P3(사소) 중 하나.\n\
-         - label은 다음 중 하나만: {labels}\n\n\
-         ## 출력(JSON만, 코드펜스 없이)\n\
+        "# Task\nReview the diff below independently from the \"{lens_title}\" perspective (do not reference other reviewers' results).\n\n\
+         ## This lens's focus\n{lens_guide}\n\n\
+         ## Review principles\n\
+         - Every finding requires file:line evidence. Suspicions without evidence go under unverified.\n\
+         - severity must be one of P0 (critical) through P3 (minor).\n\
+         - label must be exactly one of: {labels}\n\n\
+         ## Output (JSON only, no code fences)\n\
          {{\"findings\":[{{\"file\":\"...\",\"line\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\
-         \"impact\":\"...\",\"severity\":\"P0|P1|P2|P3\",\"label\":<허용값 중 하나>,\
+         \"impact\":\"...\",\"severity\":\"P0|P1|P2|P3\",\"label\":<one of the allowed values>,\
          \"confidence\":\"high|medium|low\",\"recommendation\":\"...\"}}],\"unverified\":[\"...\"]}}\n",
         lens_title = lens_title,
         lens_guide = lens_guide,
@@ -217,7 +220,7 @@ pub fn review_lens(
 ) -> Result<LensOutput> {
     let lens = spec
         .lens_by_id(lens_id)
-        .ok_or_else(|| anyhow::anyhow!("spec에 없는 렌즈: {lens_id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("Lens not in spec: {lens_id}"))?;
     // ctx (context/conventions/requirements/diff) is identical across lenses — it's passed
     // separately from task (the lens-specific instructions) so the OpenRouter backend can
     // cache it as its own block.
@@ -226,7 +229,7 @@ pub fn review_lens(
     let system = persona_system(lens);
     let mut out: LensOutput = llm
         .json_ctx_typed(Some(&ctx), &task, Some(&system))
-        .with_context(|| format!("렌즈 리뷰 실패: {lens_id}"))?;
+        .with_context(|| format!("Lens review failed: {lens_id}"))?;
     let reviewer = if lens.persona_name.is_empty() {
         lens.title.clone()
     } else {
@@ -245,21 +248,21 @@ pub fn review_lens(
 }
 
 const GOOD_THINGS_GUIDE: &str =
-    "유지할 가치가 있는 구체적 구현을 찾는다. 근거 없는 칭찬은 만들지 않는다.";
+    "Find concrete implementations worth keeping. Do not manufacture praise without evidence.";
 
 pub fn review_good_things(llm: &Llm, spec: &Spec, input: &Input) -> Result<GoodThingsOutput> {
     let ctx = shared_context(spec, input);
     let task = format!(
-        "# 과제\n아래 diff에서 유지해야 할 좋은 구현을 찾는다.\n\n\
-         ## 이 렌즈의 초점\n{guide}\n\n\
-         ## 출력(JSON만, 코드펜스 없이)\n\
+        "# Task\nFind good implementations in the diff below that are worth keeping.\n\n\
+         ## This lens's focus\n{guide}\n\n\
+         ## Output (JSON only, no code fences)\n\
          {{\"good_things\":[{{\"file_line\":\"file:line\",\"practice\":\"...\",\"why\":\"...\"}}]}}\n\
-         근거로 인용할 구체적 구현이 없으면 good_things를 빈 배열로 반환한다.\n",
+         If there is no concrete implementation to cite as evidence, return good_things as an empty array.\n",
         guide = GOOD_THINGS_GUIDE,
     );
     let out: GoodThingsOutput = llm
         .json_ctx_typed(Some(&ctx), &task, Some(LENS_SYSTEM))
-        .context("Good Things 렌즈 실패")?;
+        .context("Good Things lens failed")?;
     Ok(out)
 }
 
@@ -392,8 +395,8 @@ mod tests {
             {"file":"a.rs","line":"1","claim":"ok","evidence":"e","severity":"P1","label":"possible bug"},
             {"file":"b.rs","line":"2","claim":"second finding"}
         ]}"#;
-        let out: LensOutput =
-            serde_json::from_str(json).expect("일부 필드 누락에도 전체 파싱 성공해야 함");
+        let out: LensOutput = serde_json::from_str(json)
+            .expect("parsing should succeed for the whole array even with one field missing");
         assert_eq!(out.findings.len(), 2);
         assert_eq!(out.findings[0].claim, "ok");
         assert_eq!(out.findings[1].evidence, "");

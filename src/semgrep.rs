@@ -55,11 +55,11 @@ pub fn try_run(changed_files: &[String]) -> Option<serde_json::Value> {
     Some(serde_json::json!({
         "sast": {
             "status": if has_findings { "fail" } else { "pass" },
-            "evidence": format!("semgrep --config=auto 자동 실행: {} findings", results.len()),
+            "evidence": format!("semgrep --config=auto ran automatically: {} findings", results.len()),
         },
         "secrets": {
             "status": if secrets_hit { "fail" } else { "pass" },
-            "evidence": "semgrep --config=auto 결과 기반 — 전용 secrets 스캐너 아니므로 참고용",
+            "evidence": "based on semgrep --config=auto results — not a dedicated secrets scanner, for reference only",
         },
     }))
 }
@@ -164,7 +164,7 @@ mod build_args_tests {
             .expect("-- separator missing");
         assert!(
             args[1..sep].iter().all(|a| a.starts_with('-')),
-            "scan 다음부터 -- 전까지는 전부 실제 플래그여야 함"
+            "everything between scan and -- must be actual flags"
         );
         assert_eq!(&args[sep + 1..], existing.as_slice());
     }

@@ -58,7 +58,7 @@ impl Usage {
             String::new()
         };
         format!(
-            "LLM 호출 {}회 — input {} / output {} / cache_read {} / cache_write {}{}",
+            "LLM calls: {} — input {} / output {} / cache_read {} / cache_write {}{}",
             self.calls,
             self.input_tokens,
             self.output_tokens,
@@ -121,8 +121,9 @@ impl Llm {
         verbose: bool,
         usage: Arc<Mutex<Usage>>,
     ) -> Result<Self> {
-        let api_key = std::env::var("OPENROUTER_API_KEY")
-            .context("OPENROUTER_API_KEY 환경변수 없음 (export OPENROUTER_API_KEY=...)")?;
+        let api_key = std::env::var("OPENROUTER_API_KEY").context(
+            "OPENROUTER_API_KEY environment variable not set (export OPENROUTER_API_KEY=...)",
+        )?;
         Ok(Llm {
             provider: Provider::OpenRouter { api_key },
             model: Some(model.unwrap_or_else(|| OPENROUTER_DEFAULT_MODEL.to_string())),
@@ -174,7 +175,7 @@ impl Llm {
             Provider::Fixture(queue) => {
                 let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
                 let text = q.pop_front().ok_or_else(|| {
-                    anyhow!("fixture 응답 큐가 비었음 — 예상보다 LLM 호출이 많음")
+                    anyhow!("fixture response queue is empty — more LLM calls than expected")
                 })?;
                 Ok(CallResult {
                     text,
@@ -198,7 +199,7 @@ impl Llm {
                     if !r.text.trim().is_empty() {
                         return Ok(r.text);
                     }
-                    last = Some(anyhow!("빈 응답"));
+                    last = Some(anyhow!("empty response"));
                 }
                 Err(e) => last = Some(e),
             }
@@ -213,7 +214,7 @@ impl Llm {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| anyhow!("알 수 없는 실패")))
+        Err(last.unwrap_or_else(|| anyhow!("unknown failure")))
     }
 
     /// JSON-enforcing variant of [`Llm::text_ctx`].
@@ -266,7 +267,7 @@ impl Llm {
                 }
             };
             let parsed = extract_json(&raw).and_then(|v| {
-                serde_json::from_value::<T>(v).context("응답이 예상 스키마와 불일치")
+                serde_json::from_value::<T>(v).context("response does not match expected schema")
             });
             match parsed {
                 Ok(v) => return Ok(v),
@@ -289,7 +290,7 @@ impl Llm {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| anyhow!("JSON 응답 실패")))
+        Err(last.unwrap_or_else(|| anyhow!("JSON response failed")))
     }
 }
 
@@ -326,7 +327,7 @@ fn wait_with_timeout(
             let _ = child.kill();
             let _ = child.wait();
             return Err(anyhow!(
-                "claude CLI 호출이 {}초 넘게 응답 없어 강제 종료함",
+                "claude CLI call unresponsive for over {}s, force-killed",
                 timeout.as_secs()
             ));
         }
@@ -335,10 +336,10 @@ fn wait_with_timeout(
 
     let stdout = stdout_handle
         .join()
-        .map_err(|_| anyhow!("stdout 리더 스레드 panic"))?;
+        .map_err(|_| anyhow!("stdout reader thread panicked"))?;
     let stderr = stderr_handle
         .join()
-        .map_err(|_| anyhow!("stderr 리더 스레드 panic"))?;
+        .map_err(|_| anyhow!("stderr reader thread panicked"))?;
     Ok(std::process::Output {
         status,
         stdout,
@@ -360,7 +361,7 @@ fn write_stdin_and_wait(
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow!("stdin 열기 실패"))?;
+        .ok_or_else(|| anyhow!("failed to open stdin"))?;
     let stdin_handle =
         std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(&stdin_data) });
 
@@ -371,8 +372,8 @@ fn write_stdin_and_wait(
     // joining, the thread will terminate naturally soon.
     match stdin_handle.join() {
         Ok(Ok(())) => Ok(out),
-        Ok(Err(e)) => Err(anyhow!("stdin 쓰기 실패: {e}")),
-        Err(_) => Err(anyhow!("stdin 쓰기 스레드 panic")),
+        Ok(Err(e)) => Err(anyhow!("failed to write stdin: {e}")),
+        Err(_) => Err(anyhow!("stdin writer thread panicked")),
     }
 }
 
@@ -399,29 +400,36 @@ fn call_claude(
 
     let child = cmd
         .spawn()
-        .with_context(|| format!("`{bin}` 실행 실패 (설치 및 PATH 확인)"))?;
+        .with_context(|| format!("failed to run `{bin}` (check installation and PATH)"))?;
 
     let mut stdin_data = ctx.map(|c| c.as_bytes().to_vec()).unwrap_or_default();
     stdin_data.extend_from_slice(task.as_bytes());
     let out = write_stdin_and_wait(child, stdin_data, CLAUDE_CLI_TIMEOUT)
-        .with_context(|| format!("`{bin}` 실행 대기 실패"))?;
+        .with_context(|| format!("failed waiting for `{bin}` to finish"))?;
     if !out.status.success() {
         return Err(anyhow!(
-            "claude 종료코드 {:?}: {}",
+            "claude exited with code {:?}: {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .with_context(|| format!("claude JSON 출력 파싱 실패: {}", truncate(&stdout, 400)))?;
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).with_context(|| {
+        format!(
+            "failed to parse claude JSON output: {}",
+            truncate(&stdout, 400)
+        )
+    })?;
     if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
-        return Err(anyhow!("claude가 에러 응답: {}", truncate(&stdout, 400)));
+        return Err(anyhow!(
+            "claude returned an error response: {}",
+            truncate(&stdout, 400)
+        ));
     }
     let result = v
         .get("result")
         .and_then(|r| r.as_str())
-        .ok_or_else(|| anyhow!("응답에 result 필드 없음: {}", truncate(&stdout, 400)))?;
+        .ok_or_else(|| anyhow!("response missing result field: {}", truncate(&stdout, 400)))?;
 
     // The usage/cost fields may or may not exist, and their names may differ, depending on the
     // claude CLI version, so parse leniently (default to 0 instead of failing — only the result field is treated as a contract).
@@ -509,12 +517,12 @@ fn call_openrouter(
         .header("Content-Type", "application/json")
         .send_json(body);
 
-    let mut resp = result.map_err(|e| anyhow!("openrouter 호출 실패: {e}"))?;
+    let mut resp = result.map_err(|e| anyhow!("openrouter call failed: {e}"))?;
     if !resp.status().is_success() {
         let code = resp.status().as_u16();
         let body_text = resp.body_mut().read_to_string().unwrap_or_default();
         return Err(anyhow!(
-            "openrouter 응답 코드 {code}: {}",
+            "openrouter response code {code}: {}",
             truncate(&body_text, 400)
         ));
     }
@@ -522,7 +530,7 @@ fn call_openrouter(
     let v: serde_json::Value = resp
         .body_mut()
         .read_json()
-        .context("openrouter 응답 JSON 파싱 실패")?;
+        .context("failed to parse openrouter response JSON")?;
     let content = v
         .get("choices")
         .and_then(|c| c.get(0))
@@ -531,7 +539,7 @@ fn call_openrouter(
         .and_then(|c| c.as_str())
         .ok_or_else(|| {
             anyhow!(
-                "openrouter 응답에 content 없음: {}",
+                "openrouter response missing content: {}",
                 truncate(&v.to_string(), 400)
             )
         })?;
@@ -586,7 +594,7 @@ pub fn extract_json(raw: &str) -> Result<serde_json::Value> {
             }
         }
     }
-    Err(anyhow!("JSON 추출 실패: {}", truncate(t, 400)))
+    Err(anyhow!("failed to extract JSON: {}", truncate(t, 400)))
 }
 
 pub fn truncate(s: &str, n: usize) -> String {
@@ -624,7 +632,7 @@ mod tests {
             .unwrap();
         let err = wait_with_timeout(child, Duration::from_millis(300))
             .expect_err("hanging process must time out");
-        assert!(err.to_string().contains("초 넘게"));
+        assert!(err.to_string().contains("unresponsive for over"));
     }
 
     #[test]
@@ -658,12 +666,12 @@ mod tests {
         let large_payload = vec![b'x'; 4 * 1024 * 1024]; // 4MB, larger than any OS pipe buffer
         let start = std::time::Instant::now();
         let err = write_stdin_and_wait(child, large_payload, Duration::from_secs(1))
-            .expect_err("stdin을 안 읽는 프로세스는 타임아웃으로 종료돼야 함");
-        assert!(err.to_string().contains("초 넘게"));
+            .expect_err("a process that never reads stdin must be terminated by timeout");
+        assert!(err.to_string().contains("unresponsive for over"));
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "wait_with_timeout의 1초 타임아웃 근처에서 끝나야 하는데 {:?} 걸림 \
-             (동기 쓰기로 회귀했을 가능성)",
+            "should finish around wait_with_timeout's 1s timeout, but took {:?} \
+             (may have regressed to a synchronous write)",
             start.elapsed()
         );
     }

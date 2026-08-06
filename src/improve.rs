@@ -5,9 +5,9 @@ use crate::spec::Spec;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const IMPROVE_SYSTEM: &str = "당신은 구체적인 코드 개선안을 제시하는 리뷰어다. \
-이번 diff가 추가한(+) 라인에 대해서만 제안한다. 이미 반영된 것, docstring/타입힌트/주석/unused import 제안은 하지 않는다. \
-반드시 지정된 JSON 스키마로만 응답한다.";
+pub const IMPROVE_SYSTEM: &str = "You are a reviewer who proposes concrete code improvements. \
+Only suggest changes for lines added (+) in this diff. Don't suggest anything already addressed, and don't suggest docstring/type-hint/comment/unused-import changes. \
+Respond only in the specified JSON schema.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Suggestion {
@@ -30,19 +30,19 @@ struct ImproveOutput {
 pub fn run(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<Suggestion>> {
     let ctx = shared_context(spec, input);
     let task = format!(
-        "# 과제\n이번 diff의 신규(+) 라인에 대해 구체적인 코드 개선안을 제시한다.\n\n\
-         ## 규칙\n\
-         - existing_code/improved_code는 실제 diff에 있는 코드를 그대로 인용/수정.\n\
-         - one_sentence_summary는 6단어 이내.\n\
-         - label은 다음 중 하나만: {labels}\n\n\
-         ## 출력(JSON만, 코드펜스 없이)\n\
+        "# Task\nPropose concrete code improvements for the new (+) lines in this diff.\n\n\
+         ## Rules\n\
+         - existing_code/improved_code must quote/edit the actual code from the diff verbatim.\n\
+         - one_sentence_summary must be under 6 words.\n\
+         - label must be exactly one of: {labels}\n\n\
+         ## Output (JSON only, no code fences)\n\
          {{\"suggestions\":[{{\"relevant_file\":\"...\",\"language\":\"...\",\"existing_code\":\"...\",\
          \"suggestion_content\":\"...\",\"improved_code\":\"...\",\"one_sentence_summary\":\"...\",\
-         \"label\":<허용값 중 하나>}}]}}\n",
+         \"label\":<one of the allowed values>}}]}}\n",
         labels = spec.labels_prompt(),
     );
     let out: ImproveOutput = llm
         .json_ctx_typed(Some(&ctx), &task, Some(IMPROVE_SYSTEM))
-        .context("improve 실패")?;
+        .context("improve failed")?;
     Ok(out.suggestions)
 }

@@ -107,11 +107,11 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     let mut md = String::new();
 
     md.push_str(&format!(
-        "# 코드 리뷰 — {} (round {})\n\n",
+        "# Code Review — {} (round {})\n\n",
         spec.name, round
     ));
     md.push_str(&format!(
-        "**Verdict: {}**  ·  Score: {}/100  ·  Effort: {}/5  ·  변경 파일 {}개 (+{}/-{})\n\n",
+        "**Verdict: {}**  ·  Score: {}/100  ·  Effort: {}/5  ·  {} files changed (+{}/-{})\n\n",
         quant.verdict,
         quant.score,
         quant.estimated_effort_1_5,
@@ -119,12 +119,15 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         input.added_lines,
         input.removed_lines,
     ));
-    md.push_str(&format!("선택 렌즈: {}\n\n", selected_lenses.join(", ")));
+    md.push_str(&format!(
+        "Selected lenses: {}\n\n",
+        selected_lenses.join(", ")
+    ));
 
     if !stage_errors.is_empty() {
         md.push_str(&format!(
-            "## ⚠ 일부 단계 실패 ({}건)\n\n아래 단계가 실패해 이 결과는 부분적입니다 — \
-             해당 단계의 관점/판정은 findings·requirements 결과에 반영되지 않았습니다.\n\n",
+            "## ⚠ Some Stages Failed ({})\n\nThe stages below failed, so this result is partial — \
+             the affected stage's perspective/judgment is not reflected in the findings/requirements results.\n\n",
             stage_errors.len()
         ));
         for e in stage_errors {
@@ -134,13 +137,15 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     }
 
     if !fix_results.is_empty() {
-        md.push_str("## 이전 라운드 대비\n\n| Finding | Status | Evidence |\n|---|---|---|\n");
+        md.push_str(
+            "## Compared to Previous Round\n\n| Finding | Status | Evidence |\n|---|---|---|\n",
+        );
         for f in fix_results {
             // superseded_by is always attached explicitly by the code rather than relying solely
             // on the LLM's free-form text (evidence) — even if the evidence wording is missing
             // or ambiguous, which finding replaced it must always be verifiable in the report.
             let evidence = if f.status == "SUPERSEDED" && !f.superseded_by.is_empty() {
-                format!("[{}로 대체됨] {}", f.superseded_by, f.evidence)
+                format!("[Superseded by {}] {}", f.superseded_by, f.evidence)
             } else {
                 f.evidence.clone()
             };
@@ -165,15 +170,15 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     }
     md.push('\n');
 
-    md.push_str("## 정량 요약\n\n");
+    md.push_str("## Quantitative Summary\n\n");
     md.push_str(&format!(
-        "- estimated_effort_to_review: {}/5\n- review time cost: best {}분 / average {}분 / worst {}분\n",
+        "- estimated_effort_to_review: {}/5\n- review time cost: best {} min / average {} min / worst {} min\n",
         quant.estimated_effort_1_5, quant.time_best_min, quant.time_average_min, quant.time_worst_min
     ));
     if quant.score_deductions.is_empty() {
-        md.push_str("- 감점 없음 (CONFIRMED finding 없음)\n\n");
+        md.push_str("- No deductions (no CONFIRMED findings)\n\n");
     } else {
-        md.push_str("- 감점 근거:\n");
+        md.push_str("- Deduction rationale:\n");
         for d in &quant.score_deductions {
             md.push_str(&format!("  - {}\n", d));
         }
@@ -182,8 +187,8 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
 
     md.push_str("## Requirements Verification\n\n");
     match requirements {
-        None => md.push_str("(요구사항 미제공 — 검증 생략)\n\n"),
-        Some(reqs) if reqs.is_empty() => md.push_str("(요구사항 없음)\n\n"),
+        None => md.push_str("(No requirements provided — verification skipped)\n\n"),
+        Some(reqs) if reqs.is_empty() => md.push_str("(No requirements)\n\n"),
         Some(reqs) => {
             md.push_str("| Requirement | Status | Evidence or gap |\n|---|---|---|\n");
             for r in reqs {
@@ -205,7 +210,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     confirmed.sort_by_key(|f| severity_rank(&f.severity));
 
     md.push_str("## Findings\n\n");
-    md.push_str(&format!("허용 label: {}\n\n", spec.labels_prompt()));
+    md.push_str(&format!("Allowed labels: {}\n\n", spec.labels_prompt()));
     md.push_str("| ID | Priority | Label | Lens | Reviewer | File:line | Evidence | Impact | Recommendation | Discourse result |\n|---|---|---|---|---|---|---|---|---|---|\n");
     for f in &confirmed {
         let r = resolved.get(&f.id);
@@ -232,7 +237,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         .filter(|f| resolved.get(&f.id).map(|r| r.status.as_str()) == Some("REJECTED"))
         .collect();
     if !rejected.is_empty() {
-        md.push_str("### 기각된 후보\n\n");
+        md.push_str("### Rejected Candidates\n\n");
         for f in &rejected {
             let reason = resolved.get(&f.id).map(|r| r.reason.as_str()).unwrap_or("");
             md.push_str(&format!(
@@ -244,7 +249,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     }
 
     if !unverified.is_empty() {
-        md.push_str("### 검증 필요 사항 (근거 부족으로 finding 미승격)\n\n");
+        md.push_str("### Needs Verification (insufficient evidence to promote to finding)\n\n");
         for (lens_id, item) in unverified {
             md.push_str(&format!("- [{}] {}\n", lens_id, item));
         }
@@ -268,10 +273,11 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         .collect();
     if !needs_human_look.is_empty() {
         md.push_str(
-            "### 사람이 봐야 할 항목 (확정도 기각도 아님 — score/verdict 미반영)\n\n\
-             discourse가 합의에 이르지 못했거나(UNCERTAIN) 다른 finding에 병합(MERGED)된 \
-             항목이다. 여러 렌즈가 독립적으로 같은 문제를 지적했을 수 있으니 직접 확인 권장.\n\n\
-             | ID | Priority | Label | File:line | Claim | 상태 | 사유 |\n|---|---|---|---|---|---|---|\n",
+            "### Needs Human Review (neither confirmed nor rejected — not reflected in score/verdict)\n\n\
+             These are items where discourse failed to reach consensus (UNCERTAIN) or that were merged \
+             into another finding (MERGED). Multiple lenses may have independently flagged the same \
+             issue, so manual review is recommended.\n\n\
+             | ID | Priority | Label | File:line | Claim | Status | Reason |\n|---|---|---|---|---|---|---|\n",
         );
         for f in &needs_human_look {
             let r = resolved.get(&f.id);
@@ -279,7 +285,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             let reason = r.map(|r| r.reason.as_str()).unwrap_or("");
             let reason = if status == "MERGED" {
                 let target = r.map(|r| r.merged_into.as_str()).unwrap_or("");
-                format!("{target}로 병합: {reason}")
+                format!("Merged into {target}: {reason}")
             } else {
                 reason.to_string()
             };
@@ -300,7 +306,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
 
     md.push_str("## Good Things\n\n");
     if good_things.is_empty() {
-        md.push_str("관찰되지 않음\n\n");
+        md.push_str("None observed\n\n");
     } else {
         md.push_str("| File:line | Good practice | Why it should be preserved |\n|---|---|---|\n");
         for g in good_things {
@@ -349,7 +355,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     }
 
     let path = out_dir.join("report.md");
-    std::fs::write(&path, md).with_context(|| format!("{} 쓰기 실패", path.display()))?;
+    std::fs::write(&path, md).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
 }
 
@@ -365,24 +371,24 @@ pub fn write_describe(out_dir: &Path, d: &Describe, todos: &[String]) -> Result<
         "## can_be_split\n\n{} — {}\n\n",
         d.can_be_split, d.can_be_split_note
     ));
-    md.push_str("## TODO/FIXME (신규 라인, 결정론적 스캔)\n\n");
+    md.push_str("## TODO/FIXME (new lines, deterministic scan)\n\n");
     if todos.is_empty() {
-        md.push_str("없음\n");
+        md.push_str("None\n");
     } else {
         for t in todos {
             md.push_str(&format!("- {}\n", t));
         }
     }
     let path = out_dir.join("describe.md");
-    std::fs::write(&path, md).with_context(|| format!("{} 쓰기 실패", path.display()))?;
+    std::fs::write(&path, md).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
 }
 
 pub fn write_improve(out_dir: &Path, suggestions: &[Suggestion]) -> Result<PathBuf> {
     let mut md = String::new();
-    md.push_str("# 코드 개선 제안\n\n");
+    md.push_str("# Code Improvement Suggestions\n\n");
     if suggestions.is_empty() {
-        md.push_str("제안 없음\n");
+        md.push_str("No suggestions\n");
     }
     for s in suggestions {
         md.push_str(&format!(
@@ -400,7 +406,7 @@ pub fn write_improve(out_dir: &Path, suggestions: &[Suggestion]) -> Result<PathB
         ));
     }
     let path = out_dir.join("improve.md");
-    std::fs::write(&path, md).with_context(|| format!("{} 쓰기 실패", path.display()))?;
+    std::fs::write(&path, md).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
 }
 
@@ -478,7 +484,7 @@ mod tests {
             file: "src/users.rs".to_string(),
             line: "12".to_string(),
             claim: claim.to_string(),
-            evidence: "format! 로 SQL 문자열 조립".to_string(),
+            evidence: "SQL string built via format!".to_string(),
             impact: String::new(),
             severity: "P1".to_string(),
             label: "security".to_string(),
@@ -495,7 +501,7 @@ mod tests {
         // couldn't land on CONFIRMED or REJECTED, so it was invisible everywhere in the report.
         let findings = vec![
             test_finding("security-r1-1", "raw SQL injection"),
-            test_finding("security-r1-2", "동일 SQL injection, 다른 렌즈"),
+            test_finding("security-r1-2", "same SQL injection, different lens"),
         ];
         let mut resolved = HashMap::new();
         resolved.insert(
@@ -504,7 +510,7 @@ mod tests {
                 finding_id: "security-r1-1".to_string(),
                 status: "UNCERTAIN".to_string(),
                 merged_into: String::new(),
-                reason: "합의 실패(net=0.30)".to_string(),
+                reason: "Consensus failed (net=0.30)".to_string(),
             },
         );
         resolved.insert(
@@ -513,7 +519,7 @@ mod tests {
                 finding_id: "security-r1-2".to_string(),
                 status: "MERGED".to_string(),
                 merged_into: "security-r1-1".to_string(),
-                reason: "동일 근본 원인".to_string(),
+                reason: "Same root cause".to_string(),
             },
         );
         let spec = test_spec();
@@ -548,26 +554,29 @@ mod tests {
             .split("## Findings")
             .nth(1)
             .unwrap()
-            .split("### 사람이 봐야 할 항목")
+            .split("### Needs Human Review")
             .next()
             .unwrap();
         assert!(
             !findings_section.contains("security-r1-1")
                 && !findings_section.contains("security-r1-2"),
-            "UNCERTAIN/MERGED finding이 CONFIRMED Findings 테이블에 섞이면 안 됨"
+            "UNCERTAIN/MERGED findings must not appear in the CONFIRMED Findings table"
         );
         assert!(
-            md.contains("사람이 봐야 할 항목"),
-            "새 가시성 섹션이 렌더링돼야 함"
+            md.contains("Needs Human Review"),
+            "The new visibility section should render"
         );
         assert!(
             md.contains("security-r1-1"),
-            "UNCERTAIN finding이 보여야 함"
+            "UNCERTAIN finding should be visible"
         );
-        assert!(md.contains("security-r1-2"), "MERGED finding이 보여야 함");
         assert!(
-            md.contains("security-r1-1로 병합"),
-            "MERGED 사유에 병합 대상이 보여야 함"
+            md.contains("security-r1-2"),
+            "MERGED finding should be visible"
+        );
+        assert!(
+            md.contains("Merged into security-r1-1"),
+            "MERGED reason should show the merge target"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

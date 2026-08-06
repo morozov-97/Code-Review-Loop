@@ -9,7 +9,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin="${CODEREVIEW_BIN:-$repo_root/target/release/codereview}"
 
 if [[ ! -x "$bin" ]]; then
-  echo "codereview 바이너리를 못 찾음: $bin — 먼저 'cargo build --release' 하거나 CODEREVIEW_BIN으로 경로 지정" >&2
+  echo "codereview binary not found: $bin — run 'cargo build --release' first, or set CODEREVIEW_BIN to its path" >&2
   exit 1
 fi
 

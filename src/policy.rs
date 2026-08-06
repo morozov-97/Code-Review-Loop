@@ -90,7 +90,7 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
         return PolicyResult {
             title: "Tests accompany behavior changes".into(),
             status: PolicyStatus::NotConfigured,
-            evidence: "spec.test_path_patterns 미설정".into(),
+            evidence: "spec.test_path_patterns not configured".into(),
         };
     }
     let test_files: Vec<&String> = input
@@ -109,7 +109,7 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
         return PolicyResult {
             title: "Tests accompany behavior changes".into(),
             status: PolicyStatus::NotApplicable,
-            evidence: "동작 코드 변경 없음(테스트/문서 파일만 변경)".into(),
+            evidence: "no behavior code changes (only test/doc files changed)".into(),
         };
     }
     if !test_files.is_empty() {
@@ -117,7 +117,7 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
             title: "Tests accompany behavior changes".into(),
             status: PolicyStatus::Pass,
             evidence: format!(
-                "테스트 파일 변경: {}",
+                "test files changed: {}",
                 test_files
                     .iter()
                     .map(|s| s.as_str())
@@ -130,7 +130,7 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
             title: "Tests accompany behavior changes".into(),
             status: PolicyStatus::Fail,
             evidence: format!(
-                "동작 변경 파일({})에 대응하는 테스트 파일 변경 없음",
+                "no corresponding test file changes for behavior-changed files ({})",
                 behavior_files
                     .iter()
                     .map(|s| s.as_str())
@@ -146,7 +146,7 @@ fn diff_size(spec: &Spec, input: &Input) -> PolicyResult {
         return PolicyResult {
             title: "Diff size within configured limit".into(),
             status: PolicyStatus::NotConfigured,
-            evidence: "spec.diff_size_limit 미설정".into(),
+            evidence: "spec.diff_size_limit not configured".into(),
         };
     }
     let total = input.added_lines + input.removed_lines;
@@ -155,7 +155,7 @@ fn diff_size(spec: &Spec, input: &Input) -> PolicyResult {
             title: "Diff size within configured limit".into(),
             status: PolicyStatus::Pass,
             evidence: format!(
-                "변경 {total}줄 (+{}/-{}) ≤ 임계값 {}",
+                "{total} lines changed (+{}/-{}) <= threshold {}",
                 input.added_lines, input.removed_lines, spec.diff_size_limit
             ),
         }
@@ -164,7 +164,7 @@ fn diff_size(spec: &Spec, input: &Input) -> PolicyResult {
             title: "Diff size within configured limit".into(),
             status: PolicyStatus::Fail,
             evidence: format!(
-                "변경 {total}줄 (+{}/-{}) > 임계값 {}",
+                "{total} lines changed (+{}/-{}) > threshold {}",
                 input.added_lines, input.removed_lines, spec.diff_size_limit
             ),
         }
@@ -179,7 +179,7 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
         return PolicyResult {
             title: "Changelog/documentation updated".into(),
             status: PolicyStatus::NotConfigured,
-            evidence: "spec.doc_path_patterns 미설정".into(),
+            evidence: "spec.doc_path_patterns not configured".into(),
         };
     }
     let doc_files: Vec<&String> = input
@@ -198,7 +198,7 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
         return PolicyResult {
             title: "Changelog/documentation updated".into(),
             status: PolicyStatus::NotApplicable,
-            evidence: "공개 표면 변경으로 근사되는 파일 없음".into(),
+            evidence: "no files approximated as public surface changes".into(),
         };
     }
     if !doc_files.is_empty() {
@@ -206,7 +206,7 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
             title: "Changelog/documentation updated".into(),
             status: PolicyStatus::Pass,
             evidence: format!(
-                "문서 파일 변경: {}",
+                "doc files changed: {}",
                 doc_files
                     .iter()
                     .map(|s| s.as_str())
@@ -218,7 +218,7 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
         PolicyResult {
             title: "Changelog/documentation updated".into(),
             status: PolicyStatus::Fail,
-            evidence: "공개 표면 변경 있으나 문서/changelog 갱신 없음".into(),
+            evidence: "public surface changed but docs/changelog not updated".into(),
         }
     }
 }

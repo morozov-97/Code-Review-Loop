@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const DESCRIBE_SYSTEM: &str =
-    "당신은 PR 설명을 작성하는 리뷰어다. diff에 없는 내용을 지어내지 않는다. \
-반드시 지정된 JSON 스키마로만 응답한다.";
+    "You are a reviewer who writes PR descriptions. Don't invent anything that isn't in the diff. \
+Respond only in the specified JSON schema.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Describe {
@@ -24,14 +24,14 @@ pub struct Describe {
 
 pub fn run(llm: &Llm, spec: &Spec, input: &Input) -> Result<Describe> {
     let ctx = shared_context(spec, input);
-    let task = "# 과제\n아래 diff의 PR 설명을 작성한다.\n\n\
-         ## 출력(JSON만, 코드펜스 없이)\n\
-         {\"title\":\"50자 이내 한 줄\",\"summary\":\"2~4문장\",\
-         \"walkthrough\":[\"파일/영역별 변경 요약, 항목당 1줄\"],\
-         \"labels\":[\"feature|fix|refactor|chore|docs|test 중 해당하는 것\"],\
-         \"can_be_split\":\"yes|no|unknown\",\"can_be_split_note\":\"근거\"}\n";
+    let task = "# Task\nWrite a PR description for the diff below.\n\n\
+         ## Output (JSON only, no code fences)\n\
+         {\"title\":\"one line, under 50 characters\",\"summary\":\"2-4 sentences\",\
+         \"walkthrough\":[\"summary of changes per file/area, one line per item\"],\
+         \"labels\":[\"whichever apply: feature|fix|refactor|chore|docs|test\"],\
+         \"can_be_split\":\"yes|no|unknown\",\"can_be_split_note\":\"rationale\"}\n";
     llm.json_ctx_typed(Some(&ctx), task, Some(DESCRIBE_SYSTEM))
-        .context("describe 실패")
+        .context("describe failed")
 }
 
 /// Scans only lines newly added (+) by the diff for TODO/FIXME/XXX. Deterministic (no LLM used).

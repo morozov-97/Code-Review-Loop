@@ -35,7 +35,7 @@ fn score(findings: &[Finding], resolved: &HashMap<String, Resolution>) -> (i64, 
             let p = severity_penalty(&f.severity);
             total -= p;
             deductions.push(format!(
-                "[{}] {}:{} -{}점 — {}",
+                "[{}] {}:{} -{} pts — {}",
                 f.severity, f.file, f.line, p, f.claim
             ));
         }

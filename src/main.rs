@@ -34,7 +34,7 @@ enum Backend {
 #[command(
     name = "codereview",
     version,
-    about = "다각도(멀티 렌즈) 코드 리뷰 파이프라인 — 렌즈별 독립 리뷰 후 discourse로 교차검증"
+    about = "Multi-angle (multi-lens) code review pipeline — independent per-lens review followed by discourse cross-verification"
 )]
 struct Cli {
     #[arg(long, default_value = "claude", global = true)]
@@ -119,7 +119,7 @@ enum Cmd {
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("에러: {e:#}");
+        eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
 }
@@ -231,13 +231,15 @@ fn run_review(
     const DIFF_WARN_CHARS: usize = 300_000;
     if inp.diff.len() > DIFF_WARN_CHARS {
         eprintln!(
-            "경고: diff가 {}자로 큼 — 렌즈별 리뷰·discourse·requirements 호출마다 전체가 재전송되어 토큰 비용이 커짐",
+            "Warning: diff is {} characters, which is large — the full diff is resent on every lens review/discourse/requirements call, driving up token cost",
             inp.diff.len()
         );
     }
     if inp.deterministic_results.is_none() {
         if let Some(v) = semgrep::try_run(&inp.changed_files) {
-            println!("semgrep 자동 감지 — 로컬 실행 결과를 deterministic checks에 반영");
+            println!(
+                "semgrep auto-detected — reflecting local run results in deterministic checks"
+            );
             inp.deterministic_results = Some(v);
         }
     }
@@ -250,7 +252,7 @@ fn run_review(
     let round = prior_state.as_ref().map(|s| s.round + 1).unwrap_or(1);
 
     println!(
-        "리뷰 시작(round {}) — {} ({}개 파일, +{}/-{})",
+        "Starting review (round {}) — {} ({} files, +{}/-{})",
         round,
         sp.name,
         inp.changed_files.len(),
@@ -274,14 +276,14 @@ fn run_review(
                 .collect();
             for id in &ids {
                 let lens = sp.lens_by_id(id);
-                anyhow::ensure!(lens.is_some(), "spec에 없는 렌즈 id: {id}");
+                anyhow::ensure!(lens.is_some(), "lens id not found in spec: {id}");
                 // #96: always-on lenses (e.g. good_things) are already added below and, for
                 // good_things specifically, run through a dedicated review call with its own
                 // schema — letting one in here via --lenses would run it a second time through
                 // the generic defect-finding prompt, producing findings that pollute the score.
                 anyhow::ensure!(
                     !lens.unwrap().always,
-                    "{id}는 always 렌즈라 --lenses로 지정할 수 없음(항상 자동 포함됨)"
+                    "{id} is an always lens and cannot be specified via --lenses (it's always included automatically)"
                 );
             }
             ids
@@ -294,7 +296,7 @@ fn run_review(
             selected_ids.push(l.id.clone());
         }
     }
-    println!("선정 렌즈: {}", selected_ids.join(", "));
+    println!("Selected lenses: {}", selected_ids.join(", "));
 
     // Step 7: independent per-lens review (seal-then-reveal in sequence — equivalent to parallel
     // execution since results never reference each other).
@@ -313,7 +315,7 @@ fn run_review(
             par_map(concurrency, selected_ids.clone(), |id| {
                 let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
                 println!(
-                    "  렌즈 완료: {} — finding {}건, 미검증 {}건",
+                    "  Lens complete: {} — {} findings, {} unverified",
                     id,
                     out.findings.len(),
                     out.unverified.len()
@@ -326,9 +328,9 @@ fn run_review(
             .is_some()
             .then(|| s.spawn(|| lens::review_good_things(cheap_llm, &sp, &inp)));
 
-        let lens_results = lens_handle.join().expect("렌즈 리뷰 스레드 panic");
+        let lens_results = lens_handle.join().expect("lens review thread panicked");
         let good_things_result =
-            good_things_handle.map(|h| h.join().expect("good_things 스레드 panic"));
+            good_things_handle.map(|h| h.join().expect("good_things thread panicked"));
         (lens_results, good_things_result)
     });
 
@@ -344,7 +346,7 @@ fn run_review(
                 }
             }
             Err(e) => {
-                eprintln!("경고: 렌즈 리뷰 실패 — {e:#}");
+                eprintln!("Warning: lens review failed — {e:#}");
                 stage_errors.push(format!("{e:#}"));
             }
         }
@@ -355,7 +357,7 @@ fn run_review(
     let good_things = match good_things_result {
         Some(Ok(out)) => out.good_things,
         Some(Err(e)) => {
-            eprintln!("경고: good_things 렌즈 실패 — {e:#}");
+            eprintln!("Warning: good_things lens failed — {e:#}");
             stage_errors.push(format!("good_things: {e:#}"));
             Vec::new()
         }
@@ -364,10 +366,10 @@ fn run_review(
 
     // Steps 8-9: discourse rounds
     let (audit, mut resolved) = if findings.is_empty() {
-        println!("finding 없음 — discourse 생략");
+        println!("No findings — skipping discourse");
         (Vec::new(), std::collections::HashMap::new())
     } else {
-        println!("discourse 시작 (최대 {}라운드)", max_rounds);
+        println!("Starting discourse (up to {} rounds)", max_rounds);
         discourse::run(llm, &sp, &inp, &mut findings, max_rounds, round)?
     };
 
@@ -425,7 +427,10 @@ fn run_review(
                             finding_id: orig.id.clone(),
                             status: "CONFIRMED".to_string(),
                             merged_into: String::new(),
-                            reason: format!("이전 라운드 미해결(재확인): {}", fr.evidence),
+                            reason: format!(
+                                "Unresolved from previous round (re-confirmed): {}",
+                                fr.evidence
+                            ),
                         },
                     );
                 }
@@ -448,7 +453,7 @@ fn run_review(
     let req_results = match requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("경고: requirements 검증 실패 — {e:#}");
+            eprintln!("Warning: requirements verification failed — {e:#}");
             stage_errors.push(format!("requirements: {e:#}"));
             None
         }
@@ -502,11 +507,11 @@ fn run_review(
     )?;
 
     println!(
-        "\n종료 — verdict={} score={}/100",
+        "\nDone — verdict={} score={}/100",
         quant.verdict, quant.score
     );
-    println!("리포트: {}", path.display());
-    println!("다음 라운드: --prior {}", out_dir.display());
+    println!("Report: {}", path.display());
+    println!("Next round: --prior {}", out_dir.display());
     println!("{}", llm.usage().summary());
     Ok(())
 }
@@ -525,7 +530,7 @@ fn run_describe(
     let d = describe::run(llm, &sp, &inp)?;
     let todos = describe::todo_sections(&inp.diff);
     let path = report::write_describe(&out_dir, &d, &todos)?;
-    println!("describe 완료: {}", path.display());
+    println!("describe complete: {}", path.display());
     println!("{}", llm.usage().summary());
     Ok(())
 }
@@ -544,7 +549,7 @@ fn run_improve(
     let suggestions = improve::run(llm, &sp, &inp)?;
     let path = report::write_improve(&out_dir, &suggestions)?;
     println!(
-        "improve 완료: 제안 {}건 — {}",
+        "improve complete: {} suggestions — {}",
         suggestions.len(),
         path.display()
     );
@@ -554,7 +559,7 @@ fn run_improve(
 
 fn prepare_out(p: &PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(p)
-        .with_context(|| format!("출력 디렉터리 생성 실패: {}", p.display()))?;
+        .with_context(|| format!("failed to create output directory: {}", p.display()))?;
     Ok(p.clone())
 }
 

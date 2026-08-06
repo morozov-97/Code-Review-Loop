@@ -60,11 +60,11 @@ pub struct Spec {
 impl Spec {
     pub fn load(path: &Path) -> Result<Spec> {
         let s = std::fs::read_to_string(path)
-            .with_context(|| format!("스펙 파일 읽기 실패: {}", path.display()))?;
+            .with_context(|| format!("Failed to read spec file: {}", path.display()))?;
         let spec: Spec = toml::from_str(&s)
-            .with_context(|| format!("스펙 TOML 파싱 실패: {}", path.display()))?;
-        anyhow::ensure!(!spec.lenses.is_empty(), "lenses 비어 있음");
-        anyhow::ensure!(!spec.labels.is_empty(), "labels 비어 있음");
+            .with_context(|| format!("Failed to parse spec TOML: {}", path.display()))?;
+        anyhow::ensure!(!spec.lenses.is_empty(), "lenses is empty");
+        anyhow::ensure!(!spec.labels.is_empty(), "labels is empty");
 
         // lens_by_id() only returns the first match — if an id is empty or duplicated,
         // --lenses/selection results referencing that id could silently map to the wrong (or
@@ -74,12 +74,12 @@ impl Spec {
         for l in &spec.lenses {
             anyhow::ensure!(
                 !l.id.trim().is_empty(),
-                "lenses에 id가 빈 항목이 있음(title=\"{}\")",
+                "lenses has an entry with an empty id (title=\"{}\")",
                 l.title
             );
             anyhow::ensure!(
                 seen_ids.insert(l.id.clone()),
-                "lenses에 중복 id 있음: \"{}\"",
+                "lenses has a duplicate id: \"{}\"",
                 l.id
             );
         }
@@ -89,11 +89,11 @@ impl Spec {
         // PASS — catch TOML typos (empty array entries) at load time.
         anyhow::ensure!(
             spec.test_path_patterns.iter().all(|p| !p.trim().is_empty()),
-            "test_path_patterns에 빈 패턴이 있음"
+            "test_path_patterns has an empty pattern"
         );
         anyhow::ensure!(
             spec.doc_path_patterns.iter().all(|p| !p.trim().is_empty()),
-            "doc_path_patterns에 빈 패턴이 있음"
+            "doc_path_patterns has an empty pattern"
         );
 
         Ok(spec)
@@ -148,7 +148,7 @@ title = "Design again"
 "#,
         );
         let err = Spec::load(&path).expect_err("duplicate lens id must be rejected");
-        assert!(err.to_string().contains("중복"));
+        assert!(err.to_string().contains("duplicate"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -165,7 +165,7 @@ title = "No id"
 "#,
         );
         let err = Spec::load(&path).expect_err("empty lens id must be rejected");
-        assert!(err.to_string().contains("빈"));
+        assert!(err.to_string().contains("empty"));
         let _ = std::fs::remove_file(&path);
     }
 

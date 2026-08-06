@@ -20,7 +20,7 @@ fn read_opt(p: &Option<std::path::PathBuf>) -> Result<Option<String>> {
         None => Ok(None),
         Some(path) => {
             let s = std::fs::read_to_string(path)
-                .with_context(|| format!("파일 읽기 실패: {}", path.display()))?;
+                .with_context(|| format!("failed to read file: {}", path.display()))?;
             Ok(Some(s))
         }
     }
@@ -117,12 +117,12 @@ pub fn normalize(
     deterministic_results_path: &Option<std::path::PathBuf>,
 ) -> Result<Input> {
     let diff = std::fs::read_to_string(diff_path)
-        .with_context(|| format!("diff 파일 읽기 실패: {}", diff_path.display()))?;
-    anyhow::ensure!(!diff.trim().is_empty(), "diff가 비어 있음");
+        .with_context(|| format!("failed to read diff file: {}", diff_path.display()))?;
+    anyhow::ensure!(!diff.trim().is_empty(), "diff is empty");
     let (changed_files, added_lines, removed_lines) = parse_diff_stats(&diff);
     anyhow::ensure!(
         !changed_files.is_empty(),
-        "diff에서 변경 파일을 찾지 못함(unified diff 형식 확인)"
+        "no changed files found in diff (check unified diff format)"
     );
 
     let requirements = read_opt(requirements_path)?;
@@ -130,12 +130,15 @@ pub fn normalize(
     let deterministic_results = match deterministic_results_path {
         None => None,
         Some(p) => {
-            let s = std::fs::read_to_string(p)
-                .with_context(|| format!("결정론 결과 파일 읽기 실패: {}", p.display()))?;
-            Some(
-                serde_json::from_str(&s)
-                    .with_context(|| format!("결정론 결과 JSON 파싱 실패: {}", p.display()))?,
-            )
+            let s = std::fs::read_to_string(p).with_context(|| {
+                format!("failed to read deterministic results file: {}", p.display())
+            })?;
+            Some(serde_json::from_str(&s).with_context(|| {
+                format!(
+                    "failed to parse deterministic results JSON: {}",
+                    p.display()
+                )
+            })?)
         }
     };
 
@@ -234,11 +237,11 @@ mod tests {
         assert_eq!(
             files,
             vec!["note.txt".to_string()],
-            "가짜 경로가 섞이면 안 됨"
+            "a fake path must not slip in"
         );
         assert_eq!(
             added, 1,
-            "+++ 로 시작하는 hunk body 줄도 추가 라인으로 카운트돼야 함"
+            "hunk body lines starting with +++ must also be counted as added lines"
         );
         assert_eq!(removed, 0);
     }

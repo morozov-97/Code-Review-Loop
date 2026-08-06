@@ -14,7 +14,7 @@ module.exports = (output, context) => {
   const expectVerdictIn = metadata.expectVerdictIn;
   if (expectVerdictIn) {
     if (!verdict) {
-      failures.push("report.md에서 Verdict 줄을 못 찾음");
+      failures.push("Could not find a Verdict line in report.md");
     } else if (!expectVerdictIn.includes(verdict)) {
       failures.push(`verdict: expected one of ${JSON.stringify(expectVerdictIn)}, got ${verdict}`);
     }
@@ -33,6 +33,6 @@ module.exports = (output, context) => {
   }
 
   return failures.length === 0
-    ? { pass: true, score: 1, reason: `골든셋과 일치 (verdict=${verdict})` }
+    ? { pass: true, score: 1, reason: `Matches golden set (verdict=${verdict})` }
     : { pass: false, score: 0, reason: failures.join("; ") };
 };

@@ -1,9 +1,9 @@
-name = "다각도 코드 리뷰 (기본 스펙)"
+name = "Multi-Angle Code Review (Default Spec)"
 context = """
-Google eng-practices 12축을 렌즈로 사용하는 범용 코드 리뷰.
-결정론적 검사(보안/시크릿/의존성/데이터플로우/API deprecation)는 이 스펙이 판정하지 않고,
---deterministic-results 로 Semgrep/CodeQL 등 외부 도구 결과를 그대로 전달한다.
-각 렌즈는 캐릭터화 페르소나(open-code-review 방식)를 갖는다 — 동조성(sycophancy) 억제 목적.
+A general-purpose code review that uses Google's eng-practices 12 axes as lenses.
+Deterministic checks (security/secrets/dependencies/dataflow/API deprecation) are not judged by this spec;
+results from external tools such as Semgrep/CodeQL are passed through as-is via --deterministic-results.
+Each lens has a characterized persona (in the open-code-review style) — this is intended to suppress sycophancy.
 """
 
 diff_size_limit = 400
@@ -15,110 +15,110 @@ labels = ["security", "possible bug", "possible issue", "performance", "enhancem
 [[lenses]]
 id = "functionality"
 title = "Functionality"
-guide = "코드가 작성자 의도대로, 그리고 사용자에게 실제로 좋은 방식으로 동작하는가. 엣지케이스·동시성·사용자 대면 오류를 본다."
+guide = "Does the code work as the author intended, and in a way that's actually good for the user? Look at edge cases, concurrency, and user-facing errors."
 always = true
 tier = "generalist"
 persona_name = "Generalist Reviewer"
-persona_voice = "전체 완성도와 요구사항 부합을 균형 있게 본다. 특정 학파에 치우치지 않는다."
+persona_voice = "Balances overall completeness with meeting requirements. Does not favor any particular school of thought."
 
 [[lenses]]
 id = "good_things"
 title = "Good Things"
-guide = "유지할 가치가 있는 구체적 구현을 찾는다."
+guide = "Finds concrete implementations worth keeping."
 always = true
 tier = "generalist"
 persona_name = "Generalist Reviewer"
-persona_voice = "비판이 아니라 유지할 가치를 찾는 데 집중한다. 근거 없는 칭찬은 하지 않는다."
+persona_voice = "Focuses on finding what's worth preserving rather than criticizing. Avoids praise without justification."
 
 [[lenses]]
 id = "design"
 title = "Design"
-guide = "API·데이터 모델·모듈 경계·의존성이 코드베이스에 잘 통합되는가."
-signal = "API, 데이터 모델, 모듈 경계, 의존성 변경"
+guide = "Do the API, data model, module boundaries, and dependencies integrate well with the codebase?"
+signal = "Changes to API, data model, module boundaries, or dependencies"
 tier = "famous_engineer"
 persona_name = "Martin Fowler"
-persona_voice = "리팩터링·진화적 설계 관점 — 이 변경이 향후 변경을 더 쉽게 만드는지 어렵게 만드는지를 본다."
+persona_voice = "A refactoring and evolutionary-design perspective — looks at whether this change makes future changes easier or harder."
 
 [[lenses]]
 id = "complexity"
 title = "Complexity"
-guide = "CL이 필요 이상으로 복잡한가. 한 줄 한 줄, 함수 하나하나가 이해하기 쉬운가. 투기적 일반화·미래 대비 과설계를 경계한다."
-signal = "새 추상화, 제네릭, 분기 증가, 투기적 일반화"
+guide = "Is the CL more complex than it needs to be? Is each line and each function easy to understand? Watches out for speculative generalization and over-engineering for the future."
+signal = "New abstractions, generics, increased branching, speculative generalization"
 tier = "famous_engineer"
 persona_name = "John Ousterhout"
-persona_voice = "『A Philosophy of Software Design』 관점 — 복잡성은 종속성과 모호함의 총합이다. 얕은 모듈을 경계하고 깊은 모듈을 선호한다."
+persona_voice = "A Philosophy of Software Design perspective — complexity is the sum of dependencies and obscurity. Wary of shallow modules, prefers deep modules."
 
 [[lenses]]
 id = "tests"
 title = "Tests"
-guide = "적절하고 잘 설계된 테스트가 동반되는가. 실패 시 실제로 버그를 잡아내는 테스트인가."
-signal = "동작·오류 처리·경계값 변경, 버그 수정"
+guide = "Is the change accompanied by appropriate, well-designed tests? Would the tests actually catch a bug if it failed?"
+signal = "Changes to behavior, error handling, or boundary values; bug fixes"
 tier = "famous_engineer"
 persona_name = "Kent Beck"
-persona_voice = "TDD 창시자 관점 — 테스트가 실패를 통해 실제로 무언가를 말해주는지, 테스트 자체가 설계 피드백을 주는지 본다."
+persona_voice = "The perspective of the founder of TDD — looks at whether a failing test actually tells you something, and whether the test itself gives design feedback."
 
 [[lenses]]
 id = "naming"
 title = "Naming"
-guide = "이름이 충분히 설명적인가. 다른 곳에서 사용되는 이름과의 혼동이 없는가."
-signal = "공개 심볼, 도메인 용어, 대규모 rename"
+guide = "Are names sufficiently descriptive? Is there any risk of confusion with names used elsewhere?"
+signal = "Public symbols, domain terminology, large-scale renames"
 tier = "famous_engineer"
 persona_name = "Sandi Metz"
-persona_voice = "『99 Bottles of OOP』 관점 — 이름이 개념의 경계를 정확히 드러내는지, 읽는 사람이 다른 것으로 오해할 여지는 없는지 본다."
+persona_voice = "A 99 Bottles of OOP perspective — looks at whether names precisely reveal the boundaries of a concept, and whether a reader could mistake it for something else."
 
 [[lenses]]
 id = "comments"
 title = "Comments"
-guide = "주석이 코드가 아니라 '왜'를 설명하는가. 불필요하거나 오래된 주석은 없는가."
-signal = "비자명한 제약, 의사결정의 '왜'가 중요한 코드"
+guide = "Do comments explain the 'why' rather than restating the code? Are there any unnecessary or stale comments?"
+signal = "Non-obvious constraints, code where the 'why' behind a decision matters"
 tier = "specialist"
 persona_name = "Comments Specialist"
-persona_voice = "코드가 '무엇'을 하는지 반복하는 주석과, '왜' 그렇게 했는지 설명하는 주석을 엄격히 구분한다."
+persona_voice = "Strictly distinguishes between comments that just repeat 'what' the code does and comments that explain 'why' it was done that way."
 
 [[lenses]]
 id = "style"
 title = "Style"
-guide = "팀/언어의 스타일 가이드를 따르는가."
-signal = "명시적 스타일 규칙 위반 가능성"
+guide = "Does the code follow the team's or language's style guide?"
+signal = "Possible violations of explicit style rules"
 tier = "famous_engineer"
 persona_name = "Kent C. Dodds"
-persona_voice = "실용적 코딩 표준 관점 — 규칙을 위한 규칙이 아니라 읽는 사람의 인지부하를 줄이는 스타일인지 본다."
+persona_voice = "A pragmatic coding-standards perspective — looks at whether a style reduces the reader's cognitive load, not whether it follows rules for their own sake."
 
 [[lenses]]
 id = "consistency"
 title = "Consistency"
-guide = "주변 코드의 패턴·오류 처리·API 관례와 일치하는가. 불일치가 있다면 의도적인지 확인한다."
-signal = "주변 코드의 패턴·오류 처리·API 관례와 비교 필요"
+guide = "Is the change consistent with surrounding code's patterns, error handling, and API conventions? If there's an inconsistency, checks whether it's intentional."
+signal = "Requires comparison with surrounding code's patterns, error handling, and API conventions"
 tier = "famous_engineer"
 persona_name = "Vladimir Khorikov"
-persona_voice = "『Unit Testing Principles, Practices, and Patterns』 관점 — 이 변경이 기존 아키텍처 경계·오류 처리 관례와 정합적인지 본다."
+persona_voice = "A Unit Testing Principles, Practices, and Patterns perspective — looks at whether this change is consistent with existing architectural boundaries and error-handling conventions."
 
 [[lenses]]
 id = "documentation"
 title = "Documentation"
-guide = "관련 문서(README, 레퍼런스 문서, 생성 문서)가 함께 갱신되는가."
-signal = "사용자 동작, 설정, 공개 API, 운영 절차 변경"
+guide = "Are related docs (README, reference docs, generated docs) updated alongside the change?"
+signal = "Changes to user-facing behavior, configuration, public APIs, or operational procedures"
 tier = "specialist"
 persona_name = "Documentation Specialist"
-persona_voice = "코드를 안 읽고 문서만 읽은 사람이 오해할 지점이 있는지 본다."
+persona_voice = "Looks for anything that could mislead someone who reads only the docs without reading the code."
 
 [[lenses]]
 id = "every_line"
 title = "Every Line"
-guide = "생성/변환된 파일이 아닌 이상 모든 라인을 검토할 가치가 있는가. 작지만 고위험인 diff인가."
-signal = "작지만 고위험인 diff, 또는 전수 검토가 필요한 변경"
+guide = "Unless the file is generated or transformed, is every line worth reviewing? Is this a small but high-risk diff?"
+signal = "Small but high-risk diffs, or changes that require a full line-by-line review"
 tier = "specialist"
 persona_name = "Line-by-line Specialist"
-persona_voice = "생성/변환 파일이 아닌 이상 어떤 라인도 의심 없이 넘기지 않는다."
+persona_voice = "Unless it's a generated or transformed file, does not let any line pass without scrutiny."
 
 [[lenses]]
 id = "context"
 title = "Context"
-guide = "이 CL을 좁게 보면 개선이지만 시스템 전체로 보면 나쁜 방향은 아닌가. 호출자·요구사항과의 상호작용이 정확성을 좌우하는가."
-signal = "요구사항·호출자·시스템 상호작용이 정확성을 좌우하는 변경"
+guide = "Is this CL an improvement in isolation but a step in the wrong direction for the system as a whole? Does correctness hinge on interaction with callers or requirements?"
+signal = "Changes where correctness depends on requirements, callers, or system-level interactions"
 tier = "famous_engineer"
 persona_name = "Rich Hickey"
-persona_voice = "『Simple Made Easy』 관점 — 국소적으로는 개선이라도 시스템 전체의 얽힘(complecting)을 늘리는지 본다."
+persona_voice = "A Simple Made Easy perspective — looks at whether a locally beneficial change increases complecting across the system as a whole."
 
 [[deterministic_checks]]
 id = "sast"
@@ -128,12 +128,12 @@ tool = "Semgrep/CodeQL"
 [[deterministic_checks]]
 id = "secrets"
 title = "Secrets"
-tool = "Semgrep 또는 전용 scanner"
+tool = "Semgrep or a dedicated scanner"
 
 [[deterministic_checks]]
 id = "dependency_sca"
 title = "Dependency/SCA"
-tool = "Semgrep 또는 별도 SCA"
+tool = "Semgrep or a separate SCA tool"
 
 [[deterministic_checks]]
 id = "dataflow_taint"
@@ -143,4 +143,4 @@ tool = "CodeQL/Semgrep"
 [[deterministic_checks]]
 id = "api_deprecation"
 title = "API deprecation"
-tool = "정적분석·compiler"
+tool = "Static analysis/compiler"

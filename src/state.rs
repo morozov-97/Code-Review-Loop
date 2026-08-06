@@ -40,7 +40,7 @@ impl State {
 pub fn write(out_dir: &Path, state: &State) -> Result<PathBuf> {
     let path = out_dir.join("state.json");
     std::fs::write(&path, serde_json::to_string_pretty(state)?)
-        .with_context(|| format!("{} 쓰기 실패", path.display()))?;
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
 }
 
@@ -52,17 +52,17 @@ pub fn load(dir: &Path) -> Result<State> {
     };
     let s = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "{} 읽기 실패 (--prior는 이전 --out 디렉터리)",
+            "failed to read {} (--prior expects a previous --out directory)",
             path.display()
         )
     })?;
     let state: State =
-        serde_json::from_str(&s).with_context(|| format!("{} 파싱 실패", path.display()))?;
+        serde_json::from_str(&s).with_context(|| format!("failed to parse {}", path.display()))?;
     anyhow::ensure!(
         state.schema_version == STATE_SCHEMA_VERSION,
-        "{} 의 schema_version({})이 현재 버전({})과 다름 — 호환되지 않는 codereview 버전 간 \
-         --prior는 지원하지 않는다. --prior 없이 새로 시작하거나, state.json을 만든 버전과 \
-         같은 버전으로 다시 실행할 것.",
+        "{}'s schema_version({}) does not match the current version({}) — --prior is not \
+         supported across incompatible codereview versions. Start fresh without --prior, or \
+         rerun with the same version that created state.json.",
         path.display(),
         state.schema_version,
         STATE_SCHEMA_VERSION
