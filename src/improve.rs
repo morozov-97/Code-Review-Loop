@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub const IMPROVE_SYSTEM: &str = "You are a reviewer who proposes concrete code improvements. \
 Only suggest changes for lines added (+) in this diff. Don't suggest anything already addressed, and don't suggest docstring/type-hint/comment/unused-import changes. \
-Respond only in the specified JSON schema.";
+You must respond only in the specified JSON schema.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Suggestion {

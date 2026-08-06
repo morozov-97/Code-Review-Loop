@@ -13,9 +13,9 @@ Do not judge FIXED without evidence. If it cannot be confirmed, use UNKNOWN. \
 If it is not yet fixed but this round's findings list already has an item that caught the same \
 root cause, \
 mark it SUPERSEDED instead of STILL_OPEN (to avoid double counting), and in superseded_by \
-you must write that finding's id exactly (exactly as it appears in the reference list, never \
+you must write that finding's id exactly as it appears in the reference list (never \
 invented). \
-Respond only in the specified JSON schema.";
+You must respond only in the specified JSON schema.";
 
 /// All fields use `#[serde(default)]` — same reason as discourse::Move/Resolution. If status
 /// is missing or outside the schema, it safely falls back to "UNKNOWN" (needs a human look).

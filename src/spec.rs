@@ -60,9 +60,9 @@ pub struct Spec {
 impl Spec {
     pub fn load(path: &Path) -> Result<Spec> {
         let s = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read spec file: {}", path.display()))?;
+            .with_context(|| format!("failed to read spec file: {}", path.display()))?;
         let spec: Spec = toml::from_str(&s)
-            .with_context(|| format!("Failed to parse spec TOML: {}", path.display()))?;
+            .with_context(|| format!("failed to parse spec TOML: {}", path.display()))?;
         anyhow::ensure!(!spec.lenses.is_empty(), "lenses is empty");
         anyhow::ensure!(!spec.labels.is_empty(), "labels is empty");
 

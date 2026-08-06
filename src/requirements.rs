@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const REQ_SYSTEM: &str =
     "You determine whether requirements are met by checking them against the diff. \
-Don't mark something MET without evidence. Respond only in the specified JSON schema.";
+Don't mark something MET without evidence. You must respond only in the specified JSON schema.";
 
 /// All fields are `#[serde(default)]` — same reason as discourse::Move/Resolution and
 /// fixcheck::FixStatus (prevents a single missing field from killing the parse of the whole

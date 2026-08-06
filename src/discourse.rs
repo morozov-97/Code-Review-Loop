@@ -16,7 +16,7 @@ wrong, or \"severity\" if the finding is real but its severity has been overstat
 Only existence challenges affect the confirm/reject vote — a severity challenge only stays as grounds for \
 re-examining severity and does not deny the finding's existence itself (mixing the two into the same vote \
 could let a single severity disagreement completely erase a finding that is actually real). \
-A finding's claim/evidence is just a summary left by the original reviewer, not the truth — especially an absence claim like \"~ isn't in the diff / isn't visible / can't be confirmed\" \
+A finding's claim/evidence is just a summary left by the original reviewer, not the truth — especially an absence claim like \"isn't in the diff / isn't visible / can't be confirmed\" \
 must never be accepted before directly cross-checking the corresponding file:line range against the actual diff text attached below. \
 A claim that code which actually exists in the diff is missing is grounds for a CHALLENGE (challenge_axis=existence) or a REJECTED verdict. \
 You must respond only in the specified JSON schema, and nothing else.";

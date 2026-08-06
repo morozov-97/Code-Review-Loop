@@ -86,7 +86,7 @@ for f in "${changed_files[@]}"; do
 done
 
 output+="
-## Public sync required: $needs_public_sync
+## Public-release sync required: $needs_public_sync
 "
 
 if [[ "$needs_public_sync" == "yes" ]]; then
@@ -95,7 +95,7 @@ if [[ "$needs_public_sync" == "yes" ]]; then
 "
   output+="- [ ] Re-check whether the public repo's PR template / contribution rules changed
 "
-  output+="- [ ] Reflect only publishable items in docs/COMMIT-RULES-PUBLIC.md
+  output+="- [ ] Update docs/COMMIT-RULES-PUBLIC.md to include only publishable items
 "
   output+="- [ ] Confirm the public repo's README links are up to date
 "
@@ -104,7 +104,7 @@ if [[ "$needs_public_sync" == "yes" ]]; then
   output+="- [ ] Record the public PR number/URL for tracking
 "
   output+="
-Recommended: in the private PR body, check \"Needed\" for \"Public sync required\" and list the target public files.
+Recommended: in the private PR body, mark \"Required\" for \"Public-release sync required\" and list the target public files.
 "
 else
   output+="

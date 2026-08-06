@@ -277,7 +277,7 @@ fn run_review(
             for id in &ids {
                 let lens = sp.lens_by_id(id);
                 anyhow::ensure!(lens.is_some(), "lens id not found in spec: {id}");
-                // #96: always-on lenses (e.g. good_things) are already added below and, for
+                // #96: always lenses (e.g. good_things) are already added below and, for
                 // good_things specifically, run through a dedicated review call with its own
                 // schema — letting one in here via --lenses would run it a second time through
                 // the generic defect-finding prompt, producing findings that pollute the score.
@@ -721,7 +721,7 @@ always = true
 
     #[test]
     fn run_review_rejects_always_lens_in_manual_lenses_arg() {
-        // #96: before this check, manually passing an always-on lens id (e.g. good_things) via
+        // #96: before this check, manually passing an always lens id (e.g. good_things) via
         // --lenses slipped past validation and got reviewed a second time through the generic
         // defect-finding prompt, on top of its own dedicated call — polluting findings/score.
         let dir = std::env::temp_dir().join("codereview-loop-e2e-always-lens-reject-test");

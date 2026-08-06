@@ -1,9 +1,9 @@
 name = "Multi-Angle Code Review (Default Spec)"
 context = """
-A general-purpose code review that uses Google's eng-practices 12 axes as lenses.
+A general-purpose code review that uses the 12 axes from Google's eng-practices as lenses.
 Deterministic checks (security/secrets/dependencies/dataflow/API deprecation) are not judged by this spec;
 results from external tools such as Semgrep/CodeQL are passed through as-is via --deterministic-results.
-Each lens has a characterized persona (in the open-code-review style) — this is intended to suppress sycophancy.
+Each lens has a distinctly defined persona (in the open-code-review style) — this is intended to suppress sycophancy.
 """
 
 diff_size_limit = 400

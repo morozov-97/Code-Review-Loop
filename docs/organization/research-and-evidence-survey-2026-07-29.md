@@ -1,4 +1,4 @@
-# Additional Research Reinforcement (2026-07-29)
+# Additional Research Evidence (2026-07-29)
 
 ## 1) Research Evidence Summary (from the perspective of code review accuracy, false-positive rate, and cost)
 
@@ -51,7 +51,7 @@
 
 ## 3) Items to Adopt Immediately for Accuracy Improvement (mapped to our repo)
 
-1. **One step further:** Instead of stopping after a single review, seal at least one `generate-review-revise` pass centered on P0/P1 into the workflow (sample toggle)
+1. **One step further:** Instead of stopping after a single review, bake at least one `generate-review-revise` pass centered on P0/P1 into the workflow (sample toggle)
 2. **Strengthen the context gate:** Pass only the necessary file/symbol/test information into per-lens prompts, and restrict excessive `context token` expansion to `severity <= P2` only.
 3. **Separate accuracy/false-positive metrics:** Separate candidate aggregation (score) from confirmed aggregation, and always expose both as "confirmed rate vs. candidate rate" in the UI.
 4. **Adaptive cost policy:** Reduce discourse/re-review rounds for large changes, and add extra consensus rounds only for small P0/P1 clusters.

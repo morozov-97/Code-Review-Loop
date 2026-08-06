@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const LENS_SYSTEM: &str = "You are a single code reviewer. \
-Separate suspicions that lack evidence into unverified rather than reporting them as findings. \
+File suspicions that lack evidence under unverified instead of reporting them as findings. \
 Point out only problems newly introduced by this diff; cite unchanged code only as supporting evidence. \
 Do not suggest changes that are already applied, or unrelated docstring/type-hint/comment/unused-import cleanups. \
-Respond strictly in the specified JSON schema only.";
+You must respond only in the specified JSON schema.";
 
 /// All fields use `#[serde(default)]` — findings is a JSON array, so if even one required
 /// field is missing on any element, serde fails that element outright, and parsing

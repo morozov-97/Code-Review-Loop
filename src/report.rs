@@ -127,7 +127,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     if !stage_errors.is_empty() {
         md.push_str(&format!(
             "## ⚠ Some Stages Failed ({})\n\nThe stages below failed, so this result is partial — \
-             the affected stage's perspective/judgment is not reflected in the findings/requirements results.\n\n",
+             the affected stage's perspective is not reflected in the findings or requirements results.\n\n",
             stage_errors.len()
         ));
         for e in stage_errors {
@@ -159,7 +159,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         md.push('\n');
     }
 
-    md.push_str("## Policy checks\n\n| Policy | Status | Evidence |\n|---|---|---|\n");
+    md.push_str("## Policy Checks\n\n| Policy | Status | Evidence |\n|---|---|---|\n");
     for p in policies {
         md.push_str(&format!(
             "| {} | {} | {} |\n",
@@ -172,13 +172,13 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
 
     md.push_str("## Quantitative Summary\n\n");
     md.push_str(&format!(
-        "- estimated_effort_to_review: {}/5\n- review time cost: best {} min / average {} min / worst {} min\n",
+        "- Estimated review effort: {}/5\n- Estimated review time: best {} min, average {} min, worst {} min\n",
         quant.estimated_effort_1_5, quant.time_best_min, quant.time_average_min, quant.time_worst_min
     ));
     if quant.score_deductions.is_empty() {
         md.push_str("- No deductions (no CONFIRMED findings)\n\n");
     } else {
-        md.push_str("- Deduction rationale:\n");
+        md.push_str("- Deduction evidence:\n");
         for d in &quant.score_deductions {
             md.push_str(&format!("  - {}\n", d));
         }
@@ -211,7 +211,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
 
     md.push_str("## Findings\n\n");
     md.push_str(&format!("Allowed labels: {}\n\n", spec.labels_prompt()));
-    md.push_str("| ID | Priority | Label | Lens | Reviewer | File:line | Evidence | Impact | Recommendation | Discourse result |\n|---|---|---|---|---|---|---|---|---|---|\n");
+    md.push_str("| ID | Priority | Label | Lens | Reviewer | File:line | Evidence | Impact | Recommendation | Reason |\n|---|---|---|---|---|---|---|---|---|---|\n");
     for f in &confirmed {
         let r = resolved.get(&f.id);
         let discourse_result = r.map(|r| r.reason.as_str()).unwrap_or("");
@@ -320,11 +320,11 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         md.push('\n');
     }
 
-    md.push_str("## Deterministic checks\n\n");
+    md.push_str("## Deterministic Checks\n\n");
     md.push_str(&deterministic_table(spec, &input.deterministic_results));
     md.push('\n');
 
-    md.push_str("## Discourse audit\n\n");
+    md.push_str("## Discourse Audit\n\n");
     md.push_str(
         "| Round | Move | Challenge axis | Lens | Target | Detail | New evidence |\n|---|---|---|---|---|---|---|\n",
     );
@@ -368,7 +368,7 @@ pub fn write_describe(out_dir: &Path, d: &Describe, todos: &[String]) -> Result<
     }
     md.push_str(&format!("\n## Labels\n\n{}\n\n", d.labels.join(", ")));
     md.push_str(&format!(
-        "## can_be_split\n\n{} — {}\n\n",
+        "## Can Be Split?\n\n{} — {}\n\n",
         d.can_be_split, d.can_be_split_note
     ));
     md.push_str("## TODO/FIXME (new lines, deterministic scan)\n\n");

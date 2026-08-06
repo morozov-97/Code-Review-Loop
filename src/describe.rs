@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DESCRIBE_SYSTEM: &str =
     "You are a reviewer who writes PR descriptions. Don't invent anything that isn't in the diff. \
-Respond only in the specified JSON schema.";
+You must respond only in the specified JSON schema.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Describe {
@@ -28,7 +28,7 @@ pub fn run(llm: &Llm, spec: &Spec, input: &Input) -> Result<Describe> {
          ## Output (JSON only, no code fences)\n\
          {\"title\":\"one line, under 50 characters\",\"summary\":\"2-4 sentences\",\
          \"walkthrough\":[\"summary of changes per file/area, one line per item\"],\
-         \"labels\":[\"whichever apply: feature|fix|refactor|chore|docs|test\"],\
+         \"labels\":[\"whichever applies: feature|fix|refactor|chore|docs|test\"],\
          \"can_be_split\":\"yes|no|unknown\",\"can_be_split_note\":\"rationale\"}\n";
     llm.json_ctx_typed(Some(&ctx), task, Some(DESCRIBE_SYSTEM))
         .context("describe failed")
