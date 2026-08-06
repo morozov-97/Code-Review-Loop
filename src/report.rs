@@ -463,6 +463,7 @@ mod tests {
             requirements: None,
             conventions: None,
             deterministic_results: None,
+            language: None,
         }
     }
 

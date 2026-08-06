@@ -668,6 +668,7 @@ mod tests {
             requirements: None,
             conventions: None,
             deterministic_results: None,
+            language: None,
         };
 
         let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();
@@ -722,6 +723,7 @@ mod tests {
             requirements: None,
             conventions: None,
             deterministic_results: None,
+            language: None,
         };
 
         let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();
@@ -758,6 +760,7 @@ mod tests {
             requirements: None,
             conventions: None,
             deterministic_results: None,
+            language: None,
         };
 
         let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();
@@ -892,6 +895,7 @@ mod tests {
             requirements: None,
             conventions: None,
             deterministic_results: None,
+            language: None,
         };
 
         let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();

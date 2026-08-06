@@ -88,6 +88,10 @@ enum Cmd {
         /// Rewrite confirmed findings/good things in a human reviewer comment tone and attach to the report
         #[arg(long)]
         human_voice: bool,
+        /// Language the LLM writes findings/evidence/reasoning text in (e.g. "Korean", "Japanese").
+        /// Unset means English. report.md's own labels/headers are unaffected — only LLM-generated text.
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// PR title/summary/walkthrough/labels/splittability + TODO scan
     Describe {
@@ -101,6 +105,9 @@ enum Cmd {
         conventions: Option<PathBuf>,
         #[arg(long, default_value = "runs")]
         out: PathBuf,
+        /// Language the LLM writes the description text in (e.g. "Korean"). Unset means English.
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// Concrete code improvement suggestions (based on diff snippets)
     Improve {
@@ -114,6 +121,9 @@ enum Cmd {
         conventions: Option<PathBuf>,
         #[arg(long, default_value = "runs")]
         out: PathBuf,
+        /// Language the LLM writes suggestion text in (e.g. "Korean"). Unset means English.
+        #[arg(long)]
+        lang: Option<String>,
     },
 }
 
@@ -171,6 +181,7 @@ fn real_main() -> Result<()> {
             max_rounds,
             prior,
             human_voice,
+            lang,
         } => run_review(
             &llm,
             &cheap_llm,
@@ -185,6 +196,7 @@ fn real_main() -> Result<()> {
             *max_rounds,
             prior,
             *human_voice,
+            lang,
         ),
         Cmd::Describe {
             spec,
@@ -192,14 +204,16 @@ fn real_main() -> Result<()> {
             requirements,
             conventions,
             out,
-        } => run_describe(&llm, spec, diff, requirements, conventions, out),
+            lang,
+        } => run_describe(&llm, spec, diff, requirements, conventions, out, lang),
         Cmd::Improve {
             spec,
             diff,
             requirements,
             conventions,
             out,
-        } => run_improve(&llm, spec, diff, requirements, conventions, out),
+            lang,
+        } => run_improve(&llm, spec, diff, requirements, conventions, out, lang),
     }
 }
 
@@ -218,6 +232,7 @@ fn run_review(
     max_rounds: usize,
     prior: &Option<PathBuf>,
     human_voice: bool,
+    lang: &Option<String>,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
     let mut inp = input::normalize(
@@ -225,6 +240,7 @@ fn run_review(
         requirements_path,
         conventions_path,
         deterministic_results_path,
+        lang.clone(),
     )?;
     // Not a hard cap — since the full diff is resent on every lens/discourse/verify call, this
     // just gives an early warning that token cost grows more than linearly with diff size (no silent truncation).
@@ -523,9 +539,16 @@ fn run_describe(
     requirements_path: &Option<PathBuf>,
     conventions_path: &Option<PathBuf>,
     out: &PathBuf,
+    lang: &Option<String>,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
-    let inp = input::normalize(diff_path, requirements_path, conventions_path, &None)?;
+    let inp = input::normalize(
+        diff_path,
+        requirements_path,
+        conventions_path,
+        &None,
+        lang.clone(),
+    )?;
     let out_dir = prepare_out(out)?;
     let d = describe::run(llm, &sp, &inp)?;
     let todos = describe::todo_sections(&inp.diff);
@@ -542,9 +565,16 @@ fn run_improve(
     requirements_path: &Option<PathBuf>,
     conventions_path: &Option<PathBuf>,
     out: &PathBuf,
+    lang: &Option<String>,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
-    let inp = input::normalize(diff_path, requirements_path, conventions_path, &None)?;
+    let inp = input::normalize(
+        diff_path,
+        requirements_path,
+        conventions_path,
+        &None,
+        lang.clone(),
+    )?;
     let out_dir = prepare_out(out)?;
     let suggestions = improve::run(llm, &sp, &inp)?;
     let path = report::write_improve(&out_dir, &suggestions)?;
@@ -693,7 +723,7 @@ always = true
             &llm, &cheap_llm, &spec_path, &diff_path, &None, &None, &None, &None, &out_dir,
             1, // concurrency=1: forces the fixture queue order to match the call order
             1, // max_rounds
-            &None, false,
+            &None, false, &None,
         )
         .expect("run_review should complete end-to-end against the fixture LLM");
 
@@ -774,6 +804,7 @@ always = true
             1,
             &None,
             false,
+            &None,
         )
         .expect_err("manually selecting an always lens must be rejected");
         assert!(

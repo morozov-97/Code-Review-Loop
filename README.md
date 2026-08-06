@@ -79,11 +79,17 @@ codereview review \
   --conventions conventions.md \
   --deterministic-results deterministic-results.json \
   --human-voice \
+  --lang Korean \
   --out runs/pr123
 ```
 
 `requirements`, `conventions`, and `deterministic-results` are optional.
 If omitted, the tool emits explicit "not provided" sections rather than inventing assumptions.
+
+`--lang` controls only the language of LLM-generated text (claims, evidence, reasoning,
+descriptions, suggestions) — accepts any language name (`Korean`, `Japanese`, `Russian`, ...).
+report.md's own structural labels (headers, table columns, `Verdict:`/`Score:`) always stay
+in English. Omit it for English output (the default). Also available on `describe`/`improve`.
 
 ```mermaid
 sequenceDiagram
