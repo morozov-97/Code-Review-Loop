@@ -22,7 +22,7 @@ pub(crate) fn run_describe(
     allow_sensitive_input: bool,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
-    let inp = input::normalize(
+    let (inp, _dropped_files) = input::normalize(
         diff_path,
         requirements_path,
         conventions_path,

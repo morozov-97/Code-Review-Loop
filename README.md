@@ -19,6 +19,9 @@ git diff > diff.patch
 ./target/release/codereview review --spec specs/default.toml --diff diff.patch --out runs/
 ```
 
+Or grab a prebuilt binary (macOS/Linux) from [Releases](../../releases) once a tagged
+release exists — see [CHANGELOG.md](CHANGELOG.md) for what's changed between releases.
+
 Two things worth knowing before your first real run:
 
 - ⚠ the diff (and any `--requirements`/`--conventions` content) is sent verbatim to the
@@ -130,6 +133,11 @@ Output (normally under `runs/pr123`):
 - `report.md`: verdict, policy checks, quantitative summary, requirements/conventions,
   findings, good things, deterministic checks, and discourse audit
 - `state.json`: review state snapshot used by `--prior`
+- `manifest.json`: per-run metadata for after-the-fact debugging — codereview version,
+  model/cheap-model, spec name/path/hash, round, selected lenses, successful-lens count, stage
+  errors/warnings, files dropped from the diff due to the size cap, and the LLM usage summary.
+  Best-effort — a failure to write it doesn't fail the run, since report.md/state.json have
+  already landed by that point.
 
 ### `--prior` (re-review after patching)
 
@@ -345,7 +353,11 @@ sequenceDiagram
   they're the first to go if the diff needs trimming. Past a 1,000,000-character hard cap, the
   lowest-priority blocks are dropped from the tail — visibly, with a warning and an in-diff note
   listing what got dropped, never silently. `report.md`'s file/line-count stats still reflect the
-  full original diff regardless of what got trimmed from what's actually sent to the LLM.
+  full original diff regardless of what got trimmed from what's actually sent to the LLM. This
+  cap is character-based, not token-based — a rough ~4-chars-per-token estimate is included in
+  the large-diff warning for context, but it isn't a real per-provider/model tokenizer, so it can
+  trigger too early or too late relative to the actual context window depending on the diff's
+  language/content.
 - `claude -p` runtime depends on repository size and prompt density; expect seconds to
   minutes per run.
 

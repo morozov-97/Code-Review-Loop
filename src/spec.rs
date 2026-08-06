@@ -96,6 +96,13 @@ pub struct Spec {
     /// Path patterns (substring match) recognized as doc/changelog files.
     #[serde(default)]
     pub doc_path_patterns: Vec<String>,
+    /// #126: path patterns (substring match) for files that are neither "behavior" nor
+    /// test/docs — CI config, tooling scripts, generated/vendored files, lockfiles, non-source
+    /// fixtures, etc. A file matching one of these is excluded from `tests_included`'s and
+    /// `docs_updated`'s "does this need a test/doc" bucket entirely, instead of silently
+    /// falling into the same catch-all as real source changes.
+    #[serde(default)]
+    pub ignored_path_patterns: Vec<String>,
     /// Per-severity score-deduction weights. Absent `[scoring]` table = all defaults.
     #[serde(default)]
     pub scoring: ScoringConfig,
@@ -138,6 +145,12 @@ impl Spec {
         anyhow::ensure!(
             spec.doc_path_patterns.iter().all(|p| !p.trim().is_empty()),
             "doc_path_patterns has an empty pattern"
+        );
+        anyhow::ensure!(
+            spec.ignored_path_patterns
+                .iter()
+                .all(|p| !p.trim().is_empty()),
+            "ignored_path_patterns has an empty pattern"
         );
 
         Ok(spec)
@@ -310,6 +323,42 @@ title = "Design"
         );
         let err = Spec::load(&path).expect_err("empty doc_path_patterns entry must be rejected");
         assert!(err.to_string().contains("doc_path_patterns"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_empty_ignored_path_pattern() {
+        let path = write_spec(
+            "empty-ignored-pattern.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+ignored_path_patterns = ["vendor/", ""]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let err =
+            Spec::load(&path).expect_err("empty ignored_path_patterns entry must be rejected");
+        assert!(err.to_string().contains("ignored_path_patterns"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_defaults_ignored_path_patterns_to_empty_when_absent() {
+        let path = write_spec(
+            "no-ignored.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let spec = Spec::load(&path).expect("spec without ignored_path_patterns should load");
+        assert!(spec.ignored_path_patterns.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

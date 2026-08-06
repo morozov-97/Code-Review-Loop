@@ -10,6 +10,7 @@ mod improve;
 mod input;
 mod lens;
 mod llm;
+mod manifest;
 mod pipeline;
 mod policy;
 mod promptctx;

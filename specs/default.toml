@@ -9,6 +9,9 @@ Each lens has a distinctly defined persona (in the open-code-review style) — t
 diff_size_limit = 400
 test_path_patterns = ["test/", "tests/", "__tests__/", "_test.", ".test.", ".spec.", "spec/"]
 doc_path_patterns = ["README", "CHANGELOG", "docs/"]
+# #126: files that are neither behavior nor test/docs — don't penalize a PR for not adding a
+# test/doc change alongside these.
+ignored_path_patterns = [".github/workflows/", "Cargo.lock", "package-lock.json", "yarn.lock", "go.sum", "vendor/", "node_modules/", "dist/", "evals/diffs/"]
 
 labels = ["security", "possible bug", "possible issue", "performance", "enhancement", "best practice", "maintainability", "typo"]
 

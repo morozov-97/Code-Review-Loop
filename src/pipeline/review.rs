@@ -5,6 +5,7 @@ use crate::humanvoice;
 use crate::input;
 use crate::lens::{self, Finding};
 use crate::llm::Llm;
+use crate::manifest;
 use crate::pipeline::{enforce_secret_scan, par_map, prepare_out};
 use crate::policy;
 use crate::quantify;
@@ -64,7 +65,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     let llm = &llm.clone().with_deadline(deadline_instant);
     let cheap_llm = &cheap_llm.clone().with_deadline(deadline_instant);
     let sp = Spec::load(args.spec_path)?;
-    let mut inp = input::normalize(
+    let (mut inp, dropped_files) = input::normalize(
         args.diff_path,
         args.requirements_path,
         args.conventions_path,
@@ -77,8 +78,9 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     const DIFF_WARN_CHARS: usize = 300_000;
     if inp.diff.len() > DIFF_WARN_CHARS {
         eprintln!(
-            "Warning: diff is {} characters, which is large — the full diff is resent on every lens review/discourse/requirements call, driving up token cost",
-            inp.diff.len()
+            "Warning: diff is {} characters (~{} tokens estimated), which is large — the full diff is resent on every lens review/discourse/requirements call, driving up token cost",
+            inp.diff.len(),
+            input::estimate_tokens(&inp.diff)
         );
     }
     if inp.deterministic_results.is_none() {
@@ -431,6 +433,26 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         &out_dir,
         &state::State::new(round, findings.clone(), resolved.clone()),
     )?;
+
+    // #129: best-effort — a manifest write failure shouldn't take down an otherwise-successful
+    // review run (report.md/state.json already landed by this point).
+    match manifest::build(
+        args.spec_path,
+        &sp.name,
+        llm.model.clone(),
+        cheap_llm.model.clone(),
+        round,
+        selected_ids.clone(),
+        successful_lens_count,
+        stage_errors.clone(),
+        dropped_files,
+        llm.usage(),
+    )
+    .and_then(|m| manifest::write(&out_dir, &m))
+    {
+        Ok(_) => {}
+        Err(e) => eprintln!("Warning: failed to write manifest.json — {e:#}"),
+    }
 
     println!(
         "\nDone — verdict={} score={}/100",

@@ -39,7 +39,7 @@ pub enum Provider {
 
 /// Cumulative token/cost usage. If multiple Llm instances (e.g. main model + cheap model) share
 /// the same Arc, you get totals aggregated across the whole run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Usage {
     pub calls: u64,
     pub input_tokens: u64,

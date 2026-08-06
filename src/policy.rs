@@ -83,8 +83,9 @@ fn matches_one(path: &str, pattern: &str) -> bool {
 }
 
 /// Whether tests accompany the change. NOT_CONFIGURED when spec.test_path_patterns is unset.
-/// Assumption: a file change matching neither the test nor doc patterns is treated as a
-/// "behavior change" (design choice, uncertain).
+/// Assumption: a file change matching neither the test, doc, nor `ignored_path_patterns` (#126
+/// — CI config, tooling, generated/vendored files, lockfiles, etc.) is treated as a "behavior
+/// change" (design choice, uncertain).
 fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
     if spec.test_path_patterns.is_empty() {
         return PolicyResult {
@@ -102,7 +103,9 @@ fn tests_included(spec: &Spec, input: &Input) -> PolicyResult {
         .changed_files
         .iter()
         .filter(|f| {
-            !matches_any(f, &spec.test_path_patterns) && !matches_any(f, &spec.doc_path_patterns)
+            !matches_any(f, &spec.test_path_patterns)
+                && !matches_any(f, &spec.doc_path_patterns)
+                && !matches_any(f, &spec.ignored_path_patterns)
         })
         .collect();
     if behavior_files.is_empty() {
@@ -173,7 +176,7 @@ fn diff_size(spec: &Spec, input: &Input) -> PolicyResult {
 
 /// Whether docs/changelog accompany the change. NOT_CONFIGURED when spec.doc_path_patterns is unset.
 /// Assumption: "public API/config change" is approximated as a file change matching neither the
-/// test nor doc patterns (design choice, uncertain).
+/// test, doc, nor `ignored_path_patterns` patterns (design choice, uncertain).
 fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
     if spec.doc_path_patterns.is_empty() {
         return PolicyResult {
@@ -191,7 +194,9 @@ fn docs_updated(spec: &Spec, input: &Input) -> PolicyResult {
         .changed_files
         .iter()
         .filter(|f| {
-            !matches_any(f, &spec.test_path_patterns) && !matches_any(f, &spec.doc_path_patterns)
+            !matches_any(f, &spec.test_path_patterns)
+                && !matches_any(f, &spec.doc_path_patterns)
+                && !matches_any(f, &spec.ignored_path_patterns)
         })
         .collect();
     if public_surface_files.is_empty() {
@@ -234,6 +239,60 @@ pub fn check_all(spec: &Spec, input: &Input) -> Vec<PolicyResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_spec(test_patterns: &[&str], doc_patterns: &[&str], ignored_patterns: &[&str]) -> Spec {
+        Spec {
+            name: "test".to_string(),
+            context: String::new(),
+            lenses: Vec::new(),
+            deterministic_checks: Vec::new(),
+            labels: vec!["bug".to_string()],
+            diff_size_limit: 0,
+            test_path_patterns: test_patterns.iter().map(|s| s.to_string()).collect(),
+            doc_path_patterns: doc_patterns.iter().map(|s| s.to_string()).collect(),
+            ignored_path_patterns: ignored_patterns.iter().map(|s| s.to_string()).collect(),
+            scoring: Default::default(),
+        }
+    }
+
+    fn test_input(changed_files: &[&str]) -> Input {
+        Input {
+            diff: String::new(),
+            changed_files: changed_files.iter().map(|s| s.to_string()).collect(),
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        }
+    }
+
+    #[test]
+    fn tests_included_ignores_a_file_matching_ignored_path_patterns() {
+        // #126: a CI-config-only change used to get bucketed as "behavior that needs a test,"
+        // even though ignored_path_patterns is exactly meant to say "this isn't behavior."
+        let spec = test_spec(&["tests/"], &[], &[".github/workflows/"]);
+        let input = test_input(&[".github/workflows/ci.yml"]);
+        let result = tests_included(&spec, &input);
+        assert_eq!(result.status, PolicyStatus::NotApplicable);
+    }
+
+    #[test]
+    fn tests_included_still_fails_on_a_real_behavior_file_with_no_test() {
+        let spec = test_spec(&["tests/"], &[], &[".github/workflows/"]);
+        let input = test_input(&["src/main.rs"]);
+        let result = tests_included(&spec, &input);
+        assert_eq!(result.status, PolicyStatus::Fail);
+    }
+
+    #[test]
+    fn docs_updated_ignores_a_file_matching_ignored_path_patterns() {
+        let spec = test_spec(&[], &["README"], &["Cargo.lock"]);
+        let input = test_input(&["Cargo.lock"]);
+        let result = docs_updated(&spec, &input);
+        assert_eq!(result.status, PolicyStatus::NotApplicable);
+    }
 
     #[test]
     fn matches_one_rejects_mid_word_substring_for_directory_style_patterns() {
