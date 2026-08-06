@@ -30,10 +30,8 @@ pub fn run(llm: &Llm, spec: &Spec, input: &Input) -> Result<Describe> {
          \"walkthrough\":[\"파일/영역별 변경 요약, 항목당 1줄\"],\
          \"labels\":[\"feature|fix|refactor|chore|docs|test 중 해당하는 것\"],\
          \"can_be_split\":\"yes|no|unknown\",\"can_be_split_note\":\"근거\"}\n";
-    let v = llm
-        .json_ctx(Some(&ctx), task, Some(DESCRIBE_SYSTEM))
-        .context("describe 실패")?;
-    serde_json::from_value(v).context("describe JSON 스키마 불일치")
+    llm.json_ctx_typed(Some(&ctx), task, Some(DESCRIBE_SYSTEM))
+        .context("describe 실패")
 }
 
 /// Scans only lines newly added (+) by the diff for TODO/FIXME/XXX. Deterministic (no LLM used).

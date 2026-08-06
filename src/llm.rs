@@ -223,6 +223,22 @@ impl Llm {
         task: &str,
         system: Option<&str>,
     ) -> Result<serde_json::Value> {
+        self.json_ctx_typed(ctx, task, system)
+    }
+
+    /// Like [`Llm::json_ctx`], but also validates the response against `T`'s schema before
+    /// counting an attempt as successful. Before this existed, callers deserialized the
+    /// `Value` json_ctx returned *outside* the retry loop — syntactically valid JSON that
+    /// didn't match the expected schema (e.g. a field with the wrong type) skipped every retry
+    /// and failed the whole call immediately. Folding the schema check into the same loop that
+    /// already retries on JSON-parse failure means a schema-mismatched response gets exactly
+    /// the same retry treatment as a malformed one, instead of none.
+    pub fn json_ctx_typed<T: serde::de::DeserializeOwned>(
+        &self,
+        ctx: Option<&str>,
+        task: &str,
+        system: Option<&str>,
+    ) -> Result<T> {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..=self.retries {
             let raw = match self.call_once(ctx, task, system) {
@@ -249,7 +265,10 @@ impl Llm {
                     continue;
                 }
             };
-            match extract_json(&raw) {
+            let parsed = extract_json(&raw).and_then(|v| {
+                serde_json::from_value::<T>(v).context("응답이 예상 스키마와 불일치")
+            });
+            match parsed {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     last = Some(e);

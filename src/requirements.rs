@@ -78,11 +78,9 @@ pub fn verify(
     // ctx as other calls, it becomes eligible for cache reuse on the OpenRouter backend.
     let ctx = shared_context(spec, input);
     let task = build_task(&findings_summary);
-    let v = llm
-        .json_ctx(Some(&ctx), &task, Some(REQ_SYSTEM))
+    let mut out: RequirementsOutput = llm
+        .json_ctx_typed(Some(&ctx), &task, Some(REQ_SYSTEM))
         .context("요구사항 검증 실패")?;
-    let mut out: RequirementsOutput =
-        serde_json::from_value(v).context("요구사항 검증 JSON 스키마 불일치")?;
     for r in out.requirements.iter_mut() {
         r.status = normalize_status(&r.status);
     }

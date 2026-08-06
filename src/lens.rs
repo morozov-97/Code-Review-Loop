@@ -224,11 +224,9 @@ pub fn review_lens(
     let ctx = shared_context(spec, input);
     let task = build_review_task(spec, &lens.title, &lens.guide);
     let system = persona_system(lens);
-    let v = llm
-        .json_ctx(Some(&ctx), &task, Some(&system))
+    let mut out: LensOutput = llm
+        .json_ctx_typed(Some(&ctx), &task, Some(&system))
         .with_context(|| format!("렌즈 리뷰 실패: {lens_id}"))?;
-    let mut out: LensOutput = serde_json::from_value(v)
-        .with_context(|| format!("렌즈 리뷰 JSON 스키마 불일치: {lens_id}"))?;
     let reviewer = if lens.persona_name.is_empty() {
         lens.title.clone()
     } else {
@@ -259,11 +257,9 @@ pub fn review_good_things(llm: &Llm, spec: &Spec, input: &Input) -> Result<GoodT
          근거로 인용할 구체적 구현이 없으면 good_things를 빈 배열로 반환한다.\n",
         guide = GOOD_THINGS_GUIDE,
     );
-    let v = llm
-        .json_ctx(Some(&ctx), &task, Some(LENS_SYSTEM))
+    let out: GoodThingsOutput = llm
+        .json_ctx_typed(Some(&ctx), &task, Some(LENS_SYSTEM))
         .context("Good Things 렌즈 실패")?;
-    let out: GoodThingsOutput =
-        serde_json::from_value(v).context("Good Things JSON 스키마 불일치")?;
     Ok(out)
 }
 

@@ -76,6 +76,33 @@ fn confidence_weight(c: &str) -> f64 {
     }
 }
 
+const VALID_MOVE_KINDS: [&str; 4] = ["AGREE", "CHALLENGE", "CONNECT", "SURFACE"];
+
+/// Found in production (#94): every other LLM-controlled categorical field here
+/// (severity/status/challenge_axis) gets normalized, but `kind` didn't — an LLM returning
+/// "Challenge" instead of "CHALLENGE" made an existence dispute silently contribute zero vote
+/// weight instead of suppressing confirmation, and also slipped past the "at least one
+/// CHALLENGE per round" check. Unrecognized values fall back to "SURFACE" — the same no-vote
+/// treatment CONNECT/SURFACE already get — so a garbled kind can't accidentally count as an
+/// AGREE or a suppressed CHALLENGE.
+fn normalize_move_kind(raw: &str) -> String {
+    let upper = raw.trim().to_ascii_uppercase();
+    if VALID_MOVE_KINDS.contains(&upper.as_str()) {
+        upper
+    } else {
+        "SURFACE".to_string()
+    }
+}
+
+/// Found in production (#94): `confidence_weight` only matches exact lowercase "high"/"low",
+/// so a case variant like "Low" silently fell through to the 0.6 default — which happens to
+/// sit exactly on VOTE_THRESHOLD, so a single miscased low-confidence vote could wrongly
+/// confirm a finding on its own. Lowercasing here is enough: genuinely unrecognized values
+/// still hit confidence_weight's own "unspecified" fallback exactly as before.
+fn normalize_confidence(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
 const VOTE_THRESHOLD: f64 = 0.6;
 
 /// Tallies only the AGREE/CHALLENGE(existence) votes that directly target one finding
@@ -290,9 +317,17 @@ pub fn run(
         }
 
         let mut dr = run_round_call(llm, &ctx, spec, findings, &resolved, round)?;
+        for m in dr.moves.iter_mut() {
+            m.kind = normalize_move_kind(&m.kind);
+            m.confidence = normalize_confidence(&m.confidence);
+        }
         if !dr.moves.iter().any(|m| m.kind == "CHALLENGE") {
             dr = run_round_call(llm, &ctx, spec, findings, &resolved, round)
                 .context("CHALLENGE 누락 재요청 실패")?;
+            for m in dr.moves.iter_mut() {
+                m.kind = normalize_move_kind(&m.kind);
+                m.confidence = normalize_confidence(&m.confidence);
+            }
         }
 
         for (i, sf) in dr.surfaced.iter_mut().enumerate() {
@@ -396,11 +431,9 @@ fn run_round_call(
     round: usize,
 ) -> Result<DiscourseRound> {
     let task = build_round_prompt(spec, findings, resolved, round);
-    let v = llm
-        .json_ctx(Some(ctx), &task, Some(DISCOURSE_SYSTEM))
+    let dr: DiscourseRound = llm
+        .json_ctx_typed(Some(ctx), &task, Some(DISCOURSE_SYSTEM))
         .with_context(|| format!("discourse 라운드 {round} 실패"))?;
-    let dr: DiscourseRound = serde_json::from_value(v)
-        .with_context(|| format!("discourse 라운드 {round} JSON 스키마 불일치"))?;
     Ok(dr)
 }
 
@@ -463,6 +496,57 @@ mod tests {
     fn normalize_status_falls_back_to_uncertain_on_unknown_or_empty_value() {
         assert_eq!(normalize_status("IN_PROGRESS"), "UNCERTAIN");
         assert_eq!(normalize_status(""), "UNCERTAIN");
+    }
+
+    #[test]
+    fn normalize_move_kind_passes_through_valid_values() {
+        for k in ["AGREE", "CHALLENGE", "CONNECT", "SURFACE"] {
+            assert_eq!(normalize_move_kind(k), k);
+        }
+    }
+
+    #[test]
+    fn normalize_move_kind_is_case_insensitive() {
+        assert_eq!(normalize_move_kind("Challenge"), "CHALLENGE");
+        assert_eq!(normalize_move_kind("agree"), "AGREE");
+    }
+
+    #[test]
+    fn normalize_move_kind_falls_back_to_surface_on_unknown_or_empty_value() {
+        assert_eq!(normalize_move_kind("REJECT"), "SURFACE");
+        assert_eq!(normalize_move_kind(""), "SURFACE");
+    }
+
+    #[test]
+    fn normalize_confidence_lowercases_case_variants() {
+        assert_eq!(normalize_confidence("Low"), "low");
+        assert_eq!(normalize_confidence("HIGH"), "high");
+        assert_eq!(normalize_confidence("Medium"), "medium");
+    }
+
+    #[test]
+    fn direct_vote_net_treats_miscased_challenge_and_confidence_like_canonical_ones() {
+        // Regression for #94: before normalization, a "Challenge"/"Low" pair from the LLM
+        // silently contributed 0.0 instead of -0.3, because the vote-tally match arms compare
+        // against the exact uppercase/lowercase literals.
+        let canonical = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![existence_challenge("f1", "low")],
+        }];
+        let miscased = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![Move {
+                kind: normalize_move_kind("Challenge"),
+                confidence: normalize_confidence("Low"),
+                target: "f1".to_string(),
+                challenge_axis: "EXISTENCE".to_string(),
+                ..Default::default()
+            }],
+        }];
+        assert_eq!(
+            direct_vote_net(&canonical, "f1"),
+            direct_vote_net(&miscased, "f1")
+        );
     }
 
     #[test]

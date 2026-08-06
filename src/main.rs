@@ -273,7 +273,16 @@ fn run_review(
                 .filter(|x| seen.insert(x.clone()))
                 .collect();
             for id in &ids {
-                anyhow::ensure!(sp.lens_by_id(id).is_some(), "spec에 없는 렌즈 id: {id}");
+                let lens = sp.lens_by_id(id);
+                anyhow::ensure!(lens.is_some(), "spec에 없는 렌즈 id: {id}");
+                // #96: always-on lenses (e.g. good_things) are already added below and, for
+                // good_things specifically, run through a dedicated review call with its own
+                // schema — letting one in here via --lenses would run it a second time through
+                // the generic defect-finding prompt, producing findings that pollute the score.
+                anyhow::ensure!(
+                    !lens.unwrap().always,
+                    "{id}는 always 렌즈라 --lenses로 지정할 수 없음(항상 자동 포함됨)"
+                );
             }
             ids
         }
@@ -700,6 +709,71 @@ always = true
         assert!(
             std::fs::metadata(out_dir.join("state.json")).is_ok(),
             "state.json should be written for --prior to pick up next round"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_rejects_always_lens_in_manual_lenses_arg() {
+        // #96: before this check, manually passing an always-on lens id (e.g. good_things) via
+        // --lenses slipped past validation and got reviewed a second time through the generic
+        // defect-finding prompt, on top of its own dedicated call — polluting findings/score.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-always-lens-reject-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "e2e test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "good_things"
+title = "Good Things"
+guide = "test"
+always = true
+"#,
+        );
+
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+
+        let out_dir = dir.join("out");
+        let usage = Llm::new_usage_tracker();
+        // Empty fixture: validation must fail before any LLM call is made.
+        let llm = Llm::fixture(vec![], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        let err = run_review(
+            &llm,
+            &cheap_llm,
+            &spec_path,
+            &diff_path,
+            &None,
+            &None,
+            &None,
+            &Some("good_things".to_string()),
+            &out_dir,
+            1,
+            1,
+            &None,
+            false,
+        )
+        .expect_err("manually selecting an always lens must be rejected");
+        assert!(
+            err.to_string().contains("always"),
+            "expected an always-lens rejection error, got: {err}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

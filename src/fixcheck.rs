@@ -233,11 +233,9 @@ pub fn run(
         .join("\n");
     let ctx = shared_context(spec, input);
     let task = build_task(&list, &this_round);
-    let v = llm
-        .json_ctx(Some(&ctx), &task, Some(FIXCHECK_SYSTEM))
+    let mut out: FixCheckOutput = llm
+        .json_ctx_typed(Some(&ctx), &task, Some(FIXCHECK_SYSTEM))
         .context("fix check 실패")?;
-    let mut out: FixCheckOutput =
-        serde_json::from_value(v).context("fix check JSON 스키마 불일치")?;
     for r in out.results.iter_mut() {
         r.status = normalize_status(&r.status);
     }
