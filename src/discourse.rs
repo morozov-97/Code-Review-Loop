@@ -575,6 +575,7 @@ mod tests {
             diff_size_limit: 0,
             test_path_patterns: Vec::new(),
             doc_path_patterns: Vec::new(),
+            scoring: Default::default(),
         }
     }
 

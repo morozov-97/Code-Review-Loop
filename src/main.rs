@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand};
 use lens::Finding;
 use llm::Llm;
 use spec::Spec;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum Backend {
@@ -186,18 +186,20 @@ fn real_main() -> Result<()> {
         } => run_review(
             &llm,
             &cheap_llm,
-            spec,
-            diff,
-            requirements,
-            conventions,
-            deterministic_results,
-            lenses,
-            out,
-            *concurrency,
-            *max_rounds,
-            prior,
-            *human_voice,
-            lang,
+            &ReviewArgs {
+                spec_path: spec,
+                diff_path: diff,
+                requirements_path: requirements,
+                conventions_path: conventions,
+                deterministic_results_path: deterministic_results,
+                lenses_arg: lenses,
+                out,
+                concurrency: *concurrency,
+                max_rounds: *max_rounds,
+                prior,
+                human_voice: *human_voice,
+                lang,
+            },
         ),
         Cmd::Describe {
             spec,
@@ -218,30 +220,37 @@ fn real_main() -> Result<()> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_review(
-    llm: &Llm,
-    cheap_llm: &Llm,
-    spec_path: &PathBuf,
-    diff_path: &PathBuf,
-    requirements_path: &Option<PathBuf>,
-    conventions_path: &Option<PathBuf>,
-    deterministic_results_path: &Option<PathBuf>,
-    lenses_arg: &Option<String>,
-    out: &PathBuf,
+/// `review`'s CLI arguments, bundled so `run_review` takes one param instead of growing a
+/// positional list every time a new flag is added (see #104 — it used to be 13 separate args
+/// behind `#[allow(clippy::too_many_arguments)]`).
+struct ReviewArgs<'a> {
+    spec_path: &'a Path,
+    diff_path: &'a Path,
+    requirements_path: &'a Option<PathBuf>,
+    conventions_path: &'a Option<PathBuf>,
+    deterministic_results_path: &'a Option<PathBuf>,
+    lenses_arg: &'a Option<String>,
+    out: &'a Path,
     concurrency: usize,
     max_rounds: usize,
-    prior: &Option<PathBuf>,
+    prior: &'a Option<PathBuf>,
     human_voice: bool,
-    lang: &Option<String>,
-) -> Result<()> {
-    let sp = Spec::load(spec_path)?;
+    lang: &'a Option<String>,
+}
+
+type LensReviewResults = (
+    Vec<Result<(String, lens::LensOutput)>>,
+    Option<Result<lens::GoodThingsOutput>>,
+);
+
+fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<()> {
+    let sp = Spec::load(args.spec_path)?;
     let mut inp = input::normalize(
-        diff_path,
-        requirements_path,
-        conventions_path,
-        deterministic_results_path,
-        lang.clone(),
+        args.diff_path,
+        args.requirements_path,
+        args.conventions_path,
+        args.deterministic_results_path,
+        args.lang.clone(),
     )?;
     // Not a hard cap — since the full diff is resent on every lens/discourse/verify call, this
     // just gives an early warning that token cost grows more than linearly with diff size (no silent truncation).
@@ -260,9 +269,9 @@ fn run_review(
             inp.deterministic_results = Some(v);
         }
     }
-    let out_dir = prepare_out(out)?;
+    let out_dir = prepare_out(args.out)?;
 
-    let prior_state = match prior {
+    let prior_state = match args.prior {
         None => None,
         Some(p) => Some(state::load(p)?),
     };
@@ -280,7 +289,7 @@ fn run_review(
     // Steps 1-2 (input normalization, convention injection) are handled by input::normalize + each prompt builder.
 
     // Step 4: lens selection
-    let optional_selected: Vec<String> = match lenses_arg {
+    let optional_selected: Vec<String> = match args.lenses_arg {
         Some(s) => {
             // Filters out duplicate specifications ("--lenses design,design") — review_lens must
             // be called only once per lens so finding ids (position-based numbers) don't collide within it.
@@ -324,12 +333,9 @@ fn run_review(
     // diff/spec), yet it used to run sequentially after all lens reviews finished — adding one
     // review's worth of round-trip time to the critical path for no real reason. Now it runs
     // concurrently with the lens par_map on a separate thread.
-    let (lens_results, good_things_result): (
-        Vec<Result<(String, lens::LensOutput)>>,
-        Option<Result<lens::GoodThingsOutput>>,
-    ) = std::thread::scope(|s| {
+    let (lens_results, good_things_result): LensReviewResults = std::thread::scope(|s| {
         let lens_handle = s.spawn(|| {
-            par_map(concurrency, selected_ids.clone(), |id| {
+            par_map(args.concurrency, selected_ids.clone(), |id| {
                 let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
                 println!(
                     "  Lens complete: {} — {} findings, {} unverified",
@@ -386,8 +392,8 @@ fn run_review(
         println!("No findings — skipping discourse");
         (Vec::new(), std::collections::HashMap::new())
     } else {
-        println!("Starting discourse (up to {} rounds)", max_rounds);
-        discourse::run(llm, &sp, &inp, &mut findings, max_rounds, round)?
+        println!("Starting discourse (up to {} rounds)", args.max_rounds);
+        discourse::run(llm, &sp, &inp, &mut findings, args.max_rounds, round)?
     };
 
     // Compared to the previous round (--prior): determine whether previously confirmed findings
@@ -478,6 +484,7 @@ fn run_review(
 
     // Step 10: quantitative summary + verdict
     let quant = quantify::summarize(
+        &sp.scoring,
         &inp,
         &findings,
         &resolved,
@@ -486,7 +493,7 @@ fn run_review(
         selected_ids.len(),
     );
 
-    let hv = if human_voice {
+    let hv = if args.human_voice {
         Some(humanvoice::rewrite(
             llm,
             &sp,
@@ -535,11 +542,11 @@ fn run_review(
 
 fn run_describe(
     llm: &Llm,
-    spec_path: &PathBuf,
-    diff_path: &PathBuf,
+    spec_path: &Path,
+    diff_path: &Path,
     requirements_path: &Option<PathBuf>,
     conventions_path: &Option<PathBuf>,
-    out: &PathBuf,
+    out: &Path,
     lang: &Option<String>,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
@@ -561,11 +568,11 @@ fn run_describe(
 
 fn run_improve(
     llm: &Llm,
-    spec_path: &PathBuf,
-    diff_path: &PathBuf,
+    spec_path: &Path,
+    diff_path: &Path,
     requirements_path: &Option<PathBuf>,
     conventions_path: &Option<PathBuf>,
-    out: &PathBuf,
+    out: &Path,
     lang: &Option<String>,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
@@ -588,10 +595,10 @@ fn run_improve(
     Ok(())
 }
 
-fn prepare_out(p: &PathBuf) -> Result<PathBuf> {
+fn prepare_out(p: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(p)
         .with_context(|| format!("failed to create output directory: {}", p.display()))?;
-    Ok(p.clone())
+    Ok(p.to_path_buf())
 }
 
 /// Groups threads by concurrency and runs them in sequence (chunk-wise barrier).
@@ -721,10 +728,22 @@ always = true
         let cheap_llm = llm.clone();
 
         run_review(
-            &llm, &cheap_llm, &spec_path, &diff_path, &None, &None, &None, &None, &out_dir,
-            1, // concurrency=1: forces the fixture queue order to match the call order
-            1, // max_rounds
-            &None, false, &None,
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1, // forces the fixture queue order to match the call order
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+            },
         )
         .expect("run_review should complete end-to-end against the fixture LLM");
 
@@ -794,18 +813,20 @@ always = true
         let err = run_review(
             &llm,
             &cheap_llm,
-            &spec_path,
-            &diff_path,
-            &None,
-            &None,
-            &None,
-            &Some("good_things".to_string()),
-            &out_dir,
-            1,
-            1,
-            &None,
-            false,
-            &None,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &Some("good_things".to_string()),
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+            },
         )
         .expect_err("manually selecting an always lens must be rejected");
         assert!(

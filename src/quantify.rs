@@ -3,6 +3,7 @@ use crate::input::Input;
 use crate::lens::Finding;
 use crate::policy::{PolicyResult, PolicyStatus};
 use crate::requirements::RequirementCheck;
+use crate::spec::ScoringConfig;
 use std::collections::HashMap;
 
 pub struct QuantSummary {
@@ -15,24 +16,29 @@ pub struct QuantSummary {
     pub time_worst_min: u32,
 }
 
-fn severity_penalty(severity: &str) -> i64 {
+fn severity_penalty(scoring: &ScoringConfig, severity: &str) -> i64 {
     match severity {
-        "P0" => 25,
-        "P1" => 12,
-        "P2" => 5,
-        "P3" => 1,
+        "P0" => scoring.p0,
+        "P1" => scoring.p1,
+        "P2" => scoring.p2,
+        "P3" => scoring.p3,
         _ => 0,
     }
 }
 
 /// Deduct points from 100 using only CONFIRMED findings. Records the deduction reasons as strings alongside.
-/// Assumption: the deduction amounts (P0=25/P1=12/P2=5/P3=1) are a design choice — actual severity weighting should be adjusted per team policy (uncertain).
-fn score(findings: &[Finding], resolved: &HashMap<String, Resolution>) -> (i64, Vec<String>) {
+/// Deduction amounts come from `spec.scoring` (see #106 — used to be hardcoded here with no way
+/// to tune per team policy; `ScoringConfig`'s defaults preserve the original P0=25/P1=12/P2=5/P3=1).
+fn score(
+    scoring: &ScoringConfig,
+    findings: &[Finding],
+    resolved: &HashMap<String, Resolution>,
+) -> (i64, Vec<String>) {
     let mut total = 100i64;
     let mut deductions = Vec::new();
     for f in findings {
         if resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED") {
-            let p = severity_penalty(&f.severity);
+            let p = severity_penalty(scoring, &f.severity);
             total -= p;
             deductions.push(format!(
                 "[{}] {}:{} -{} pts — {}",
@@ -102,6 +108,7 @@ fn verdict(
 }
 
 pub fn summarize(
+    scoring: &ScoringConfig,
     input: &Input,
     findings: &[Finding],
     resolved: &HashMap<String, Resolution>,
@@ -109,7 +116,7 @@ pub fn summarize(
     requirements: &Option<Vec<RequirementCheck>>,
     lens_count: usize,
 ) -> QuantSummary {
-    let (sc, deductions) = score(findings, resolved);
+    let (sc, deductions) = score(scoring, findings, resolved);
     let (effort, best, average, worst) = effort_and_time(input, lens_count);
     let v = verdict(findings, resolved, policies, requirements);
     QuantSummary {
@@ -177,7 +184,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
         resolved.insert("b".to_string(), resolution("b", "REJECTED"));
-        let (sc, deductions) = score(&findings, &resolved);
+        let (sc, deductions) = score(&ScoringConfig::default(), &findings, &resolved);
         assert_eq!(sc, 75); // 100 - 25 (P0 only; P2 rejected, not deducted)
         assert_eq!(deductions.len(), 1);
     }
@@ -185,7 +192,7 @@ mod tests {
     #[test]
     fn score_treats_unresolved_findings_as_not_deducted() {
         let findings = vec![finding("a", "P0")];
-        let (sc, deductions) = score(&findings, &HashMap::new());
+        let (sc, deductions) = score(&ScoringConfig::default(), &findings, &HashMap::new());
         assert_eq!(sc, 100);
         assert!(deductions.is_empty());
     }
@@ -197,8 +204,24 @@ mod tests {
         for f in &findings {
             resolved.insert(f.id.clone(), resolution(&f.id, "CONFIRMED"));
         }
-        let (sc, _) = score(&findings, &resolved);
+        let (sc, _) = score(&ScoringConfig::default(), &findings, &resolved);
         assert_eq!(sc, 0);
+    }
+
+    #[test]
+    fn score_uses_custom_scoring_config_instead_of_the_hardcoded_defaults() {
+        // #106: severity weights used to be hardcoded with no way to tune per team policy.
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        let custom = ScoringConfig {
+            p0: 40,
+            p1: 12,
+            p2: 5,
+            p3: 1,
+        };
+        let (sc, _) = score(&custom, &findings, &resolved);
+        assert_eq!(sc, 60); // 100 - 40 (custom P0 weight), not the default 25
     }
 
     // --- verdict() ---

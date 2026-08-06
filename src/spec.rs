@@ -35,6 +35,47 @@ pub struct DeterministicCheck {
     pub tool: String,
 }
 
+/// Severity → score-deduction weight (`-{amount} pts` in report.md). Defaults preserve the
+/// original hardcoded values (see #106) — add a `[scoring]` table to a spec to override any
+/// subset; unset fields keep their default so a partial table doesn't zero out the rest.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScoringConfig {
+    #[serde(default = "ScoringConfig::default_p0")]
+    pub p0: i64,
+    #[serde(default = "ScoringConfig::default_p1")]
+    pub p1: i64,
+    #[serde(default = "ScoringConfig::default_p2")]
+    pub p2: i64,
+    #[serde(default = "ScoringConfig::default_p3")]
+    pub p3: i64,
+}
+
+impl ScoringConfig {
+    fn default_p0() -> i64 {
+        25
+    }
+    fn default_p1() -> i64 {
+        12
+    }
+    fn default_p2() -> i64 {
+        5
+    }
+    fn default_p3() -> i64 {
+        1
+    }
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        ScoringConfig {
+            p0: Self::default_p0(),
+            p1: Self::default_p1(),
+            p2: Self::default_p2(),
+            p3: Self::default_p3(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Spec {
     pub name: String,
@@ -55,6 +96,9 @@ pub struct Spec {
     /// Path patterns (substring match) recognized as doc/changelog files.
     #[serde(default)]
     pub doc_path_patterns: Vec<String>,
+    /// Per-severity score-deduction weights. Absent `[scoring]` table = all defaults.
+    #[serde(default)]
+    pub scoring: ScoringConfig,
 }
 
 impl Spec {
@@ -186,6 +230,50 @@ title = "Tests"
         );
         let spec = Spec::load(&path).expect("valid spec should load");
         assert_eq!(spec.lenses.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_defaults_scoring_when_table_is_absent() {
+        let path = write_spec(
+            "no-scoring.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let spec = Spec::load(&path).expect("spec without [scoring] should load");
+        assert_eq!(spec.scoring.p0, 25);
+        assert_eq!(spec.scoring.p1, 12);
+        assert_eq!(spec.scoring.p2, 5);
+        assert_eq!(spec.scoring.p3, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_partial_scoring_table_only_overrides_given_fields() {
+        // #106: a spec should be able to tune just the fields it cares about — a partial
+        // [scoring] table must not zero out the severities it doesn't mention.
+        let path = write_spec(
+            "partial-scoring.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+[scoring]
+p0 = 40
+"#,
+        );
+        let spec = Spec::load(&path).expect("spec with partial [scoring] should load");
+        assert_eq!(spec.scoring.p0, 40);
+        assert_eq!(spec.scoring.p1, 12);
+        assert_eq!(spec.scoring.p2, 5);
+        assert_eq!(spec.scoring.p3, 1);
         let _ = std::fs::remove_file(&path);
     }
 

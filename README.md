@@ -328,13 +328,10 @@ sequenceDiagram
 
 - heuristic-only policy signals for behavior vs surface changes can produce false
   positives depending on project structure.
-- severity penalties and effort/time budgets are heuristic defaults:
-  - P0: 25
-  - P1: 12
-  - P2: 5
-  - P3: 1
-  These are hardcoded in `quantify.rs`; there is no spec/config field for them yet, so
-  changing them currently requires editing the source and rebuilding.
+- severity penalties are heuristic defaults (P0: 25, P1: 12, P2: 5, P3: 1) — configurable per
+  spec via an optional `[scoring]` table (`p0`/`p1`/`p2`/`p3`); unset fields keep their default,
+  so a partial table only overrides what it mentions. Effort/time budgets (`quantify.rs`'s
+  `effort_and_time`) are still hardcoded — there's no config field for those yet.
 - fixed persona mapping (e.g., design→Fowler) is customizable but opinionated.
 - `--prior` assumes compatible finding identity across re-runs with the same spec.
 - repository-independent claim matching can become noisy when file renames are common
@@ -344,6 +341,14 @@ sequenceDiagram
   actually present). Neither failure mode is fully eliminated by the deterministic scoring layer,
   since that layer's inputs (finding existence, severity) still come from the LLM. See
   [Recommended CI integration](#recommended-ci-integration).
+- multiple lenses are called independently, but they mostly run on the same underlying model
+  against the same diff through a similar prompt family — independent *calls* don't imply
+  independent *error distributions*. If the model misreads a particular code pattern, several
+  personas can plausibly make the same mistake in the same direction, and discourse cross-checking
+  (also the same model) isn't a genuinely independent second opinion on that specific failure mode.
+  "Multiple personas agreed" is evidence the finding survived one model's self-consistency check,
+  not proof of independent verification — lean on non-LLM checks
+  (`--deterministic-results`/semgrep/compile/tests) for anything mechanically checkable instead.
 
 ## Recommended CI integration
 
