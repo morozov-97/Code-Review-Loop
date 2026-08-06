@@ -75,17 +75,57 @@ fn confidence_weight(c: &str) -> f64 {
 
 const VOTE_THRESHOLD: f64 = 0.6;
 
+/// finding 하나에 직접 겨냥된 AGREE/CHALLENGE(existence)만 집계한다(merge_vote_weight
+/// 자체는 포함 안 함 — merge_vote_weight가 이 함수를 재귀적으로 부를 때 "이 finding
+/// 자체가 얼마나 신뢰받았는지"만 따로 떼어보기 위함).
+fn direct_vote_net(audit: &[DiscourseAudit], target_id: &str) -> f64 {
+    audit
+        .iter()
+        .flat_map(|a| a.moves.iter())
+        .filter(|m| m.target == target_id)
+        .map(|m| match m.kind.as_str() {
+            "AGREE" => confidence_weight(&m.confidence),
+            "CHALLENGE" if m.challenge_axis == "EXISTENCE" => -confidence_weight(&m.confidence),
+            _ => 0.0,
+        })
+        .sum()
+}
+
 /// finding X가 Y로 MERGED되면 discourse는 "X와 Y는 같은 문제"라 판단한 것이지 X가
 /// 가짜라는 뜻이 아니다 — 그런데 MERGE 자체는 생존자(Y)를 겨냥한 AGREE/CHALLENGE 투표가
 /// 아니라서, Y를 직접 겨냥하는 투표가 하나도 없으면 Y는 아무 투표 없이 UNCERTAIN으로
 /// 남아 점수에 전혀 반영되지 않는다(두 렌즈가 독립적으로 잡은 버그가 점수 0으로 증발).
 /// MERGED 판정 자체를 high-confidence AGREE 1표와 동등하게 취급해 생존자 쪽 집계에 더한다.
-fn merge_vote_weight(resolved: &HashMap<String, Resolution>, target_id: &str) -> f64 {
-    resolved
-        .values()
-        .filter(|r| r.status == "MERGED" && r.merged_into == target_id)
-        .count() as f64
-        * confidence_weight("high")
+///
+/// 단, X 자체가 existence 축 CHALLENGE로 순 투표가 음수(반박이 우세)인 채로 MERGED됐다면
+/// 그 반박 신호를 무시하고 생존자를 세탁 확정시키면 안 된다 — 그런 병합은 credit하지
+/// 않는다(0, 페널티는 아님 — 병합 자체가 틀렸다는 뜻은 아니므로). 체인(A→B→C)도
+/// 재귀적으로 따라가며 각 홉을 독립적으로 같은 기준으로 판정한다 — 사이클은 방문
+/// 집합으로 방지한다.
+fn merge_vote_weight(
+    resolved: &HashMap<String, Resolution>,
+    audit: &[DiscourseAudit],
+    target_id: &str,
+) -> f64 {
+    let mut total = 0.0;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(target_id.to_string());
+    let mut queue = vec![target_id.to_string()];
+    while let Some(id) = queue.pop() {
+        for r in resolved.values() {
+            if r.status != "MERGED" || r.merged_into != id {
+                continue;
+            }
+            if !visited.insert(r.finding_id.clone()) {
+                continue; // 사이클(이미 방문) — 다시 안 셈
+            }
+            if direct_vote_net(audit, &r.finding_id) >= 0.0 {
+                total += confidence_weight("high");
+            }
+            queue.push(r.finding_id.clone());
+        }
+    }
+    total
 }
 
 /// 필드 전부 `#[serde(default)]` — 바로 위 Move와 동일 이유(실전에서 필드 하나 빠지면
@@ -300,7 +340,7 @@ pub fn run(
                 _ => 0.0,
             })
             .sum::<f64>()
-            + merge_vote_weight(&resolved, &f.id);
+            + merge_vote_weight(&resolved, &audit, &f.id);
 
         let (status, reason) = if net >= VOTE_THRESHOLD {
             (
@@ -487,9 +527,13 @@ mod tests {
                 reason: String::new(),
             },
         );
-        assert_eq!(merge_vote_weight(&resolved, "b"), confidence_weight("high"));
-        assert_eq!(merge_vote_weight(&resolved, "c"), 0.0);
-        assert_eq!(merge_vote_weight(&resolved, "nonexistent"), 0.0);
+        let audit = Vec::new();
+        assert_eq!(
+            merge_vote_weight(&resolved, &audit, "b"),
+            confidence_weight("high")
+        );
+        assert_eq!(merge_vote_weight(&resolved, &audit, "c"), 0.0);
+        assert_eq!(merge_vote_weight(&resolved, &audit, "nonexistent"), 0.0);
     }
 
     #[test]
@@ -615,6 +659,140 @@ mod tests {
         assert_eq!(
             resolved["security-r1-1"].status, "UNCERTAIN",
             "existence 축 CHALLENGE는 여전히 확정을 막아야 한다(net=0)"
+        );
+    }
+
+    fn merged_resolution(id: &str, into: &str) -> Resolution {
+        Resolution {
+            finding_id: id.to_string(),
+            status: "MERGED".to_string(),
+            merged_into: into.to_string(),
+            reason: String::new(),
+        }
+    }
+
+    fn existence_challenge(target: &str, confidence: &str) -> Move {
+        Move {
+            kind: "CHALLENGE".to_string(),
+            lens: "tests".to_string(),
+            target: target.to_string(),
+            detail: "disputed".to_string(),
+            new_evidence: String::new(),
+            confidence: confidence.to_string(),
+            challenge_axis: "EXISTENCE".to_string(),
+        }
+    }
+
+    fn agree(target: &str, confidence: &str) -> Move {
+        Move {
+            kind: "AGREE".to_string(),
+            lens: "tests".to_string(),
+            target: target.to_string(),
+            detail: "agreed".to_string(),
+            new_evidence: "e".to_string(),
+            confidence: confidence.to_string(),
+            challenge_axis: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_vote_weight_does_not_credit_a_disputed_source() {
+        // #87: A가 existence 축 CHALLENGE로 순 투표 음수인 채로 B에 MERGED되면, 그
+        // 반박을 무시하고 B를 세탁 확정시키면 안 된다.
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), merged_resolution("a", "b"));
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![existence_challenge("a", "high")],
+        }];
+        assert_eq!(
+            merge_vote_weight(&resolved, &audit, "b"),
+            0.0,
+            "반박당한 채 병합된 finding은 credit되면 안 된다"
+        );
+    }
+
+    #[test]
+    fn merge_vote_weight_still_credits_an_undisputed_source() {
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), merged_resolution("a", "b"));
+        let audit = Vec::new(); // 반박 없음
+        assert_eq!(
+            merge_vote_weight(&resolved, &audit, "b"),
+            confidence_weight("high")
+        );
+    }
+
+    #[test]
+    fn merge_vote_weight_propagates_through_a_merge_chain() {
+        // #88: A→B→C로 두 단계 병합되면 A의 신호도 C까지 전달돼야 한다.
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), merged_resolution("a", "b"));
+        resolved.insert("b".to_string(), merged_resolution("b", "c"));
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![agree("a", "high")],
+        }];
+        assert_eq!(
+            merge_vote_weight(&resolved, &audit, "c"),
+            2.0 * confidence_weight("high"),
+            "A(agreed)와 B, 두 홉 모두 credit돼야 한다"
+        );
+    }
+
+    #[test]
+    fn merge_vote_weight_ignores_cycles() {
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), merged_resolution("a", "b"));
+        resolved.insert("b".to_string(), merged_resolution("b", "a"));
+        let audit = Vec::new();
+        // 무한루프 없이 끝나기만 하면 충분 — 정확한 값보다 종료가 핵심.
+        let _ = merge_vote_weight(&resolved, &audit, "a");
+    }
+
+    #[test]
+    fn run_does_not_launder_a_disputed_finding_via_merge() {
+        // #87 재현(run() 레벨): design-r1-1은 existence 축 CHALLENGE를 받고
+        // security-r1-1로 MERGED된다. security-r1-1 자체는 직접 투표가 하나도 없다 —
+        // 고치기 전이었다면 merge_vote_weight만으로 1.0을 받아 확정됐다.
+        let mut findings = vec![
+            test_finding("의심스러운 SQL injection 주장", "evidence A"),
+            test_finding("약한 보안 관련 지적", "evidence B"),
+        ];
+        findings[0].id = "design-r1-1".to_string();
+        findings[1].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "design-r1-1",
+                "detail": "근거 자체가 diff에 없음", "confidence": "high",
+                "challenge_axis": "existence"
+            }],
+            "resolutions": [{
+                "finding_id": "design-r1-1", "status": "MERGED",
+                "merged_into": "security-r1-1", "reason": "같은 문제로 병합"
+            }],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+        };
+
+        let (_audit, resolved) = run(&llm, &test_spec(), &input, &mut findings, 1, 1).unwrap();
+
+        assert_eq!(resolved["design-r1-1"].status, "MERGED");
+        assert_eq!(
+            resolved["security-r1-1"].status, "UNCERTAIN",
+            "반박당한 finding이 병합됐다고 생존자가 세탁 확정되면 안 된다"
         );
     }
 }
