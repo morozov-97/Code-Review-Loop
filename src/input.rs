@@ -113,6 +113,124 @@ fn parse_diff_stats(diff: &str) -> (Vec<String>, usize, usize) {
     (files, added, removed)
 }
 
+/// Splits a diff into (file_path, block_text) pairs at `diff --git` boundaries. Any content
+/// before the first such line (atypical, but don't lose it) becomes an unlabeled first block
+/// that prioritize_and_cap_diff never reorders or drops.
+fn split_into_file_blocks(diff: &str) -> Vec<(Option<String>, String)> {
+    let mut blocks: Vec<(Option<String>, String)> = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_lines: Vec<&str> = Vec::new();
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            if !current_lines.is_empty() {
+                blocks.push((current_path.take(), current_lines.join("\n")));
+                current_lines.clear();
+            }
+            // Same "b/" extraction as parse_diff_stats, for consistency.
+            current_path = line
+                .rfind(" b/")
+                .map(|idx| line[idx + 3..].to_string())
+                .filter(|p| !p.is_empty());
+        }
+        current_lines.push(line);
+    }
+    if !current_lines.is_empty() {
+        blocks.push((current_path, current_lines.join("\n")));
+    }
+    blocks
+}
+
+const NOISY_FILENAMES: [&str; 8] = [
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "go.sum",
+    "composer.lock",
+    "Gemfile.lock",
+    "poetry.lock",
+];
+const NOISY_PATH_SEGMENTS: [&str; 6] = [
+    "/vendor/",
+    "/generated/",
+    "/dist/",
+    "/build/",
+    "/node_modules/",
+    "/target/",
+];
+
+/// Lockfiles, vendored/generated/build output, and minified assets rarely need the same
+/// attention as hand-written source changes, and are usually large relative to their actual
+/// review value.
+fn is_noisy_path(path: &str) -> bool {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    if NOISY_FILENAMES.contains(&filename) {
+        return true;
+    }
+    if filename.ends_with(".min.js") || filename.ends_with(".min.css") {
+        return true;
+    }
+    let normalized = format!("/{path}");
+    NOISY_PATH_SEGMENTS
+        .iter()
+        .any(|seg| normalized.contains(seg))
+}
+
+/// Unlike DIFF_WARN_CHARS (a cost warning, see pipeline/review.rs), this is an actual limit —
+/// past this, prioritize_and_cap_diff starts dropping the lowest-priority file-blocks so the
+/// diff can't grow unbounded and risk exceeding the model's context window.
+const DIFF_HARD_CAP_CHARS: usize = 1_000_000;
+
+/// Reorders file-blocks so noisy/generated ones (see `is_noisy_path`) sort after everything
+/// else, stable within each group — pure reordering, no information loss, always applied. If
+/// the diff is still over DIFF_HARD_CAP_CHARS afterward, drops the lowest-priority blocks from
+/// the tail until it fits (always keeping at least one block so the diff never ends up empty)
+/// and returns which files got dropped, so the caller can surface that instead of silently
+/// truncating (see #107 — this is the "no silent truncation" principle already used for
+/// DIFF_WARN_CHARS, extended to an actual cap).
+fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
+    let blocks = split_into_file_blocks(diff);
+    if blocks.len() <= 1 {
+        return (diff.to_string(), Vec::new());
+    }
+
+    let mut indexed: Vec<(usize, Option<String>, String)> = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(i, (path, text))| (i, path, text))
+        .collect();
+    indexed.sort_by_key(|(i, path, _)| {
+        let noisy = path.as_deref().is_some_and(is_noisy_path);
+        (noisy, *i)
+    });
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for (_, path, text) in indexed {
+        if total + text.len() > DIFF_HARD_CAP_CHARS && !kept.is_empty() {
+            if let Some(p) = path {
+                dropped.push(p);
+            }
+            continue;
+        }
+        total += text.len();
+        kept.push(text);
+    }
+
+    let mut out = kept.join("\n");
+    if !dropped.is_empty() {
+        out.push_str(&format!(
+            "\n\n[NOTE: {} file(s) omitted from this diff due to the {}-char size cap — not reviewed: {}]\n",
+            dropped.len(),
+            DIFF_HARD_CAP_CHARS,
+            dropped.join(", ")
+        ));
+    }
+    (out, dropped)
+}
+
 pub fn normalize(
     diff_path: &Path,
     requirements_path: &Option<std::path::PathBuf>,
@@ -128,6 +246,18 @@ pub fn normalize(
         !changed_files.is_empty(),
         "no changed files found in diff (check unified diff format)"
     );
+
+    // changed_files/added_lines/removed_lines above reflect the full original diff (accurate
+    // stats for reporting) even if prioritize_and_cap_diff below drops some file-blocks from
+    // what's actually sent to the LLM.
+    let (diff, dropped_files) = prioritize_and_cap_diff(&diff);
+    if !dropped_files.is_empty() {
+        eprintln!(
+            "Warning: diff exceeded the {DIFF_HARD_CAP_CHARS}-char hard cap — {} file(s) dropped from what's sent to the LLM: {}",
+            dropped_files.len(),
+            dropped_files.join(", ")
+        );
+    }
 
     let requirements = read_opt(requirements_path)?;
     let conventions = read_opt(conventions_path)?;
@@ -280,5 +410,119 @@ mod tests {
                      index 0000000..e69de29\n";
         let (files, _, _) = parse_diff_stats(diff);
         assert_eq!(files, vec![".gitkeep".to_string()]);
+    }
+
+    // --- is_noisy_path() ---
+
+    #[test]
+    fn is_noisy_path_flags_known_lockfiles() {
+        for f in ["Cargo.lock", "package-lock.json", "yarn.lock", "go.sum"] {
+            assert!(is_noisy_path(f), "{f} should be noisy");
+            assert!(
+                is_noisy_path(&format!("nested/dir/{f}")),
+                "{f} should be noisy when nested"
+            );
+        }
+    }
+
+    #[test]
+    fn is_noisy_path_flags_generated_and_vendor_paths() {
+        assert!(is_noisy_path("vendor/lib/thing.go"));
+        assert!(is_noisy_path("web/dist/bundle.js"));
+        assert!(is_noisy_path("web/node_modules/react/index.js"));
+        assert!(is_noisy_path("assets/app.min.js"));
+    }
+
+    #[test]
+    fn is_noisy_path_leaves_ordinary_source_files_alone() {
+        assert!(!is_noisy_path("src/main.rs"));
+        assert!(!is_noisy_path("src/vendor_utils.rs")); // "vendor" substring but not the /vendor/ path segment
+    }
+
+    // --- split_into_file_blocks() ---
+
+    #[test]
+    fn split_into_file_blocks_splits_at_each_diff_git_header() {
+        let diff = "diff --git a/a.rs b/a.rs\n+x\n\
+                     diff --git a/b.rs b/b.rs\n+y\n";
+        let blocks = split_into_file_blocks(diff);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0.as_deref(), Some("a.rs"));
+        assert_eq!(blocks[1].0.as_deref(), Some("b.rs"));
+    }
+
+    // --- prioritize_and_cap_diff() ---
+
+    #[test]
+    fn prioritize_and_cap_diff_moves_noisy_files_after_normal_ones_without_dropping_anything() {
+        let diff = "diff --git a/Cargo.lock b/Cargo.lock\n+lockfile change\n\
+                     diff --git a/src/main.rs b/src/main.rs\n+real change\n";
+        let (out, dropped) = prioritize_and_cap_diff(diff);
+        assert!(dropped.is_empty());
+        // src/main.rs's block must now come before Cargo.lock's, even though Cargo.lock was first originally.
+        let main_pos = out.find("src/main.rs").unwrap();
+        let lock_pos = out.find("Cargo.lock").unwrap();
+        assert!(
+            main_pos < lock_pos,
+            "non-noisy file should be reordered ahead of the noisy one:\n{out}"
+        );
+    }
+
+    #[test]
+    fn prioritize_and_cap_diff_preserves_relative_order_within_the_same_priority_group() {
+        let diff = "diff --git a/a.rs b/a.rs\n+a\n\
+                     diff --git a/b.rs b/b.rs\n+b\n";
+        let (out, dropped) = prioritize_and_cap_diff(diff);
+        assert!(dropped.is_empty());
+        assert!(out.find("a.rs").unwrap() < out.find("b.rs").unwrap());
+    }
+
+    #[test]
+    fn prioritize_and_cap_diff_is_a_no_op_on_a_single_file_diff() {
+        let diff = "diff --git a/a.rs b/a.rs\n+a\n";
+        let (out, dropped) = prioritize_and_cap_diff(diff);
+        assert_eq!(out, diff);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn prioritize_and_cap_diff_drops_lowest_priority_tail_past_the_hard_cap_and_reports_it() {
+        // Two huge files, each over half the cap on its own — together they exceed
+        // DIFF_HARD_CAP_CHARS, so the noisy one (sorted last) must be dropped, not the real one.
+        let real_content = "a".repeat(DIFF_HARD_CAP_CHARS / 2 + 10);
+        let lock_content = "l".repeat(DIFF_HARD_CAP_CHARS / 2 + 10);
+        let diff = format!(
+            "diff --git a/src/main.rs b/src/main.rs\n+{real_content}\n\
+             diff --git a/Cargo.lock b/Cargo.lock\n+{lock_content}\n"
+        );
+        let (out, dropped) = prioritize_and_cap_diff(&diff);
+        assert_eq!(dropped, vec!["Cargo.lock".to_string()]);
+        assert!(out.contains("src/main.rs"));
+        assert!(
+            out.contains(&real_content),
+            "the kept file's actual content must survive"
+        );
+        assert!(
+            !out.contains(&lock_content),
+            "the dropped file's content must not survive"
+        );
+        assert!(out.contains("[NOTE: 1 file(s) omitted"));
+        assert!(
+            out.contains("Cargo.lock"),
+            "the note must name the dropped file"
+        );
+    }
+
+    #[test]
+    fn prioritize_and_cap_diff_never_drops_everything_even_if_the_first_block_alone_exceeds_the_cap(
+    ) {
+        let big = "x".repeat(DIFF_HARD_CAP_CHARS + 1000);
+        let diff = format!("diff --git a/src/main.rs b/src/main.rs\n+{big}\n");
+        let (out, dropped) = prioritize_and_cap_diff(&diff);
+        assert!(
+            dropped.is_empty(),
+            "the only block must be kept even though it's over the cap alone"
+        );
+        assert!(out.contains("src/main.rs"));
     }
 }
