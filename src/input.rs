@@ -1,3 +1,4 @@
+use crate::core::RunConfig;
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -13,11 +14,8 @@ pub struct Input {
     /// Deterministic tool results. check id -> (status, evidence). If absent, every item in
     /// the spec is NOT_RUN.
     pub deterministic_results: Option<serde_json::Value>,
-    /// Language the LLM should write findings/evidence/reasoning text in (e.g. "Korean").
-    /// None means no instruction is given, so the LLM defaults to English. Read only by
-    /// `promptctx::shared_context` — every prompt builder goes through that one function, so
-    /// this is the single place output language is controlled from.
-    pub language: Option<String>,
+    /// Cross-cutting run settings (currently just output language) — see `core::RunConfig`.
+    pub config: RunConfig,
 }
 
 fn read_opt(p: &Option<std::path::PathBuf>) -> Result<Option<String>> {
@@ -156,7 +154,7 @@ pub fn normalize(
         requirements,
         conventions,
         deterministic_results,
-        language,
+        config: RunConfig { language },
     })
 }
 

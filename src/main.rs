@@ -1,3 +1,4 @@
+mod core;
 mod describe;
 mod discourse;
 mod fixcheck;
