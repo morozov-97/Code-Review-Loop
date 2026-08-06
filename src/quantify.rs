@@ -7,15 +7,22 @@ use crate::spec::ScoringConfig;
 use std::collections::HashMap;
 
 /// #115: whether every stage that could have contributed to `verdict`/`score` actually ran
-/// successfully. `report.rs` already renders a "(PARTIAL)" marker on the verdict line when this
-/// is `Partial`, but that's markdown text — this field exists so a programmatic consumer
+/// successfully. `report.rs` already renders a "(PARTIAL)"/"(FAILED)" marker on the verdict
+/// line based on this, but that's markdown text — this field exists so a programmatic consumer
 /// (future structured output, a CI script reading state.json, anything matching on
 /// `QuantSummary` directly instead of parsing the rendered report) gets the same signal without
 /// having to parse a string.
+///
+/// `Failed` (added after review — see the follow-up issue filed alongside #115) is distinct
+/// from `Partial`: some supplementary stage failing (good_things, human-voice, a `--prior` fix
+/// check) still leaves a meaningful defect review behind, but every selected lens failing means
+/// there's no defect-finding coverage at all — calling that "Partial" the same way undersells
+/// how little the resulting verdict actually reflects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewCompleteness {
     Complete,
     Partial,
+    Failed,
 }
 
 pub struct QuantSummary {

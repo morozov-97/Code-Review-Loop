@@ -110,15 +110,21 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         "# Code Review — {} (round {})\n\n",
         spec.name, round
     ));
-    // #112: verdict/score are computed purely from whatever findings survived — if a stage
+    // #112/#115: verdict/score are computed purely from whatever findings survived — if a stage
     // failed (a lens erroring out, etc.), that's recorded in stage_errors but was previously
     // never reflected in the verdict itself, so a partial review could read as a clean,
     // fully-confident one unless you scrolled down to the separate stage-errors section below.
     // This puts the reliability signal right on the verdict line, where it's actually seen.
-    let partial_marker = if stage_errors.is_empty() {
-        String::new()
-    } else {
-        " (PARTIAL — see ⚠ below)".to_string()
+    // Reads from quant.completeness (not stage_errors directly) so this marker and the
+    // programmatic signal on QuantSummary can never disagree with each other.
+    let partial_marker = match quant.completeness {
+        crate::quantify::ReviewCompleteness::Complete => String::new(),
+        crate::quantify::ReviewCompleteness::Partial => " (PARTIAL — see ⚠ below)".to_string(),
+        // Failed: every selected lens errored out — the verdict below reflects zero
+        // defect-finding coverage, not "clean, just missing a supplementary stage".
+        crate::quantify::ReviewCompleteness::Failed => {
+            " (FAILED — no lens completed, see ⚠ below)".to_string()
+        }
     };
     md.push_str(&format!(
         "**Verdict: {}{}**  ·  Score: {}/100  ·  Effort: {}/5  ·  {} files changed (+{}/-{})\n\n",
@@ -603,7 +609,8 @@ mod tests {
         // separate stage-errors section further down where a quick glance would miss it.
         let spec = test_spec();
         let input = test_input();
-        let quant = test_quant();
+        let mut quant = test_quant();
+        quant.completeness = crate::quantify::ReviewCompleteness::Partial;
         let dir = std::env::temp_dir().join("codereview-loop-report-partial-verdict-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -673,6 +680,51 @@ mod tests {
             !verdict_line.contains("PARTIAL"),
             "verdict line must not be marked partial when no stage failed:\n{verdict_line}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_marks_the_verdict_line_failed_not_partial_when_completeness_is_failed() {
+        // #115 follow-up: Failed (zero lens coverage) must read differently from Partial (some
+        // other stage failed but the core review still has real findings behind it) — a
+        // reader glancing only at the verdict line needs to tell "trust this a little less"
+        // apart from "there's essentially nothing here".
+        let spec = test_spec();
+        let input = test_input();
+        let mut quant = test_quant();
+        quant.completeness = crate::quantify::ReviewCompleteness::Failed;
+        let dir = std::env::temp_dir().join("codereview-loop-report-failed-verdict-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["security".to_string()],
+            round: 1,
+            findings: &[],
+            resolved: &HashMap::new(),
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &[],
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &["lens review failed: security".to_string()],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        let verdict_line = md.lines().find(|l| l.starts_with("**Verdict:")).unwrap();
+        assert!(
+            verdict_line.contains("(FAILED"),
+            "verdict line must say FAILED, not just PARTIAL, when no lens completed:\n{verdict_line}"
+        );
+        assert!(!verdict_line.contains("(PARTIAL"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

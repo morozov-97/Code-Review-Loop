@@ -51,6 +51,15 @@ type LensReviewResults = (
 
 pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<()> {
     let started = std::time::Instant::now();
+    // #119: without this, --deadline-minutes only stopped new *stages* from starting — a call
+    // already in flight could still run its full per-call timeout (600s) past the deadline.
+    // Attaching the deadline to the Llm itself shrinks every individual call's own timeout to
+    // whatever's actually left, so it's a real wall-clock bound, not just a between-stage check.
+    let deadline_instant = args
+        .deadline_minutes
+        .map(|m| started + std::time::Duration::from_secs(m * 60));
+    let llm = &llm.clone().with_deadline(deadline_instant);
+    let cheap_llm = &cheap_llm.clone().with_deadline(deadline_instant);
     let sp = Spec::load(args.spec_path)?;
     let mut inp = input::normalize(
         args.diff_path,
@@ -177,9 +186,14 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
     let mut stage_errors: Vec<String> = Vec::new();
+    // #115 follow-up: tracked separately from findings.is_empty() — a clean diff with zero
+    // real findings and "every lens errored out" both leave `findings` empty, but only the
+    // latter means the review has zero defect-finding coverage (completeness::Failed below).
+    let mut successful_lens_count = 0usize;
     for r in lens_results {
         match r {
             Ok((id, out)) => {
+                successful_lens_count += 1;
                 findings.extend(out.findings);
                 for u in out.unverified {
                     unverified.push((id.clone(), u));
@@ -374,9 +388,15 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // #115: every stage that could have failed by this point (lens/good_things/discourse/
     // fixcheck/requirements/human-voice) already recorded into stage_errors — this is the
     // single place that turns "did anything fail" into the structured signal on QuantSummary
-    // itself, not just the rendered report.md text.
+    // itself, not just the rendered report.md text. Failed (every selected lens errored out,
+    // zero defect-finding coverage) is distinct from Partial (some other stage failed but at
+    // least one lens succeeded) — see ReviewCompleteness's doc comment.
     if !stage_errors.is_empty() {
-        quant.completeness = quantify::ReviewCompleteness::Partial;
+        quant.completeness = if successful_lens_count == 0 && !selected_ids.is_empty() {
+            quantify::ReviewCompleteness::Failed
+        } else {
+            quantify::ReviewCompleteness::Partial
+        };
     }
 
     // Step 12: output
@@ -605,6 +625,86 @@ always = true
         assert!(
             verdict_line.contains("PARTIAL"),
             "verdict line must be marked partial when discourse failed:\n{verdict_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_marks_the_report_failed_when_every_selected_lens_errors_out() {
+        // #115 follow-up: distinct from the discourse-failure test above — here the *lens*
+        // review itself fails (malformed response), so there's zero defect-finding coverage at
+        // all. The report must say FAILED, not the more forgiving PARTIAL a supplementary-stage
+        // failure gets.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-all-lenses-failed-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "e2e test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "test_lens"
+title = "Test Lens"
+guide = "test"
+always = true
+"#,
+        );
+
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+
+        let out_dir = dir.join("out");
+        // Malformed on purpose — the single selected lens's only call fails, findings stays
+        // empty, and (no findings) skips discourse entirely, so this is the only fixture entry needed.
+        let broken_lens_response = "this is not json".to_string();
+
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![broken_lens_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: None,
+            },
+        )
+        .expect("run_review must still succeed even when every lens fails");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        let verdict_line = report
+            .lines()
+            .find(|l| l.starts_with("**Verdict:"))
+            .unwrap();
+        assert!(
+            verdict_line.contains("(FAILED"),
+            "verdict line must say FAILED when every lens errored out, not just PARTIAL:\n{verdict_line}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

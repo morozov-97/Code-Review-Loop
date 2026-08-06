@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub const OPENROUTER_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
@@ -90,6 +90,39 @@ pub struct Llm {
     pub retries: u32,
     pub verbose: bool,
     usage: Arc<Mutex<Usage>>,
+    /// #119: an overall deadline (see `with_deadline`) — None means each call always gets its
+    /// full per-call timeout, unchanged from before this field existed.
+    deadline: Option<Instant>,
+}
+
+/// An HTTP-ish failure that carries its status code as data, not just baked into a message
+/// string — lets `is_retryable` classify it without parsing rendered text (see #119).
+#[derive(Debug)]
+struct HttpError {
+    code: u16,
+    body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "openrouter response code {}: {}", self.code, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// #119: retries used to treat every failure identically — a permanent 401 (bad API key) got
+/// the same "retry `--retries` more times" treatment as a transient 429/5xx, wasting the whole
+/// retry budget on something no amount of retrying fixes. Only downgrades the clear-cut case
+/// (a classified HTTP 4xx that isn't 429); anything else — network errors, 5xx, 429, the claude
+/// CLI backend's exit-code errors, JSON parse/schema-mismatch failures — keeps retrying exactly
+/// as before. Defaulting unclassified errors to "retryable" is the safe direction: at worst it
+/// costs one extra wasted attempt, never skips a retry that might have succeeded.
+fn is_retryable(e: &anyhow::Error) -> bool {
+    match e.downcast_ref::<HttpError>() {
+        Some(HttpError { code, .. }) => *code == 429 || *code >= 500,
+        None => true,
+    }
 }
 
 /// #119: retries used to fire back-to-back with no delay — fine against a one-off blip, but
@@ -128,6 +161,7 @@ impl Llm {
             retries,
             verbose,
             usage,
+            deadline: None,
         }
     }
 
@@ -147,6 +181,7 @@ impl Llm {
             retries,
             verbose,
             usage,
+            deadline: None,
         })
     }
 
@@ -161,6 +196,7 @@ impl Llm {
             retries,
             verbose: false,
             usage,
+            deadline: None,
         }
     }
 
@@ -168,6 +204,28 @@ impl Llm {
     /// panics while holding the lock and poisons it (the accumulated total could be wrong), this doesn't panic again here.
     pub fn usage(&self) -> Usage {
         self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// #119: without this, --deadline-minutes only stopped new *stages* from starting — a call
+    /// already in flight (or one started right as the deadline passed) could still run its full
+    /// per-call timeout (600s) regardless. Attaching a deadline makes each individual call's
+    /// own timeout shrink to whatever's actually left of the budget, so the deadline becomes a
+    /// real wall-clock bound instead of only a between-stage checkpoint.
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Caps `base` at whatever's left until `self.deadline`, if set. Floors at 1s so a deadline
+    /// that's already passed by the time a call starts still gets a real (if short) attempt
+    /// instead of a zero/negative timeout reaching a syscall.
+    fn effective_timeout(&self, base: Duration) -> Duration {
+        match self.deadline {
+            None => base,
+            Some(d) => base
+                .min(d.saturating_duration_since(Instant::now()))
+                .max(Duration::from_secs(1)),
+        }
     }
 
     fn record_usage(&self, u: &CallUsage) {
@@ -182,12 +240,22 @@ impl Llm {
 
     fn call_once(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
         match &self.provider {
-            Provider::ClaudeCli { bin } => {
-                call_claude(bin, self.model.as_deref(), ctx, task, system)
-            }
-            Provider::OpenRouter { api_key } => {
-                call_openrouter(api_key, self.model.as_deref(), ctx, task, system)
-            }
+            Provider::ClaudeCli { bin } => call_claude(
+                bin,
+                self.model.as_deref(),
+                ctx,
+                task,
+                system,
+                self.effective_timeout(CLAUDE_CLI_TIMEOUT),
+            ),
+            Provider::OpenRouter { api_key } => call_openrouter(
+                api_key,
+                self.model.as_deref(),
+                ctx,
+                task,
+                system,
+                self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
+            ),
             #[cfg(test)]
             Provider::Fixture(queue) => {
                 let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -210,6 +278,7 @@ impl Llm {
     pub fn text_ctx(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<String> {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..=self.retries {
+            let mut retryable = true;
             match self.call_once(ctx, task, system) {
                 Ok(r) => {
                     self.record_usage(&r.usage);
@@ -218,7 +287,10 @@ impl Llm {
                     }
                     last = Some(anyhow!("empty response"));
                 }
-                Err(e) => last = Some(e),
+                Err(e) => {
+                    retryable = is_retryable(&e);
+                    last = Some(e);
+                }
             }
             if self.verbose {
                 match last.as_ref() {
@@ -229,6 +301,11 @@ impl Llm {
                         self.retries
                     ),
                 }
+            }
+            // #119: a permanent failure (e.g. a 401) won't succeed no matter how many times
+            // it's retried — stop burning the retry budget on it instead of looping to the end.
+            if !retryable {
+                break;
             }
             if attempt < self.retries {
                 std::thread::sleep(backoff_delay(attempt));
@@ -268,6 +345,9 @@ impl Llm {
                     r.text
                 }
                 Err(e) => {
+                    // #119: same permanent-vs-transient distinction as text_ctx — a classified
+                    // 401/403 here won't succeed on retry no matter how many attempts remain.
+                    let retryable = is_retryable(&e);
                     last = Some(e);
                     if self.verbose {
                         match last.as_ref() {
@@ -282,6 +362,9 @@ impl Llm {
                                 );
                             }
                         }
+                    }
+                    if !retryable {
+                        break;
                     }
                     if attempt < self.retries {
                         std::thread::sleep(backoff_delay(attempt));
@@ -411,6 +494,7 @@ fn call_claude(
     ctx: Option<&str>,
     task: &str,
     system: Option<&str>,
+    timeout: Duration,
 ) -> Result<CallResult> {
     let mut cmd = Command::new(bin);
     cmd.arg("-p").arg("--output-format").arg("json");
@@ -430,7 +514,7 @@ fn call_claude(
 
     let mut stdin_data = ctx.map(|c| c.as_bytes().to_vec()).unwrap_or_default();
     stdin_data.extend_from_slice(task.as_bytes());
-    let out = write_stdin_and_wait(child, stdin_data, CLAUDE_CLI_TIMEOUT)
+    let out = write_stdin_and_wait(child, stdin_data, timeout)
         .with_context(|| format!("failed waiting for `{bin}` to finish"))?;
     if !out.status.success() {
         return Err(anyhow!(
@@ -501,6 +585,7 @@ fn call_openrouter(
     ctx: Option<&str>,
     task: &str,
     system: Option<&str>,
+    timeout: Duration,
 ) -> Result<CallResult> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(s) = system {
@@ -533,7 +618,7 @@ fn call_openrouter(
     // status code and body in our own error message as before (with the default, you'd get only
     // an Err with no body, unable to read it).
     let config = ureq::Agent::config_builder()
-        .timeout_global(Some(HTTP_TIMEOUT_GLOBAL))
+        .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .build();
     let agent: ureq::Agent = config.into();
@@ -547,10 +632,14 @@ fn call_openrouter(
     if !resp.status().is_success() {
         let code = resp.status().as_u16();
         let body_text = resp.body_mut().read_to_string().unwrap_or_default();
-        return Err(anyhow!(
-            "openrouter response code {code}: {}",
-            truncate(&body_text, 400)
-        ));
+        // #119: HttpError carries the status code through as a typed error (instead of only
+        // baking it into a string) so the retry loop can tell a permanent 401/403 apart from a
+        // retry-worthy 429/5xx, instead of treating every failure the same.
+        return Err(HttpError {
+            code,
+            body: truncate(&body_text, 400),
+        }
+        .into());
     }
 
     let v: serde_json::Value = resp
@@ -634,6 +723,81 @@ pub fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_llm() -> Llm {
+        Llm::fixture(vec![], 0, Llm::new_usage_tracker())
+    }
+
+    #[test]
+    fn effective_timeout_returns_base_when_no_deadline_is_set() {
+        let llm = test_llm();
+        assert_eq!(
+            llm.effective_timeout(Duration::from_secs(600)),
+            Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn effective_timeout_shrinks_to_the_remaining_deadline_when_it_is_less_than_the_base() {
+        let llm = test_llm().with_deadline(Some(Instant::now() + Duration::from_secs(10)));
+        let effective = llm.effective_timeout(Duration::from_secs(600));
+        assert!(
+            effective <= Duration::from_secs(10) && effective >= Duration::from_secs(9),
+            "expected ~10s, got {effective:?}"
+        );
+    }
+
+    #[test]
+    fn effective_timeout_does_not_shrink_the_base_when_deadline_is_further_away() {
+        let llm = test_llm().with_deadline(Some(Instant::now() + Duration::from_secs(3600)));
+        assert_eq!(
+            llm.effective_timeout(Duration::from_secs(600)),
+            Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn effective_timeout_floors_at_one_second_when_the_deadline_already_passed() {
+        // #119: a deadline in the past must not hand a zero/negative timeout to a syscall.
+        let llm = test_llm().with_deadline(Some(Instant::now() - Duration::from_secs(5)));
+        assert_eq!(
+            llm.effective_timeout(Duration::from_secs(600)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn is_retryable_treats_429_and_5xx_as_retryable() {
+        for code in [429, 500, 502, 503] {
+            let e: anyhow::Error = HttpError {
+                code,
+                body: String::new(),
+            }
+            .into();
+            assert!(is_retryable(&e), "{code} should be retryable");
+        }
+    }
+
+    #[test]
+    fn is_retryable_treats_other_4xx_as_permanent() {
+        for code in [400, 401, 403, 404, 422] {
+            let e: anyhow::Error = HttpError {
+                code,
+                body: String::new(),
+            }
+            .into();
+            assert!(!is_retryable(&e), "{code} should not be retryable");
+        }
+    }
+
+    #[test]
+    fn is_retryable_defaults_unclassified_errors_to_retryable() {
+        // #119: network errors, JSON parse/schema-mismatch failures, claude CLI exit-code
+        // errors — anything that isn't a classified HttpError keeps the pre-existing
+        // always-retry behavior, since defaulting to "don't retry" would be the unsafe direction.
+        let e = anyhow!("some other failure that isn't an HttpError");
+        assert!(is_retryable(&e));
+    }
 
     #[test]
     fn backoff_delay_grows_with_attempt_number() {
