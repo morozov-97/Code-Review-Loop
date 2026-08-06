@@ -136,11 +136,19 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
     if !fix_results.is_empty() {
         md.push_str("## 이전 라운드 대비\n\n| Finding | Status | Evidence |\n|---|---|---|\n");
         for f in fix_results {
+            // superseded_by는 LLM 자유서술(evidence)에만 의존하지 않고 코드가 항상
+            // 명시적으로 붙인다 — evidence 문구가 없거나 애매해도 어떤 finding이
+            // 대체했는지는 리포트에서 항상 확인 가능해야 한다.
+            let evidence = if f.status == "SUPERSEDED" && !f.superseded_by.is_empty() {
+                format!("[{}로 대체됨] {}", f.superseded_by, f.evidence)
+            } else {
+                f.evidence.clone()
+            };
             md.push_str(&format!(
                 "| {} | {} | {} |\n",
                 escape_table_cell(&f.finding_id),
                 escape_table_cell(&f.status),
-                escape_table_cell(&f.evidence)
+                escape_table_cell(&evidence)
             ));
         }
         md.push('\n');

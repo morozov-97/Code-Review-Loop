@@ -10,11 +10,16 @@ pub const FIXCHECK_SYSTEM: &str =
     "당신은 이전 라운드에서 확정된 finding이 이번 diff에서 실제로 고쳐졌는지 판정한다. \
 근거 없이 FIXED로 판정하지 않는다. 확인 불가하면 UNKNOWN. \
 아직 안 고쳐졌지만 이번 라운드 findings 목록에 동일한 근본 원인을 이미 잡은 항목이 있으면 \
-STILL_OPEN이 아니라 SUPERSEDED로 표시하고(이중 집계 방지), evidence에 어떤 finding이 \
-이미 잡았는지 적는다. 반드시 지정된 JSON 스키마로만 응답한다.";
+STILL_OPEN이 아니라 SUPERSEDED로 표시하고(이중 집계 방지), superseded_by에 그 finding의 \
+id를 반드시 정확히 적는다(참고 목록에 있는 id 그대로, 지어내지 않는다). \
+반드시 지정된 JSON 스키마로만 응답한다.";
 
 /// 필드 전부 `#[serde(default)]` — discourse::Move/Resolution과 동일 이유. status가
 /// 빠지거나 스키마 밖 값이면 "UNKNOWN"(사람이 다시 봐야 함)으로 안전하게 떨어진다.
+/// superseded_by는 status가 SUPERSEDED일 때만 의미 있음 — run()이 이 필드가 실제
+/// this_round_confirmed에 있는 id인지, 심각도가 원래 finding보다 안 낮은지 검증한다
+/// (검증 실패 시 STILL_OPEN으로 안전하게 떨어뜨림 — FIXED가 corroborate로 재검증되는 것과
+/// 동일한 원칙: LLM의 SUPERSEDED 판정을 그대로 믿지 않는다).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixStatus {
     #[serde(default)]
@@ -23,6 +28,8 @@ pub struct FixStatus {
     pub status: String, // FIXED|STILL_OPEN|SUPERSEDED|UNKNOWN
     #[serde(default)]
     pub evidence: String,
+    #[serde(default)]
+    pub superseded_by: String,
 }
 
 fn unknown_status() -> String {
@@ -101,7 +108,63 @@ fn fill_missing_as_still_open(
                 evidence:
                     "fix check 응답에 이 finding_id가 없었음(누락) — 안전하게 STILL_OPEN 처리"
                         .to_string(),
+                superseded_by: String::new(),
             });
+        }
+    }
+    results
+}
+
+fn severity_rank(s: &str) -> u8 {
+    match s {
+        "P0" => 0,
+        "P1" => 1,
+        "P2" => 2,
+        "P3" => 3,
+        _ => 4,
+    }
+}
+
+/// SUPERSEDED는 FIXED/누락과 달리 아무 검증 장치가 없었다 — LLM이 this_round_confirmed에
+/// 실존하지 않는 id를 지어내 superseded_by에 넣어도, 혹은 이번 라운드 findings가 비어있는
+/// 상황에서도 그대로 통과해 이전 P0/P1이 재편입 없이 조용히 증발했다. 여기서 두 가지를
+/// 확인한다: (1) superseded_by가 실제로 this_round_confirmed에 있는 id인가, (2) 그
+/// finding의 심각도가 원래 finding보다 낮지 않은가(안 그러면 P0가 P3로 몰래 다운그레이드될
+/// 수 있음). 둘 중 하나라도 안 맞으면 STILL_OPEN으로 안전하게 낮춘다 — FIXED가
+/// corroborate()로 재검증되는 것과 동일 원칙: LLM의 SUPERSEDED 자기 판정만으로 믿지 않는다.
+fn verify_supersedes(
+    mut results: Vec<FixStatus>,
+    prior_confirmed: &[Finding],
+    this_round_confirmed: &[&Finding],
+) -> Vec<FixStatus> {
+    for r in results.iter_mut() {
+        if r.status != "SUPERSEDED" {
+            continue;
+        }
+        let superseding = this_round_confirmed
+            .iter()
+            .find(|f| f.id == r.superseded_by);
+        let Some(superseding) = superseding else {
+            r.evidence = format!(
+                "{} [검증 실패: superseded_by(\"{}\")가 이번 라운드 확정 findings에 없음 — \
+                 안전하게 STILL_OPEN으로 되돌림]",
+                r.evidence, r.superseded_by
+            );
+            r.status = "STILL_OPEN".to_string();
+            continue;
+        };
+        let original_severity = prior_confirmed
+            .iter()
+            .find(|f| f.id == r.finding_id)
+            .map(|f| f.severity.as_str())
+            .unwrap_or("P0"); // 못 찾으면 가장 엄격한 쪽으로(사실상 발생 안 함 — 호출부가 prior_confirmed로 만든 목록만 넘김).
+        if severity_rank(&superseding.severity) > severity_rank(original_severity) {
+            r.evidence = format!(
+                "{} [검증 실패: superseded_by(\"{}\")의 심각도({})가 원래 finding({})보다 \
+                 낮음 — 안전하게 STILL_OPEN으로 되돌림]",
+                r.evidence, r.superseded_by, superseding.severity, original_severity
+            );
+            r.status = "STILL_OPEN".to_string();
         }
     }
     results
@@ -118,7 +181,8 @@ fn build_task(list: &str, this_round: &str) -> String {
          ## 이전 라운드 확정 findings\n{list}\n\n\
          ## 이번 라운드에 이미 확정된 findings(참고용 — 동일 근본 원인이면 SUPERSEDED)\n{this_round_block}\n\n\
          ## 출력(JSON만, 코드펜스 없이)\n\
-         {{\"results\":[{{\"finding_id\":\"...\",\"status\":\"FIXED|STILL_OPEN|SUPERSEDED|UNKNOWN\",\"evidence\":\"...\"}}]}}\n",
+         {{\"results\":[{{\"finding_id\":\"...\",\"status\":\"FIXED|STILL_OPEN|SUPERSEDED|UNKNOWN\",\
+         \"evidence\":\"...\",\"superseded_by\":\"SUPERSEDED일 때만: 위 참고 목록의 id 그대로\"}}]}}\n",
         // claim/evidence는 diff 원문을 인용할 수 있다 — shared_context에서 fenced()로
         // 막았던 인젝션 payload가 이 2차 호출에 무방비로 재유입되지 않게 여기서도 처리.
         list = fenced("findings", list)
@@ -171,6 +235,7 @@ pub fn run(
         r.status = normalize_status(&r.status);
     }
     let results = fill_missing_as_still_open(out.results, prior_confirmed);
+    let results = verify_supersedes(results, prior_confirmed, this_round_confirmed);
     Ok(corroborate(results, prior_confirmed, &input.diff))
 }
 
@@ -195,14 +260,19 @@ mod tests {
         }
     }
 
+    fn fix_status(id: &str, status: &str, evidence: &str) -> FixStatus {
+        FixStatus {
+            finding_id: id.to_string(),
+            status: status.to_string(),
+            evidence: evidence.to_string(),
+            superseded_by: String::new(),
+        }
+    }
+
     #[test]
     fn corroborate_downgrades_fixed_to_unknown_when_evidence_still_present() {
         let prior = vec![finding("a", "unsafe { *ptr }")];
-        let results = vec![FixStatus {
-            finding_id: "a".to_string(),
-            status: "FIXED".to_string(),
-            evidence: "diff no longer touches this".to_string(),
-        }];
+        let results = vec![fix_status("a", "FIXED", "diff no longer touches this")];
         let diff = "some context\nunsafe { *ptr }\nmore context";
         let out = corroborate(results, &prior, diff);
         assert_eq!(out[0].status, "UNKNOWN");
@@ -212,11 +282,7 @@ mod tests {
     #[test]
     fn corroborate_leaves_fixed_alone_when_evidence_is_gone() {
         let prior = vec![finding("a", "unsafe { *ptr }")];
-        let results = vec![FixStatus {
-            finding_id: "a".to_string(),
-            status: "FIXED".to_string(),
-            evidence: "replaced with safe accessor".to_string(),
-        }];
+        let results = vec![fix_status("a", "FIXED", "replaced with safe accessor")];
         let diff = "some context\nlet v = safe_accessor();\nmore context";
         let out = corroborate(results, &prior, diff);
         assert_eq!(out[0].status, "FIXED");
@@ -225,11 +291,7 @@ mod tests {
     #[test]
     fn corroborate_leaves_non_fixed_statuses_untouched() {
         let prior = vec![finding("a", "unsafe { *ptr }")];
-        let results = vec![FixStatus {
-            finding_id: "a".to_string(),
-            status: "STILL_OPEN".to_string(),
-            evidence: "still there".to_string(),
-        }];
+        let results = vec![fix_status("a", "STILL_OPEN", "still there")];
         let diff = "unsafe { *ptr }";
         let out = corroborate(results, &prior, diff);
         assert_eq!(out[0].status, "STILL_OPEN");
@@ -261,11 +323,7 @@ mod tests {
         // LLM이 두 finding 중 하나만 결과에 넣고 나머지는 그냥 언급을 빼먹은 경우 —
         // "빠짐"이 "고쳐짐"으로 둔갑하면 안 되고 STILL_OPEN으로 안전하게 재편입돼야 한다.
         let prior = vec![finding("a", "unsafe { *ptr }"), finding("b", "eval(input)")];
-        let results = vec![FixStatus {
-            finding_id: "a".to_string(),
-            status: "FIXED".to_string(),
-            evidence: "replaced with safe accessor".to_string(),
-        }];
+        let results = vec![fix_status("a", "FIXED", "replaced with safe accessor")];
         let out = fill_missing_as_still_open(results, &prior);
         assert_eq!(out.len(), 2);
         let b = out
@@ -278,11 +336,7 @@ mod tests {
     #[test]
     fn fill_missing_as_still_open_leaves_fully_covered_results_untouched() {
         let prior = vec![finding("a", "unsafe { *ptr }")];
-        let results = vec![FixStatus {
-            finding_id: "a".to_string(),
-            status: "FIXED".to_string(),
-            evidence: "e".to_string(),
-        }];
+        let results = vec![fix_status("a", "FIXED", "e")];
         let out = fill_missing_as_still_open(results, &prior);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, "FIXED");
@@ -318,5 +372,60 @@ mod tests {
     #[test]
     fn normalize_status_accepts_superseded() {
         assert_eq!(normalize_status("superseded"), "SUPERSEDED");
+    }
+
+    fn finding_sev(id: &str, severity: &str) -> Finding {
+        let mut f = finding(id, "e");
+        f.severity = severity.to_string();
+        f
+    }
+
+    #[test]
+    fn verify_supersedes_rejects_unknown_superseded_by() {
+        let prior = vec![finding_sev("a", "P0")];
+        let this_round: Vec<&Finding> = vec![];
+        let mut r = fix_status("a", "SUPERSEDED", "already caught");
+        r.superseded_by = "does-not-exist".to_string();
+        let out = verify_supersedes(vec![r], &prior, &this_round);
+        assert_eq!(
+            out[0].status, "STILL_OPEN",
+            "존재하지 않는 superseded_by는 STILL_OPEN으로 되돌아가야 한다"
+        );
+    }
+
+    #[test]
+    fn verify_supersedes_rejects_lower_severity_replacement() {
+        // 원래 P0였는데 이번 라운드가 같은 근본 원인을 P3로만 다시 잡았다면, 조용히
+        // 심각도가 다운그레이드되면 안 되고 STILL_OPEN으로 원래 심각도를 지켜야 한다.
+        let prior = vec![finding_sev("a", "P0")];
+        let weak = finding_sev("b", "P3");
+        let this_round: Vec<&Finding> = vec![&weak];
+        let mut r = fix_status("a", "SUPERSEDED", "same root cause");
+        r.superseded_by = "b".to_string();
+        let out = verify_supersedes(vec![r], &prior, &this_round);
+        assert_eq!(out[0].status, "STILL_OPEN");
+    }
+
+    #[test]
+    fn verify_supersedes_accepts_valid_same_or_higher_severity_replacement() {
+        let prior = vec![finding_sev("a", "P1")];
+        let strong = finding_sev("b", "P0");
+        let this_round: Vec<&Finding> = vec![&strong];
+        let mut r = fix_status("a", "SUPERSEDED", "same root cause, worse than thought");
+        r.superseded_by = "b".to_string();
+        let out = verify_supersedes(vec![r], &prior, &this_round);
+        assert_eq!(out[0].status, "SUPERSEDED");
+    }
+
+    #[test]
+    fn verify_supersedes_leaves_non_superseded_statuses_untouched() {
+        let prior = vec![finding_sev("a", "P0")];
+        let this_round: Vec<&Finding> = vec![];
+        let out = verify_supersedes(
+            vec![fix_status("a", "STILL_OPEN", "still broken")],
+            &prior,
+            &this_round,
+        );
+        assert_eq!(out[0].status, "STILL_OPEN");
     }
 }
