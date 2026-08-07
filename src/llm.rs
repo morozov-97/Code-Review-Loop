@@ -1282,13 +1282,25 @@ mod tests {
             retry_after: None,
         }
         .into();
-        assert_eq!(retry_delay(2, &e), backoff_delay(2));
+        // backoff_delay() draws jitter from the current instant, so two independent calls
+        // aren't bit-for-bit equal — assert the result lands in backoff_delay(2)'s known range
+        // (base 2000ms, jitter up to 1000ms) instead of comparing against a second live call.
+        let delay = retry_delay(2, &e);
+        assert!(
+            delay >= Duration::from_millis(2000) && delay < Duration::from_millis(3000),
+            "expected retry_delay to fall back to backoff_delay(2)'s ~2000-3000ms range, got {delay:?}"
+        );
     }
 
     #[test]
     fn retry_delay_falls_back_to_backoff_for_a_non_http_error() {
         let e = anyhow!("some transport failure that isn't an HttpError");
-        assert_eq!(retry_delay(1, &e), backoff_delay(1));
+        // base 1000ms, jitter up to 500ms — see the note above.
+        let delay = retry_delay(1, &e);
+        assert!(
+            delay >= Duration::from_millis(1000) && delay < Duration::from_millis(1500),
+            "expected retry_delay to fall back to backoff_delay(1)'s ~1000-1500ms range, got {delay:?}"
+        );
     }
 
     #[test]
