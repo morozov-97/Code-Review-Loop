@@ -198,6 +198,40 @@ fn verify_supersedes(
     results
 }
 
+/// #174: `corroborate()` only ever overrides an LLM-said-FIXED verdict, always to the same
+/// UNKNOWN status, for exactly these two conditions (file untouched this round; original
+/// evidence still present verbatim). Deciding them here, before the LLM call, means those
+/// findings never need to go over the wire at all — the LLM only sees the genuinely ambiguous
+/// remainder. The one thing this gives up: the (rare) case where the LLM would have found a
+/// valid SUPERSEDED for one of these via this round's newly confirmed findings — corroborate()
+/// never protected that case anyway (it only touches FIXED), so nothing already-safe regresses.
+fn locally_resolvable(
+    finding: &Finding,
+    diff: &str,
+    changed_files: &[String],
+) -> Option<FixStatus> {
+    if !changed_files.iter().any(|f| f == &finding.file) {
+        return Some(FixStatus {
+            finding_id: finding.id.clone(),
+            status: "UNKNOWN".to_string(),
+            evidence: format!(
+                "{} isn't part of this round's diff at all — resolved locally without an LLM call",
+                finding.file
+            ),
+            superseded_by: String::new(),
+        });
+    }
+    if evidence_still_present(&finding.evidence, diff) {
+        return Some(FixStatus {
+            finding_id: finding.id.clone(),
+            status: "UNKNOWN".to_string(),
+            evidence: "original evidence is still present verbatim in the new diff — resolved locally without an LLM call".to_string(),
+            superseded_by: String::new(),
+        });
+    }
+    None
+}
+
 fn build_task(list: &str, this_round: &str) -> String {
     let this_round_block = if this_round.is_empty() {
         "(none)".to_string()
@@ -235,35 +269,48 @@ pub fn run(
     if prior_confirmed.is_empty() {
         return Ok(Vec::new());
     }
-    let list = prior_confirmed
-        .iter()
-        .map(|f| {
-            format!(
-                "- id={} | {}:{} | {}\n  evidence: {}",
-                f.id, f.file, f.line, f.claim, f.evidence
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let this_round = this_round_confirmed
-        .iter()
-        .map(|f| {
-            format!(
-                "- id={} | {}:{} | {}\n  evidence: {}",
-                f.id, f.file, f.line, f.claim, f.evidence
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let ctx = shared_context(spec, input);
-    let task = build_task(&list, &this_round);
-    let mut out: FixCheckOutput = llm
-        .json_ctx_typed(Some(&ctx), &task, Some(FIXCHECK_SYSTEM))
-        .context("fix check failed")?;
-    for r in out.results.iter_mut() {
-        r.status = normalize_status(&r.status);
+    // #174: only findings locally_resolvable() can't already decide go to the LLM — see its doc
+    // comment for exactly which two cases are resolved without a call.
+    let mut results: Vec<FixStatus> = Vec::new();
+    let mut remaining: Vec<&Finding> = Vec::new();
+    for f in prior_confirmed {
+        match locally_resolvable(f, &input.diff, &input.changed_files) {
+            Some(status) => results.push(status),
+            None => remaining.push(f),
+        }
     }
-    let results = fill_missing_as_still_open(out.results, prior_confirmed);
+    if !remaining.is_empty() {
+        let list = remaining
+            .iter()
+            .map(|f| {
+                format!(
+                    "- id={} | {}:{} | {}\n  evidence: {}",
+                    f.id, f.file, f.line, f.claim, f.evidence
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let this_round = this_round_confirmed
+            .iter()
+            .map(|f| {
+                format!(
+                    "- id={} | {}:{} | {}\n  evidence: {}",
+                    f.id, f.file, f.line, f.claim, f.evidence
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ctx = shared_context(spec, input);
+        let task = build_task(&list, &this_round);
+        let mut out: FixCheckOutput = llm
+            .json_ctx_typed(Some(&ctx), &task, Some(FIXCHECK_SYSTEM))
+            .context("fix check failed")?;
+        for r in out.results.iter_mut() {
+            r.status = normalize_status(&r.status);
+        }
+        results.extend(out.results);
+    }
+    let results = fill_missing_as_still_open(results, prior_confirmed);
     let results = verify_supersedes(results, prior_confirmed, this_round_confirmed);
     Ok(corroborate(
         results,
@@ -481,6 +528,79 @@ mod tests {
         r.superseded_by = "b".to_string();
         let out = verify_supersedes(vec![r], &prior, &this_round);
         assert_eq!(out[0].status, "SUPERSEDED");
+    }
+
+    // --- #174: locally_resolvable() / run()'s LLM-skip path ---
+
+    #[test]
+    fn locally_resolvable_returns_unknown_when_the_file_is_not_in_this_rounds_diff() {
+        let f = finding("a", "unsafe { *ptr }");
+        let diff = "diff --git a/src/other.rs b/src/other.rs\n+something unrelated\n";
+        let out = locally_resolvable(&f, diff, &["src/other.rs".to_string()])
+            .expect("an untouched file must resolve locally");
+        assert_eq!(out.status, "UNKNOWN");
+        assert!(out.evidence.contains("isn't part of this round's diff"));
+    }
+
+    #[test]
+    fn locally_resolvable_returns_unknown_when_evidence_is_still_present_verbatim() {
+        let f = finding("a", "unsafe { *ptr }");
+        let diff = "context\nunsafe { *ptr }\nmore context";
+        let out = locally_resolvable(&f, diff, &["src/x.rs".to_string()])
+            .expect("unchanged evidence must resolve locally");
+        assert_eq!(out.status, "UNKNOWN");
+        assert!(out
+            .evidence
+            .contains("resolved locally without an LLM call"));
+    }
+
+    #[test]
+    fn locally_resolvable_returns_none_when_the_file_changed_and_evidence_is_gone() {
+        // A genuinely ambiguous case — the file was touched, the flagged evidence is no longer
+        // there verbatim, but whether it's actually fixed (vs. just refactored around) needs
+        // real judgment. Must still go to the LLM.
+        let f = finding("a", "unsafe { *ptr }");
+        let diff = "context\nlet v = safe_accessor();\nmore context";
+        assert!(locally_resolvable(&f, diff, &["src/x.rs".to_string()]).is_none());
+    }
+
+    fn test_spec() -> Spec {
+        Spec {
+            name: "test".to_string(),
+            context: String::new(),
+            lenses: Vec::new(),
+            deterministic_checks: Vec::new(),
+            labels: vec!["bug".to_string()],
+            diff_size_limit: 0,
+            test_path_patterns: Vec::new(),
+            doc_path_patterns: Vec::new(),
+            ignored_path_patterns: Vec::new(),
+            scoring: Default::default(),
+        }
+    }
+
+    #[test]
+    fn run_never_calls_the_llm_when_every_prior_finding_resolves_locally() {
+        let prior = vec![finding("a", "unsafe { *ptr }")];
+        let input = Input {
+            // Doesn't touch src/x.rs at all, so the only prior finding resolves via the
+            // untouched-file branch — if run() called the LLM anyway, the empty fixture below
+            // would return an Err and this test would fail.
+            diff: "diff --git a/src/other.rs b/src/other.rs\n+unrelated\n".to_string(),
+            changed_files: vec!["src/other.rs".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![], 0, usage);
+        let out = run(&llm, &test_spec(), &input, &prior, &[])
+            .expect("must succeed without making any LLM call");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, "UNKNOWN");
     }
 
     #[test]

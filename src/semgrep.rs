@@ -1,5 +1,10 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+/// #169: a generous default for callers (like the CLI's automatic semgrep detection) that don't
+/// have a more specific deadline of their own to bound this by.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// If semgrep is on PATH, run it against the changed files and convert the output into
 /// deterministic_results form. Returns None if it's missing or execution/parsing fails — the
@@ -27,7 +32,14 @@ fn build_args<'a>(existing: &[&'a str]) -> Vec<&'a str> {
     args
 }
 
-pub fn try_run(changed_files: &[String]) -> Option<serde_json::Value> {
+/// #169: this used to be a synchronous `.output()` call with no timeout at all — a hang (e.g. a
+/// slow first-run rule pull under `--config=auto`) blocked the whole review indefinitely,
+/// regardless of `--deadline-minutes`, even though nothing in the LLM context actually depends
+/// on this result (only `quantify::deterministic_gate`, at the very end of the pipeline, reads
+/// it) — the caller is expected to run this in the background and only join it there. On
+/// timeout, same as every other failure path here: falls back to NOT_RUN rather than fabricating
+/// a guessed result.
+pub fn try_run(changed_files: &[String], timeout: Duration) -> Option<serde_json::Value> {
     let bin = which("semgrep")?;
     let existing: Vec<&str> = changed_files
         .iter()
@@ -38,12 +50,60 @@ pub fn try_run(changed_files: &[String]) -> Option<serde_json::Value> {
         return None;
     }
 
-    let output = Command::new(&bin)
+    let child = Command::new(&bin)
         .args(build_args(&existing))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .ok()?;
+    let output = wait_with_timeout(child, timeout)?;
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     build_deterministic_results(output.status.success(), output.status.code(), &v)
+}
+
+/// Drains stdout/stderr on separate threads before polling starts (prevents the child from
+/// blocking on a full pipe — same deadlock-avoidance reasoning as `llm.rs`'s wait_with_timeout),
+/// then polls with `try_wait()` and kills on timeout. Returns None on timeout or any I/O error —
+/// callers here already treat every failure mode identically (fall back to NOT_RUN).
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stdout_pipe {
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stderr_pipe {
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+        }
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    Some(std::process::Output {
+        status,
+        stdout: stdout_handle.join().ok()?,
+        stderr: stderr_handle.join().ok()?,
+    })
 }
 
 /// #144: split out of `try_run` so the exit-status/errors-array handling can be unit tested
@@ -140,6 +200,38 @@ fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // --- #169: wait_with_timeout() ---
+
+    #[test]
+    fn wait_with_timeout_returns_output_when_process_finishes_in_time() {
+        let child = Command::new("sh")
+            .args(["-c", "echo hi"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = wait_with_timeout(child, Duration::from_secs(5)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    #[test]
+    fn wait_with_timeout_kills_and_returns_none_when_the_process_hangs() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let out = wait_with_timeout(child, Duration::from_millis(300));
+        assert!(out.is_none(), "a hanging process must time out to None");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return promptly around the timeout, not wait for the full sleep"
+        );
+    }
 
     // --- build_deterministic_results() ---
 

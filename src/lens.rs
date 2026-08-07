@@ -1,6 +1,6 @@
 use crate::input::Input;
 use crate::llm::Llm;
-use crate::promptctx::shared_context;
+use crate::promptctx::{selection_context, shared_context};
 use crate::spec::{Lens, Spec};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,10 @@ pub struct LensOutput {
     /// essentially a no-op that still happened to parse" (see `is_degenerate`).
     #[serde(default)]
     pub summary: String,
+    /// #174: only populated when this lens is `GOOD_THINGS_HOST_LENS` — folded in here instead
+    /// of being a fully separate always-on lens/call (see that constant's doc comment).
+    #[serde(default)]
+    pub good_things: Vec<GoodThing>,
 }
 
 impl LensOutput {
@@ -124,11 +128,12 @@ pub struct GoodThing {
     pub why: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GoodThingsOutput {
-    #[serde(default)]
-    pub good_things: Vec<GoodThing>,
-}
+/// #174: good_things used to be a fully separate always-on lens with its own dedicated
+/// full-context LLM call (`review_good_things`, removed) — it doesn't affect score or verdict,
+/// so paying for a whole extra round trip just to collect supplementary praise wasn't worth it.
+/// Folded into this lens's own output instead: `review_lens` asks for `good_things` in the same
+/// response as findings/unverified/summary when `lens_id == GOOD_THINGS_HOST_LENS`.
+pub const GOOD_THINGS_HOST_LENS: &str = "functionality";
 
 /// For a lens with a persona set, prepend the character identity to the front of the system
 /// prompt (to suppress conformity/sycophancy).
@@ -169,9 +174,13 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let ctx = shared_context(spec, input);
+    // #173 (partial): selection only needs to decide WHICH lenses fit, not review the diff
+    // itself — selection_context sends the changed-file list/stats instead of the full diff
+    // (see its doc comment for the tradeoff this makes). Each selected lens's own review call
+    // still gets shared_context's full diff.
+    let ctx = selection_context(spec, input);
     let task = format!(
-        "# Task\nChoose 1-3 review lenses that fit the nature of the diff below (no swapping after selection).\n\n\
+        "# Task\nChoose 1-3 review lenses that fit the nature of the change described below (no swapping after selection).\n\n\
          ## Candidate lenses\n{catalog}\n\n\
          ## Output (JSON only)\n{{\"selected\":[\"id\", ...]}}\n",
         catalog = catalog
@@ -213,7 +222,23 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
     Ok(valid)
 }
 
-fn build_review_task(spec: &Spec, lens_title: &str, lens_guide: &str) -> String {
+fn build_review_task(
+    spec: &Spec,
+    lens_title: &str,
+    lens_guide: &str,
+    host_good_things: bool,
+) -> String {
+    let good_things_field = if host_good_things {
+        ",\"good_things\":[{\"file_line\":\"file:line\",\"practice\":\"...\",\"why\":\"...\"}]"
+    } else {
+        ""
+    };
+    let good_things_instructions = if host_good_things {
+        "\n- Alongside defects, also note concrete implementations worth keeping in \
+         good_things (empty array if none) — do not manufacture praise without evidence."
+    } else {
+        ""
+    };
     format!(
         "# Task\nReview the diff below independently from the \"{lens_title}\" perspective (do not reference other reviewers' results).\n\n\
          ## This lens's focus\n{lens_guide}\n\n\
@@ -223,12 +248,12 @@ fn build_review_task(spec: &Spec, lens_title: &str, lens_guide: &str) -> String 
          - label must be exactly one of: {labels}\n\n\
          - summary is required even when findings is empty: one sentence on what you actually\n\
          looked at and whether you found anything, so an empty findings array is distinguishable\n\
-         from a response that didn't engage with the diff at all.\n\n\
+         from a response that didn't engage with the diff at all.{good_things_instructions}\n\n\
          ## Output (JSON only, no code fences)\n\
          {{\"findings\":[{{\"file\":\"...\",\"line\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\
          \"impact\":\"...\",\"severity\":\"P0|P1|P2|P3\",\"label\":<one of the allowed values>,\
          \"confidence\":\"high|medium|low\",\"recommendation\":\"...\"}}],\"unverified\":[\"...\"],\
-         \"summary\":\"...\"}}\n",
+         \"summary\":\"...\"{good_things_field}}}\n",
         lens_title = lens_title,
         lens_guide = lens_guide,
         labels = spec.labels_prompt(),
@@ -260,7 +285,8 @@ pub fn review_lens(
     // separately from task (the lens-specific instructions) so the OpenRouter backend can
     // cache it as its own block.
     let ctx = shared_context(spec, input);
-    let task = build_review_task(spec, &lens.title, &lens.guide);
+    let host_good_things = lens_id == GOOD_THINGS_HOST_LENS;
+    let task = build_review_task(spec, &lens.title, &lens.guide, host_good_things);
     let system = persona_system(lens);
     let mut out: LensOutput = llm
         .json_ctx_typed(Some(&ctx), &task, Some(&system))
@@ -279,25 +305,6 @@ pub fn review_lens(
             f.line = unknown();
         }
     }
-    Ok(out)
-}
-
-const GOOD_THINGS_GUIDE: &str =
-    "Find concrete implementations worth keeping. Do not manufacture praise without evidence.";
-
-pub fn review_good_things(llm: &Llm, spec: &Spec, input: &Input) -> Result<GoodThingsOutput> {
-    let ctx = shared_context(spec, input);
-    let task = format!(
-        "# Task\nFind good implementations in the diff below that are worth keeping.\n\n\
-         ## This lens's focus\n{guide}\n\n\
-         ## Output (JSON only, no code fences)\n\
-         {{\"good_things\":[{{\"file_line\":\"file:line\",\"practice\":\"...\",\"why\":\"...\"}}]}}\n\
-         If there is no concrete implementation to cite as evidence, return good_things as an empty array.\n",
-        guide = GOOD_THINGS_GUIDE,
-    );
-    let out: GoodThingsOutput = llm
-        .json_ctx_typed(Some(&ctx), &task, Some(LENS_SYSTEM))
-        .context("Good Things lens failed")?;
     Ok(out)
 }
 

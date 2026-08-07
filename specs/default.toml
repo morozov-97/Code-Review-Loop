@@ -23,6 +23,9 @@ ignored_path_patterns = [".github/workflows/", "Cargo.lock", "package-lock.json"
 labels = ["security", "possible bug", "possible issue", "performance", "enhancement", "best practice", "maintainability", "typo"]
 
 [[lenses]]
+# #174: this lens also collects good_things (see lens::GOOD_THINGS_HOST_LENS) — it used to be a
+# separate always-on "good_things" lens with its own dedicated full-context LLM call, which cost
+# a whole extra round trip for information that doesn't affect score/verdict.
 id = "functionality"
 title = "Functionality"
 guide = "Does the code work as the author intended, and in a way that's actually good for the user? Look at edge cases, concurrency, and user-facing errors."
@@ -30,15 +33,6 @@ always = true
 tier = "generalist"
 persona_name = "Generalist Reviewer"
 persona_voice = "Balances overall completeness with meeting requirements. Does not favor any particular school of thought."
-
-[[lenses]]
-id = "good_things"
-title = "Good Things"
-guide = "Finds concrete implementations worth keeping."
-always = true
-tier = "generalist"
-persona_name = "Generalist Reviewer"
-persona_voice = "Focuses on finding what's worth preserving rather than criticizing. Avoids praise without justification."
 
 [[lenses]]
 id = "design"

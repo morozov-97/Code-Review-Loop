@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -35,13 +35,75 @@ pub enum Provider {
     },
     OpenRouter {
         api_key: String,
+        agent: Arc<ureq::Agent>,
     },
     Custom {
         base_url: String,
         api_key: Option<String>,
+        agent: Arc<ureq::Agent>,
     },
     #[cfg(test)]
     Fixture(Arc<Mutex<std::collections::VecDeque<String>>>),
+}
+
+/// #171: shared across every call an `Llm` instance makes (previously, `call_openai_compatible`
+/// built a fresh `ureq::Agent` on every single call), so a run's 5-13+ logical LLM calls reuse
+/// the same underlying connection pool instead of paying TLS/TCP setup each time. No
+/// `timeout_global` set here — that stays per-request (via `RequestBuilder::config()` in
+/// `call_openai_compatible`), since different calls in the same run can have different effective
+/// timeouts once a `--deadline-minutes` budget is shrinking; ureq 3's request-level config
+/// override makes that possible on a shared agent instead of needing one agent per timeout value.
+fn new_http_agent() -> Arc<ureq::Agent> {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build();
+    Arc::new(config.into())
+}
+
+/// #166: bounds the total number of simultaneous LLM calls across every call site — lens
+/// `par_map` workers, and (once other call sites overlap too, see #168/#170) lens selection,
+/// requirements, human_voice — instead of each call site's own thread count, which undercounts
+/// real total in-flight requests once more than one site can be active at the same time. Share
+/// one `Arc<CallGate>` across every `Llm` instance in a run (main model and cheap model both) via
+/// [`Llm::with_gate`] to get a real global cap, not just a per-stage worker-count limit.
+#[derive(Debug)]
+pub struct CallGate {
+    max: usize,
+    state: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl CallGate {
+    pub fn new(max: usize) -> Arc<Self> {
+        Arc::new(CallGate {
+            max: max.max(1),
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> GatePermit {
+        let mut n = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= self.max {
+            n = self.cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        GatePermit {
+            gate: Arc::clone(self),
+        }
+    }
+}
+
+struct GatePermit {
+    gate: Arc<CallGate>,
+}
+
+impl Drop for GatePermit {
+    fn drop(&mut self) {
+        let mut n = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.gate.cv.notify_one();
+    }
 }
 
 /// Cumulative token/cost usage. If multiple Llm instances (e.g. main model + cheap model) share
@@ -85,6 +147,7 @@ struct CallUsage {
     cost_usd: f64,
 }
 
+#[derive(Debug)]
 struct CallResult {
     text: String,
     usage: CallUsage,
@@ -100,6 +163,15 @@ pub struct Llm {
     /// #119: an overall deadline (see `with_deadline`) — None means each call always gets its
     /// full per-call timeout, unchanged from before this field existed.
     deadline: Option<Instant>,
+    /// #166: None means uncapped (existing behavior, unchanged) — set via `with_gate`.
+    gate: Option<Arc<CallGate>>,
+    /// #175: sent as `max_tokens` on OpenAI-compatible requests (OpenRouter/Custom) — None
+    /// means no cap is sent (existing behavior, unchanged). Ignored by the claude-cli backend.
+    max_output_tokens: Option<u32>,
+    /// #175: hard ceiling on total provider calls (shared `usage.calls` — main and cheap model
+    /// combined when they share a usage tracker) — None means uncapped (existing behavior,
+    /// unchanged).
+    max_calls: Option<u64>,
 }
 
 /// An HTTP-ish failure that carries its status code as data, not just baked into a message
@@ -108,6 +180,11 @@ pub struct Llm {
 struct HttpError {
     code: u16,
     body: String,
+    /// #171: parsed from the response's Retry-After header when present (seconds form only —
+    /// the HTTP-date form isn't handled, same effect as if the header were absent). Previously
+    /// the response headers weren't captured at all, so even a well-behaved 429 that specified
+    /// exactly how long to wait got the same generic exponential backoff as any other retry.
+    retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for HttpError {
@@ -118,6 +195,24 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// #175: a distinct marker (rather than a plain `anyhow!(...)` string) so `is_retryable`
+/// classifies a call-budget refusal as permanent — retrying it burns backoff sleeps for no
+/// reason since `usage.calls` isn't going to shrink between attempts.
+#[derive(Debug)]
+struct CallBudgetExceeded(u64);
+
+impl std::fmt::Display for CallBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider call budget exceeded ({} calls) — raise --max-provider-calls if this run genuinely needs more",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CallBudgetExceeded {}
+
 /// #119: retries used to treat every failure identically — a permanent 401 (bad API key) got
 /// the same "retry `--retries` more times" treatment as a transient 429/5xx, wasting the whole
 /// retry budget on something no amount of retrying fixes. Only downgrades the clear-cut case
@@ -126,6 +221,9 @@ impl std::error::Error for HttpError {}
 /// as before. Defaulting unclassified errors to "retryable" is the safe direction: at worst it
 /// costs one extra wasted attempt, never skips a retry that might have succeeded.
 fn is_retryable(e: &anyhow::Error) -> bool {
+    if e.downcast_ref::<CallBudgetExceeded>().is_some() {
+        return false;
+    }
     match e.downcast_ref::<HttpError>() {
         Some(HttpError { code, .. }) => *code == 429 || *code >= 500,
         None => true,
@@ -149,6 +247,34 @@ fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + jitter_ms)
 }
 
+/// #171: a 429 with an explicit Retry-After takes priority over the generic exponential
+/// backoff — the provider is telling us exactly how long it wants, and guessing shorter than
+/// that just produces another 429 tomorrow, no wiser than today.
+fn retry_delay(attempt: u32, error: &anyhow::Error) -> Duration {
+    match error.downcast_ref::<HttpError>() {
+        Some(HttpError {
+            retry_after: Some(d),
+            ..
+        }) => *d,
+        _ => backoff_delay(attempt),
+    }
+}
+
+/// #171: a schema/parse failure isn't a transient server problem — the model made a mistake in
+/// its own output, and resending the identical prompt tends to just reproduce it. Builds a
+/// follow-up task that includes the prior bad response and the specific validation error, so the
+/// model has something concrete to correct instead of guessing again from scratch.
+fn build_repair_task(original_task: &str, bad_response: &str, error: &anyhow::Error) -> String {
+    format!(
+        "{original_task}\n\n\
+         ## Your previous response failed schema validation\n\
+         Previous response:\n{prev}\n\n\
+         Validation error: {error}\n\n\
+         Fix the JSON to match the schema exactly and respond with corrected JSON only — no code fences, no commentary.",
+        prev = truncate(bad_response, 2000),
+    )
+}
+
 impl Llm {
     /// Share this across multiple Llm instances to track aggregated usage for the whole run.
     pub fn new_usage_tracker() -> Arc<Mutex<Usage>> {
@@ -169,6 +295,9 @@ impl Llm {
             verbose,
             usage,
             deadline: None,
+            gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         }
     }
 
@@ -183,12 +312,18 @@ impl Llm {
             "OPENROUTER_API_KEY environment variable not set (export OPENROUTER_API_KEY=...)",
         )?;
         Ok(Llm {
-            provider: Provider::OpenRouter { api_key },
+            provider: Provider::OpenRouter {
+                api_key,
+                agent: new_http_agent(),
+            },
             model: Some(model.unwrap_or_else(|| OPENROUTER_DEFAULT_MODEL.to_string())),
             retries,
             verbose,
             usage,
             deadline: None,
+            gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         })
     }
 
@@ -206,12 +341,19 @@ impl Llm {
         usage: Arc<Mutex<Usage>>,
     ) -> Self {
         Llm {
-            provider: Provider::Custom { base_url, api_key },
+            provider: Provider::Custom {
+                base_url,
+                api_key,
+                agent: new_http_agent(),
+            },
             model: Some(model),
             retries,
             verbose,
             usage,
             deadline: None,
+            gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         }
     }
 
@@ -227,6 +369,9 @@ impl Llm {
             verbose: false,
             usage,
             deadline: None,
+            gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         }
     }
 
@@ -243,6 +388,27 @@ impl Llm {
     /// real wall-clock bound instead of only a between-stage checkpoint.
     pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// #166: share the same `Arc<CallGate>` across every `Llm` instance in a run (main model and
+    /// cheap model both — `backend_factory::build_llm` does this) to cap real total in-flight
+    /// calls, not just one call site's own thread count.
+    pub fn with_gate(mut self, gate: Option<Arc<CallGate>>) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// #175: applies to OpenAI-compatible backends only (OpenRouter/Custom) — see the field's
+    /// doc comment.
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// #175: checked in call_once before every provider call — see the field's doc comment.
+    pub fn with_max_calls(mut self, max_calls: Option<u64>) -> Self {
+        self.max_calls = max_calls;
         self
     }
 
@@ -290,6 +456,18 @@ impl Llm {
     }
 
     fn call_once(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
+        // #175: checked before acquiring a gate permit or making any actual call — a
+        // misconfigured invocation (e.g. --lenses listing every optional lens) hits this and
+        // fails fast instead of burning the provider call anyway.
+        if let Some(max) = self.max_calls {
+            let current = self.usage.lock().unwrap_or_else(|e| e.into_inner()).calls;
+            if current >= max {
+                return Err(CallBudgetExceeded(max).into());
+            }
+        }
+        // #166: held for the whole call (network round trip or subprocess) — dropped at the end
+        // of this function, freeing the slot for the next waiting caller.
+        let _permit = self.gate.as_ref().map(|g| g.acquire());
         match &self.provider {
             Provider::ClaudeCli { bin } => call_claude(
                 bin,
@@ -299,7 +477,8 @@ impl Llm {
                 system,
                 self.effective_timeout(CLAUDE_CLI_TIMEOUT),
             ),
-            Provider::OpenRouter { api_key } => call_openai_compatible(
+            Provider::OpenRouter { api_key, agent } => call_openai_compatible(
+                agent,
                 OPENROUTER_URL,
                 Some(api_key),
                 self.model.as_deref(),
@@ -307,8 +486,14 @@ impl Llm {
                 task,
                 system,
                 self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
+                self.max_output_tokens,
             ),
-            Provider::Custom { base_url, api_key } => call_openai_compatible(
+            Provider::Custom {
+                base_url,
+                api_key,
+                agent,
+            } => call_openai_compatible(
+                agent,
                 base_url,
                 api_key.as_deref(),
                 self.model.as_deref(),
@@ -316,6 +501,7 @@ impl Llm {
                 task,
                 system,
                 self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
+                self.max_output_tokens,
             ),
             #[cfg(test)]
             Provider::Fixture(queue) => {
@@ -374,7 +560,10 @@ impl Llm {
                 break;
             }
             if attempt < self.retries {
-                self.deadline_aware_sleep(backoff_delay(attempt));
+                let delay = last
+                    .as_ref()
+                    .map_or_else(|| backoff_delay(attempt), |e| retry_delay(attempt, e));
+                self.deadline_aware_sleep(delay);
             }
         }
         Err(last.unwrap_or_else(|| anyhow!("unknown failure")))
@@ -404,8 +593,19 @@ impl Llm {
         system: Option<&str>,
     ) -> Result<T> {
         let mut last: Option<anyhow::Error> = None;
+        // #171: retries used to treat a transport failure and a schema-mismatched response
+        // identically — resend the exact same ctx/task and sleep an exponential backoff either
+        // way. A schema failure isn't a transient server problem, so backoff doesn't help it,
+        // and resending an unmodified prompt tends to just reproduce the same mistake. At most
+        // one attempt (not the whole --retries budget) becomes a targeted repair instead: same
+        // ctx, but the task is augmented with the prior bad response and the specific validation
+        // error. If the repair itself still fails, any remaining attempts fall back to a plain
+        // resend with normal backoff, same as before — this doesn't add attempts beyond
+        // self.retries, it only changes what a schema-failure retry looks like.
+        let mut current_task: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(task);
+        let mut repair_used = false;
         for attempt in 0..=self.retries {
-            let raw = match self.call_once(ctx, task, system) {
+            let raw = match self.call_once(ctx, &current_task, system) {
                 Ok(r) => {
                     self.record_usage(&r.usage);
                     r.text
@@ -414,30 +614,21 @@ impl Llm {
                     // #119: same permanent-vs-transient distinction as text_ctx — a classified
                     // 401/403 here won't succeed on retry no matter how many attempts remain.
                     let retryable = is_retryable(&e);
-                    last = Some(e);
                     if self.verbose {
-                        match last.as_ref() {
-                            Some(error) => {
-                                eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries)
-                            }
-                            None => {
-                                eprintln!(
-                                    "[json retry {}/{}] unknown json retry error",
-                                    attempt + 1,
-                                    self.retries
-                                );
-                            }
-                        }
+                        eprintln!("[json retry {}/{}] {e}", attempt + 1, self.retries);
                     }
                     if !retryable {
+                        last = Some(e);
                         break;
                     }
                     if self.deadline_passed() {
+                        last = Some(e);
                         break;
                     }
                     if attempt < self.retries {
-                        self.deadline_aware_sleep(backoff_delay(attempt));
+                        self.deadline_aware_sleep(retry_delay(attempt, &e));
                     }
+                    last = Some(e);
                     continue;
                 }
             };
@@ -447,27 +638,30 @@ impl Llm {
             match parsed {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    last = Some(e);
                     if self.verbose {
-                        match last.as_ref() {
-                            Some(error) => {
-                                eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries)
-                            }
-                            None => {
-                                eprintln!(
-                                    "[json retry {}/{}] unknown json retry error",
-                                    attempt + 1,
-                                    self.retries
-                                );
-                            }
-                        }
+                        eprintln!("[json retry {}/{}] {e}", attempt + 1, self.retries);
                     }
                     if self.deadline_passed() {
+                        last = Some(e);
                         break;
                     }
                     if attempt < self.retries {
-                        self.deadline_aware_sleep(backoff_delay(attempt));
+                        if !repair_used {
+                            repair_used = true;
+                            current_task =
+                                std::borrow::Cow::Owned(build_repair_task(task, &raw, &e));
+                            // No backoff sleep here: a schema mistake isn't a rate-limit or
+                            // server-load problem, so there's nothing gained by waiting before
+                            // the model gets a chance to correct it.
+                        } else {
+                            // Repair already attempted once and still failed — fall back to a
+                            // plain resend (original task, normal backoff) for any remaining
+                            // budget rather than compounding repair attempts.
+                            current_task = std::borrow::Cow::Borrowed(task);
+                            self.deadline_aware_sleep(backoff_delay(attempt));
+                        }
                     }
+                    last = Some(e);
                 }
             }
         }
@@ -655,7 +849,9 @@ fn supports_prompt_caching(model: &str) -> bool {
 /// cache_control(ephemeral) attached — an optimization aiming for cache hits when the same ctx
 /// is called repeatedly (e.g. per-lens reviews). Otherwise, sends a single-string content as
 /// before.
+#[allow(clippy::too_many_arguments)]
 fn call_openai_compatible(
+    agent: &ureq::Agent,
     url: &str,
     api_key: Option<&str>,
     model: Option<&str>,
@@ -663,6 +859,7 @@ fn call_openai_compatible(
     task: &str,
     system: Option<&str>,
     timeout: Duration,
+    max_output_tokens: Option<u32>,
 ) -> Result<CallResult> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(s) = system {
@@ -685,21 +882,34 @@ fn call_openai_compatible(
     };
     messages.push(serde_json::json!({"role": "user", "content": user_content}));
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": resolved_model,
         "messages": messages,
+        // #175: opts into OpenRouter's extended usage accounting (cost, and potentially
+        // provider-reported cache token counts) — without this, those fields are omitted from
+        // the response entirely on OpenRouter. An endpoint that doesn't recognize this field
+        // (e.g. some Custom/self-hosted backends) should just ignore the extra top-level key.
+        "usage": {"include": true},
     });
+    // #175: previously no output cap was sent at all — a verbose response had nothing bounding
+    // its length beyond whatever the provider defaults to.
+    if let Some(max) = max_output_tokens {
+        body["max_tokens"] = serde_json::json!(max);
+    }
 
-    // ureq 3.x: AgentBuilder was replaced by Config/ConfigBuilder. http_status_as_error(false)
-    // makes 4xx/5xx come back as Ok(response) instead of Err, so we can still include both the
-    // status code and body in our own error message as before (with the default, you'd get only
-    // an Err with no body, unable to read it).
-    let config = ureq::Agent::config_builder()
+    // #171: timeout is set per-request (via RequestBuilder::config()), not on the agent itself
+    // — `agent` is shared and reused across every call this Llm instance makes (built once in
+    // new_http_agent), while `timeout` varies call to call as --deadline-minutes shrinks.
+    // http_status_as_error(false) (set once, at agent construction) makes 4xx/5xx come back as
+    // Ok(response) instead of Err, so we can still include both the status code and body in our
+    // own error message as before (with the default, you'd get only an Err with no body, unable
+    // to read it).
+    let mut req = agent
+        .post(url)
+        .config()
         .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .build();
-    let agent: ureq::Agent = config.into();
-    let mut req = agent.post(url).header("Content-Type", "application/json");
+        .build()
+        .header("Content-Type", "application/json");
     if let Some(key) = api_key {
         req = req.header("Authorization", &format!("Bearer {key}"));
     }
@@ -708,6 +918,16 @@ fn call_openai_compatible(
     let mut resp = result.map_err(|e| anyhow!("openrouter call failed: {e}"))?;
     if !resp.status().is_success() {
         let code = resp.status().as_u16();
+        // #171: previously the response headers weren't captured at all — a 429 with an
+        // explicit Retry-After got the same generic exponential backoff as any other retry.
+        // Seconds form only; the HTTP-date form of the header falls back to None (same effect
+        // as if the header were absent, not an error).
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
         let body_text = resp.body_mut().read_to_string().unwrap_or_default();
         // #119: HttpError carries the status code through as a typed error (instead of only
         // baking it into a string) so the retry loop can tell a permanent 401/403 apart from a
@@ -715,6 +935,7 @@ fn call_openai_compatible(
         return Err(HttpError {
             code,
             body: truncate(&body_text, 400),
+            retry_after,
         }
         .into());
     }
@@ -736,7 +957,7 @@ fn call_openai_compatible(
             )
         })?;
 
-    // OpenAI-compatible usage schema (prompt_tokens/completion_tokens). cost is absent from the response, so it's left at 0.
+    // OpenAI-compatible usage schema (prompt_tokens/completion_tokens).
     let usage_obj = v.get("usage");
     let get_u64 = |key: &str| {
         usage_obj
@@ -744,14 +965,32 @@ fn call_openai_compatible(
             .and_then(|x| x.as_u64())
             .unwrap_or(0)
     };
+    // #175: best-effort — OpenRouter's cache/cost reporting isn't uniformly documented across
+    // every provider it proxies, and this hasn't been validated against real traffic for every
+    // shape it might take. Tries a couple of known field shapes (Anthropic-style pass-through
+    // for cache tokens, OpenAI-style nested `prompt_tokens_details` for the read side) and
+    // defaults to 0 either way if none match — same fallback as before, just no longer
+    // hardcoded to 0 unconditionally.
+    let cache_read_tokens = get_u64("cache_read_input_tokens").max(
+        usage_obj
+            .and_then(|u| u.get("prompt_tokens_details"))
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+    );
+    let cache_creation_tokens = get_u64("cache_creation_input_tokens");
+    let cost_usd = usage_obj
+        .and_then(|u| u.get("cost"))
+        .and_then(|c| c.as_f64())
+        .unwrap_or(0.0);
     Ok(CallResult {
         text: content.to_string(),
         usage: CallUsage {
             input_tokens: get_u64("prompt_tokens"),
             output_tokens: get_u64("completion_tokens"),
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            cost_usd: 0.0,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cost_usd,
         },
     })
 }
@@ -803,6 +1042,75 @@ mod tests {
 
     fn test_llm() -> Llm {
         Llm::fixture(vec![], 0, Llm::new_usage_tracker())
+    }
+
+    // --- #166: CallGate ---
+
+    #[test]
+    fn call_gate_never_lets_more_than_max_permits_be_held_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = CallGate::new(2);
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..6 {
+                let gate = Arc::clone(&gate);
+                let current = Arc::clone(&current);
+                let peak = Arc::clone(&peak);
+                s.spawn(move || {
+                    let _permit = gate.acquire();
+                    let n = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    current.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "never more than 2 permits held simultaneously"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "should actually allow up to its max, not be overly conservative"
+        );
+    }
+
+    #[test]
+    fn with_gate_none_leaves_calls_uncapped_same_as_before_the_field_existed() {
+        // A gate is opt-in — an Llm with no gate configured must behave exactly like before
+        // #166, with call_once never blocking on a permit.
+        let llm = test_llm();
+        assert!(llm.call_once(None, "task", None).is_err()); // fixture queue is empty — just proves this returns promptly, not hangs on a gate wait.
+    }
+
+    // --- #175: max_calls ---
+
+    #[test]
+    fn text_ctx_refuses_once_max_calls_is_reached_without_touching_the_provider() {
+        // Goes through text_ctx (not call_once directly) since record_usage — which the
+        // max_calls check reads from — is called by text_ctx/json_ctx_typed after a successful
+        // call_once, not by call_once itself.
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec!["a".to_string(), "b".to_string()], 0, usage.clone())
+            .with_max_calls(Some(1));
+        assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "a");
+        let err = llm
+            .text_ctx(None, "task", None)
+            .expect_err("must refuse the second call once max_calls(1) is reached");
+        assert!(err.to_string().contains("provider call budget exceeded"));
+        // The second fixture entry was never touched — proves the refusal happened before ever
+        // reaching the provider, not that the provider itself happened to fail.
+        assert_eq!(usage.lock().unwrap().calls, 1);
+    }
+
+    #[test]
+    fn text_ctx_is_uncapped_when_max_calls_is_none() {
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec!["a".to_string(), "b".to_string()], 0, usage);
+        assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "a");
+        assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "b");
     }
 
     #[test]
@@ -894,6 +1202,7 @@ mod tests {
             let e: anyhow::Error = HttpError {
                 code,
                 body: String::new(),
+                retry_after: None,
             }
             .into();
             assert!(is_retryable(&e), "{code} should be retryable");
@@ -906,6 +1215,7 @@ mod tests {
             let e: anyhow::Error = HttpError {
                 code,
                 body: String::new(),
+                retry_after: None,
             }
             .into();
             assert!(!is_retryable(&e), "{code} should not be retryable");
@@ -919,6 +1229,14 @@ mod tests {
         // always-retry behavior, since defaulting to "don't retry" would be the unsafe direction.
         let e = anyhow!("some other failure that isn't an HttpError");
         assert!(is_retryable(&e));
+    }
+
+    #[test]
+    fn is_retryable_treats_call_budget_exceeded_as_permanent() {
+        // #175: usage.calls isn't going to shrink between attempts, so retrying this just burns
+        // backoff sleeps for no reason.
+        let e: anyhow::Error = CallBudgetExceeded(3).into();
+        assert!(!is_retryable(&e));
     }
 
     #[test]
@@ -941,6 +1259,96 @@ mod tests {
             past_cap < at_cap * 2,
             "attempt 20's delay ({past_cap}ms) should be capped near attempt 6's ({at_cap}ms), not keep doubling"
         );
+    }
+
+    // --- #171: retry_delay() / build_repair_task() ---
+
+    #[test]
+    fn retry_delay_prefers_an_explicit_retry_after_over_the_generic_backoff() {
+        let e: anyhow::Error = HttpError {
+            code: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(7)),
+        }
+        .into();
+        assert_eq!(retry_delay(0, &e), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_backoff_when_no_retry_after_is_present() {
+        let e: anyhow::Error = HttpError {
+            code: 500,
+            body: String::new(),
+            retry_after: None,
+        }
+        .into();
+        // backoff_delay() draws jitter from the current instant, so two independent calls
+        // aren't bit-for-bit equal — assert the result lands in backoff_delay(2)'s known range
+        // (base 2000ms, jitter up to 1000ms) instead of comparing against a second live call.
+        let delay = retry_delay(2, &e);
+        assert!(
+            delay >= Duration::from_millis(2000) && delay < Duration::from_millis(3000),
+            "expected retry_delay to fall back to backoff_delay(2)'s ~2000-3000ms range, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_backoff_for_a_non_http_error() {
+        let e = anyhow!("some transport failure that isn't an HttpError");
+        // base 1000ms, jitter up to 500ms — see the note above.
+        let delay = retry_delay(1, &e);
+        assert!(
+            delay >= Duration::from_millis(1000) && delay < Duration::from_millis(1500),
+            "expected retry_delay to fall back to backoff_delay(1)'s ~1000-1500ms range, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn build_repair_task_includes_the_prior_response_and_the_validation_error() {
+        let e = anyhow!("missing field `finding_id`");
+        let task = build_repair_task("# Task\nDo the thing.", "{\"oops\": true}", &e);
+        assert!(task.contains("# Task\nDo the thing."));
+        assert!(task.contains("{\"oops\": true}"));
+        assert!(task.contains("missing field `finding_id`"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RepairTestOut {
+        ok: bool,
+    }
+
+    #[test]
+    fn json_ctx_typed_recovers_after_one_schema_failure_when_a_retry_is_available() {
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(
+            vec!["not json at all".to_string(), r#"{"ok":true}"#.to_string()],
+            1,
+            usage,
+        );
+        let out: RepairTestOut = llm
+            .json_ctx_typed(None, "task", None)
+            .expect("should recover via the repair attempt");
+        assert!(out.ok);
+    }
+
+    #[test]
+    fn json_ctx_typed_does_not_spend_a_repair_attempt_when_retries_is_zero() {
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(
+            vec!["not json at all".to_string(), r#"{"ok":true}"#.to_string()],
+            0,
+            usage,
+        );
+        let err = llm.json_ctx_typed::<RepairTestOut>(None, "task", None);
+        assert!(
+            err.is_err(),
+            "must fail outright — no repair budget available with retries=0"
+        );
+        // The second fixture entry must still be untouched — prove it by consuming it directly.
+        let second = llm
+            .call_once(None, "task", None)
+            .expect("second fixture entry must still be queued, unconsumed by a repair attempt");
+        assert_eq!(second.text, r#"{"ok":true}"#);
     }
 
     #[test]

@@ -48,10 +48,39 @@ fn deadline_exceeded(started: std::time::Instant, deadline_minutes: Option<u64>)
     }
 }
 
-type LensReviewResults = (
-    Vec<Result<(String, lens::LensOutput)>>,
-    Option<Result<lens::GoodThingsOutput>>,
-);
+/// #169: caps semgrep::DEFAULT_TIMEOUT at whatever's left of the overall --deadline-minutes
+/// budget, mirroring Llm::effective_timeout's same base.min(remaining).max(floor) shape — a
+/// background semgrep run shouldn't be able to eat the whole deadline on its own.
+fn semgrep_timeout(deadline: Option<std::time::Instant>) -> std::time::Duration {
+    match deadline {
+        None => semgrep::DEFAULT_TIMEOUT,
+        Some(d) => semgrep::DEFAULT_TIMEOUT
+            .min(d.saturating_duration_since(std::time::Instant::now()))
+            .max(std::time::Duration::from_secs(1)),
+    }
+}
+
+type LensReviewResults = Vec<Result<(String, lens::LensOutput)>>;
+
+/// Shared by both the mandatory-lens and optional-lens `par_map` calls (#168) — kept as one
+/// plain fn instead of a closure defined twice so the "lens complete" logging can't drift
+/// between the two call sites.
+fn review_one_lens(
+    llm: &Llm,
+    sp: &Spec,
+    inp: &input::Input,
+    id: &str,
+    round: usize,
+) -> Result<(String, lens::LensOutput)> {
+    let out = lens::review_lens(llm, sp, inp, id, round)?;
+    println!(
+        "  Lens complete: {} — {} findings, {} unverified",
+        id,
+        out.findings.len(),
+        out.unverified.len()
+    );
+    Ok((id.to_string(), out))
+}
 
 pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<()> {
     let started = std::time::Instant::now();
@@ -94,14 +123,17 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             inp.diff.len()
         );
     }
-    if inp.deterministic_results.is_none() {
-        if let Some(v) = semgrep::try_run(&inp.changed_files) {
-            println!(
-                "semgrep auto-detected — reflecting local run results in deterministic checks"
-            );
-            inp.deterministic_results = Some(v);
-        }
-    }
+    // #169: semgrep used to run synchronously right here, blocking lens selection on a
+    // subprocess whose result nothing in the LLM context even reads (shared_context never
+    // includes deterministic_results — only quantify::deterministic_gate does, at the very end
+    // of this function). Spawned in the background instead; joined just before that gate needs
+    // it, so it overlaps with everything from lens review through human-voice.
+    let semgrep_started = std::time::Instant::now();
+    let semgrep_handle = inp.deterministic_results.is_none().then(|| {
+        let changed_files = inp.changed_files.clone();
+        let timeout = semgrep_timeout(deadline_instant);
+        std::thread::spawn(move || semgrep::try_run(&changed_files, timeout))
+    });
     let out_dir = prepare_out(args.out)?;
 
     let prior_state = match args.prior {
@@ -121,8 +153,12 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
 
     // Steps 1-2 (input normalization, convention injection) are handled by input::normalize + each prompt builder.
 
-    // Step 4: lens selection
-    let optional_selected: Vec<String> = match args.lenses_arg {
+    // Step 4: lens selection. Manual --lenses validation is synchronous (no LLM call) and must
+    // fail before anything else starts — so it's resolved eagerly here, before the thread::scope
+    // below, rather than inside it (spawning the mandatory-lens par_map before knowing whether
+    // manual validation even passed would mean an invalid --lenses value still burns real LLM
+    // calls before the error is returned).
+    let manual_ids: Option<Vec<String>> = match args.lenses_arg {
         Some(s) => {
             // Filters out duplicate specifications ("--lenses design,design") — review_lens must
             // be called only once per lens so finding ids (position-based numbers) don't collide within it.
@@ -136,69 +172,76 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             for id in &ids {
                 let lens = sp.lens_by_id(id);
                 anyhow::ensure!(lens.is_some(), "lens id not found in spec: {id}");
-                // #96: always lenses (e.g. good_things) are already added below and, for
-                // good_things specifically, run through a dedicated review call with its own
-                // schema — letting one in here via --lenses would run it a second time through
-                // the generic defect-finding prompt, producing findings that pollute the score.
+                // #96: always lenses are already added below and run unconditionally — letting
+                // one in here via --lenses would run it a second time through the generic
+                // defect-finding prompt, producing duplicate findings that pollute the score.
                 anyhow::ensure!(
                     !lens.unwrap().always,
                     "{id} is an always lens and cannot be specified via --lenses (it's always included automatically)"
                 );
             }
-            ids
+            Some(ids)
         }
-        None => lens::select_lenses(cheap_llm, &sp, &inp)?,
+        None => None,
     };
-    let mut selected_ids: Vec<String> = optional_selected;
-    for l in sp.always_lenses() {
-        if l.id != "good_things" && !selected_ids.contains(&l.id) {
-            selected_ids.push(l.id.clone());
-        }
-    }
-    println!("Selected lenses: {}", selected_ids.join(", "));
+    let mandatory_ids: Vec<String> = sp.always_lenses().iter().map(|l| l.id.clone()).collect();
 
     // Step 7: independent per-lens review (seal-then-reveal in sequence — equivalent to parallel
     // execution since results never reference each other).
     // Even if one lens fails (LLM call error, etc.), the remaining lens results are kept and the
     // failure is recorded in the report — avoids aborting the whole review without partial
     // results just because of one lens.
-    // good_things is an independent LLM call that doesn't depend on findings (only needs
-    // diff/spec), yet it used to run sequentially after all lens reviews finished — adding one
-    // review's worth of round-trip time to the critical path for no real reason. Now it runs
-    // concurrently with the lens par_map on a separate thread.
-    let (lens_results, good_things_result): LensReviewResults = std::thread::scope(|s| {
-        let lens_handle = s.spawn(|| {
-            par_map(args.concurrency, selected_ids.clone(), |id| {
-                let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
-                println!(
-                    "  Lens complete: {} — {} findings, {} unverified",
-                    id,
-                    out.findings.len(),
-                    out.unverified.len()
-                );
-                Ok((id, out))
-            })
-        });
-        let good_things_handle = sp
-            .lens_by_id("good_things")
-            .is_some()
-            .then(|| s.spawn(|| lens::review_good_things(cheap_llm, &sp, &inp)));
+    //
+    // #168: when --lenses isn't given, automatic lens selection used to be an unconditional
+    // barrier before any lens review started — even though the mandatory (always) lenses don't
+    // depend on its result at all. Running selection on its own thread alongside the
+    // mandatory-lens par_map hides that round trip behind work that has to happen anyway.
+    let lens_stage_started = std::time::Instant::now();
+    let (optional_selected, mandatory_results): (Result<Vec<String>>, LensReviewResults) =
+        std::thread::scope(|s| {
+            let selection_handle = manual_ids
+                .is_none()
+                .then(|| s.spawn(|| lens::select_lenses(cheap_llm, &sp, &inp)));
+            let mandatory_handle = s.spawn(|| {
+                par_map(args.concurrency, mandatory_ids.clone(), |id| {
+                    review_one_lens(llm, &sp, &inp, &id, round)
+                })
+            });
 
-        // #113: par_map already isolates per-item worker panics into a Result — this thread
-        // itself panicking (outside per-item processing) shouldn't be treated any differently
-        // and take the whole CLI down with it. A single synthetic error entry composes with the
-        // existing "for r in lens_results { ... Err(e) => stage_errors.push(...) }" loop below
-        // exactly like a normal per-lens failure would.
-        let lens_results: Vec<Result<(String, lens::LensOutput)>> = match lens_handle.join() {
-            Ok(r) => r,
-            Err(_) => vec![Err(anyhow::anyhow!("lens review thread panicked"))],
-        };
-        let good_things_result = good_things_handle.map(|h| {
-            h.join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("good_things thread panicked")))
+            let optional_selected: Result<Vec<String>> = match manual_ids {
+                Some(ids) => Ok(ids),
+                None => selection_handle
+                    .unwrap()
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("lens selection thread panicked"))),
+            };
+            let mandatory_results = mandatory_handle
+                .join()
+                .unwrap_or_else(|_| vec![Err(anyhow::anyhow!("lens review thread panicked"))]);
+            (optional_selected, mandatory_results)
         });
-        (lens_results, good_things_result)
-    });
+    let optional_selected = optional_selected?;
+
+    let mut selected_ids: Vec<String> = optional_selected.clone();
+    for id in &mandatory_ids {
+        if !selected_ids.contains(id) {
+            selected_ids.push(id.clone());
+        }
+    }
+    println!("Selected lenses: {}", selected_ids.join(", "));
+
+    let optional_results: LensReviewResults = if optional_selected.is_empty() {
+        Vec::new()
+    } else {
+        par_map(args.concurrency, optional_selected, |id| {
+            review_one_lens(llm, &sp, &inp, &id, round)
+        })
+    };
+    let lens_selection_and_review_ms = lens_stage_started.elapsed().as_millis();
+    let lens_results: LensReviewResults = mandatory_results
+        .into_iter()
+        .chain(optional_results)
+        .collect();
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
@@ -207,6 +250,10 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // real findings and "every lens errored out" both leave `findings` empty, but only the
     // latter means the review has zero defect-finding coverage (completeness::Failed below).
     let mut successful_lens_count = 0usize;
+    // #174: good_things used to come from a fully separate always-on lens/call joined on its own
+    // thread — it's now just whichever lens is lens::GOOD_THINGS_HOST_LENS's own `good_things`
+    // field, extracted in the same pass as findings/unverified below.
+    let mut good_things: Vec<lens::GoodThing> = Vec::new();
     for r in lens_results {
         match r {
             Ok((id, out)) => {
@@ -224,6 +271,9 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
                 } else {
                     successful_lens_count += 1;
                 }
+                if id == lens::GOOD_THINGS_HOST_LENS {
+                    good_things = out.good_things.clone();
+                }
                 findings.extend(out.findings);
                 for u in out.unverified {
                     unverified.push((id.clone(), u));
@@ -240,18 +290,6 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // findings whose evidence may be hallucinated.
     evidence::verify(&mut findings, &inp.diff);
 
-    // good_things is supplementary info that doesn't affect findings/score/verdict, so there's no
-    // reason for its failure to discard the core review result entirely — just log a warning and continue with an empty list.
-    let good_things = match good_things_result {
-        Some(Ok(out)) => out.good_things,
-        Some(Err(e)) => {
-            eprintln!("Warning: good_things lens failed — {e:#}");
-            stage_errors.push(format!("good_things: {e:#}"));
-            Vec::new()
-        }
-        None => Vec::new(),
-    };
-
     // Steps 8-9: discourse rounds
     // #117: discourse used to propagate failure via `?`, aborting the whole run (no report.md
     // at all) even though every lens result up to this point is otherwise usable. Falls back to
@@ -259,6 +297,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // (unresolved), so none of it can be wrongly CONFIRMED off a failed round; verdict/score
     // simply don't count anything from this stage, same fail-safe direction as a missing
     // resolution already gets treated everywhere else in this function.
+    let discourse_started = std::time::Instant::now();
     let (audit, mut resolved) = if findings.is_empty() {
         println!("No findings — skipping discourse");
         (Vec::new(), std::collections::HashMap::new())
@@ -279,6 +318,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
     };
+    let discourse_ms = discourse_started.elapsed().as_millis();
     // #139: discourse's SURFACE moves can add brand-new findings straight into `findings`
     // (src/discourse/mod.rs) without ever going through evidence::verify — the earlier call at
     // the top of this function only saw the original per-lens findings. Re-running here is
@@ -287,6 +327,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
 
     // Compared to the previous round (--prior): determine whether previously confirmed findings
     // were fixed in this diff. If STILL_OPEN, re-fold them into this round's working set (keeps affecting score/verdict).
+    let fixcheck_started = std::time::Instant::now();
     let mut fix_results: Vec<fixcheck::FixStatus> = Vec::new();
     if let Some(ps) = &prior_state {
         let prior_confirmed: Vec<Finding> = ps
@@ -374,6 +415,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
     }
+    let fixcheck_ms = fixcheck_started.elapsed().as_millis();
 
     // Step 6: policy lens (local, deterministic)
     let policies = policy::check_all(&sp, &inp);
@@ -383,45 +425,84 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         .iter()
         .filter(|f| resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED"))
         .collect();
-    // On failure, treated the same as "requirements not provided" (None), but recorded in
-    // stage_errors so the two aren't conflated — since requirements factors into the verdict's
-    // NEEDS_CONTEXT judgment, this beats silently letting it pass, but this single stage still
-    // doesn't kill the whole review the way a lens failure would.
-    let req_results = if deadline_exceeded(started, args.deadline_minutes) {
-        eprintln!("Warning: --deadline-minutes exceeded — skipping requirements verification");
-        stage_errors.push("requirements: skipped, --deadline-minutes exceeded".to_string());
-        None
-    } else {
-        match requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Warning: requirements verification failed — {e:#}");
-                stage_errors.push(format!("requirements: {e:#}"));
-                None
-            }
-        }
-    };
 
-    // #117: human-voice doesn't read `quant` at all, so it can run before summarize() — moved
-    // up from after it so a failure here (now caught instead of propagated via `?`) is already
-    // reflected in stage_errors by the time summarize()/report::write need it, instead of
-    // landing after the verdict was already computed.
-    let hv = if !args.human_voice {
-        None
-    } else if deadline_exceeded(started, args.deadline_minutes) {
-        eprintln!("Warning: --deadline-minutes exceeded — skipping human-voice rewrite");
-        stage_errors.push("human_voice: skipped, --deadline-minutes exceeded".to_string());
-        None
-    } else {
-        match humanvoice::rewrite(llm, &sp, &inp, &confirmed_refs, &good_things) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("Warning: human-voice rewrite failed — {e:#}");
-                stage_errors.push(format!("human_voice: {e:#}"));
-                None
+    // #170: requirements verification and human-voice rewrite don't read each other's output —
+    // human-voice doesn't read `quant` either (#117: that's why it can run before summarize()
+    // below), and requirements doesn't read human-voice's rewritten text. They only share
+    // confirmed_refs/good_things, both already available here. Run them concurrently instead of
+    // one after the other.
+    //
+    // On failure (or a deadline skip), each is treated the same as "not provided"/"not
+    // rewritten" (None), but recorded in stage_errors so the two aren't conflated — since
+    // requirements factors into the verdict's NEEDS_CONTEXT judgment, this beats silently
+    // letting it pass, but neither stage kills the whole review the way a lens failure would.
+    let req_hv_started = std::time::Instant::now();
+    let (req_results, hv): (Option<Vec<requirements::RequirementCheck>>, Option<String>) =
+        std::thread::scope(|s| {
+            let req_handle = s.spawn(|| {
+                if deadline_exceeded(started, args.deadline_minutes) {
+                    return Err("skipped, --deadline-minutes exceeded".to_string());
+                }
+                requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs)
+                    .map_err(|e| format!("{e:#}"))
+            });
+            let hv_handle = args.human_voice.then(|| {
+                s.spawn(|| {
+                    if deadline_exceeded(started, args.deadline_minutes) {
+                        return Err("skipped, --deadline-minutes exceeded".to_string());
+                    }
+                    humanvoice::rewrite(llm, &sp, &inp, &confirmed_refs, &good_things)
+                        .map_err(|e| format!("{e:#}"))
+                })
+            });
+
+            let req_results = match req_handle
+                .join()
+                .unwrap_or_else(|_| Err("requirements thread panicked".to_string()))
+            {
+                Ok(r) => r,
+                Err(msg) => {
+                    eprintln!("Warning: requirements verification failed — {msg}");
+                    stage_errors.push(format!("requirements: {msg}"));
+                    None
+                }
+            };
+            let hv = hv_handle.and_then(|h| {
+                match h
+                    .join()
+                    .unwrap_or_else(|_| Err("human_voice thread panicked".to_string()))
+                {
+                    Ok(v) => Some(v),
+                    Err(msg) => {
+                        eprintln!("Warning: human-voice rewrite failed — {msg}");
+                        stage_errors.push(format!("human_voice: {msg}"));
+                        None
+                    }
+                }
+            });
+            (req_results, hv)
+        });
+    let requirements_and_human_voice_ms = req_hv_started.elapsed().as_millis();
+
+    // #169: this is the earliest point that actually needs deterministic_results (quantify's
+    // deterministic gate, right below) — join the background semgrep run here instead of
+    // blocking on it before lens selection even started.
+    let semgrep_ms = semgrep_handle.map(|handle| {
+        match handle.join() {
+            Ok(Some(v)) => {
+                println!(
+                    "semgrep auto-detected — reflecting local run results in deterministic checks"
+                );
+                inp.deterministic_results = Some(v);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                eprintln!("Warning: semgrep background thread panicked");
+                stage_errors.push("semgrep: background thread panicked".to_string());
             }
         }
-    };
+        semgrep_started.elapsed().as_millis()
+    });
 
     // Step 10: quantitative summary + verdict
     let mut quant = quantify::summarize(
@@ -485,6 +566,14 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         stage_errors.clone(),
         dropped_files,
         llm.usage(),
+        manifest::StageTimings {
+            semgrep_ms,
+            lens_selection_and_review_ms,
+            discourse_ms,
+            fixcheck_ms,
+            requirements_and_human_voice_ms,
+            total_ms: started.elapsed().as_millis(),
+        },
     )
     .and_then(|m| manifest::write(&out_dir, &m))
     {
@@ -1329,10 +1418,12 @@ always = true
 
     #[test]
     fn run_review_still_carries_a_prior_confirmed_finding_downgraded_to_unknown() {
-        // #135: fixcheck::corroborate() downgrades a wrongly-FIXED verdict to UNKNOWN when the
-        // original evidence is still present verbatim in the diff — but UNKNOWN wasn't
-        // previously re-folded (only STILL_OPEN was), so this safety net produced the exact
-        // silent drop it was built to prevent.
+        // #135: a finding whose original evidence is still present verbatim in the diff must
+        // downgrade to UNKNOWN — but UNKNOWN wasn't previously re-folded (only STILL_OPEN was),
+        // so this safety net produced the exact silent drop it was built to prevent.
+        // #174: this downgrade is now resolved locally (fixcheck::locally_resolvable) before
+        // ever reaching the LLM — see the fixture below, which only queues the round-2 lens
+        // call's response, not a fixcheck one.
         let dir = std::env::temp_dir().join("codereview-loop-e2e-prior-unknown-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1358,11 +1449,11 @@ always = true
         let out_dir = dir.join("out");
 
         let lens_response = r#"{"findings":[],"unverified":[]}"#.to_string();
-        let fixcheck_response =
-            r#"{"results":[{"finding_id":"prior-r1-1","status":"FIXED","evidence":"looks fixed"}]}"#
-                .to_string();
         let usage = Llm::new_usage_tracker();
-        let llm = Llm::fixture(vec![lens_response, fixcheck_response], 0, usage.clone());
+        // Only the round-2 lens response is queued — if fixcheck called the LLM instead of
+        // resolving this finding locally, the empty queue would error instead of run_review
+        // completing successfully.
+        let llm = Llm::fixture(vec![lens_response], 0, usage.clone());
         let cheap_llm = llm.clone();
 
         run_review(
