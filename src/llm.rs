@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -42,6 +42,52 @@ pub enum Provider {
     },
     #[cfg(test)]
     Fixture(Arc<Mutex<std::collections::VecDeque<String>>>),
+}
+
+/// #166: bounds the total number of simultaneous LLM calls across every call site — lens
+/// `par_map` workers, and (once other call sites overlap too, see #168/#170) lens selection,
+/// requirements, human_voice — instead of each call site's own thread count, which undercounts
+/// real total in-flight requests once more than one site can be active at the same time. Share
+/// one `Arc<CallGate>` across every `Llm` instance in a run (main model and cheap model both) via
+/// [`Llm::with_gate`] to get a real global cap, not just a per-stage worker-count limit.
+#[derive(Debug)]
+pub struct CallGate {
+    max: usize,
+    state: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl CallGate {
+    pub fn new(max: usize) -> Arc<Self> {
+        Arc::new(CallGate {
+            max: max.max(1),
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> GatePermit {
+        let mut n = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= self.max {
+            n = self.cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        GatePermit {
+            gate: Arc::clone(self),
+        }
+    }
+}
+
+struct GatePermit {
+    gate: Arc<CallGate>,
+}
+
+impl Drop for GatePermit {
+    fn drop(&mut self) {
+        let mut n = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.gate.cv.notify_one();
+    }
 }
 
 /// Cumulative token/cost usage. If multiple Llm instances (e.g. main model + cheap model) share
@@ -100,6 +146,8 @@ pub struct Llm {
     /// #119: an overall deadline (see `with_deadline`) — None means each call always gets its
     /// full per-call timeout, unchanged from before this field existed.
     deadline: Option<Instant>,
+    /// #166: None means uncapped (existing behavior, unchanged) — set via `with_gate`.
+    gate: Option<Arc<CallGate>>,
 }
 
 /// An HTTP-ish failure that carries its status code as data, not just baked into a message
@@ -169,6 +217,7 @@ impl Llm {
             verbose,
             usage,
             deadline: None,
+            gate: None,
         }
     }
 
@@ -189,6 +238,7 @@ impl Llm {
             verbose,
             usage,
             deadline: None,
+            gate: None,
         })
     }
 
@@ -212,6 +262,7 @@ impl Llm {
             verbose,
             usage,
             deadline: None,
+            gate: None,
         }
     }
 
@@ -227,6 +278,7 @@ impl Llm {
             verbose: false,
             usage,
             deadline: None,
+            gate: None,
         }
     }
 
@@ -243,6 +295,14 @@ impl Llm {
     /// real wall-clock bound instead of only a between-stage checkpoint.
     pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// #166: share the same `Arc<CallGate>` across every `Llm` instance in a run (main model and
+    /// cheap model both — `backend_factory::build_llm` does this) to cap real total in-flight
+    /// calls, not just one call site's own thread count.
+    pub fn with_gate(mut self, gate: Option<Arc<CallGate>>) -> Self {
+        self.gate = gate;
         self
     }
 
@@ -290,6 +350,9 @@ impl Llm {
     }
 
     fn call_once(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
+        // #166: held for the whole call (network round trip or subprocess) — dropped at the end
+        // of this function, freeing the slot for the next waiting caller.
+        let _permit = self.gate.as_ref().map(|g| g.acquire());
         match &self.provider {
             Provider::ClaudeCli { bin } => call_claude(
                 bin,
@@ -803,6 +866,47 @@ mod tests {
 
     fn test_llm() -> Llm {
         Llm::fixture(vec![], 0, Llm::new_usage_tracker())
+    }
+
+    // --- #166: CallGate ---
+
+    #[test]
+    fn call_gate_never_lets_more_than_max_permits_be_held_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = CallGate::new(2);
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..6 {
+                let gate = Arc::clone(&gate);
+                let current = Arc::clone(&current);
+                let peak = Arc::clone(&peak);
+                s.spawn(move || {
+                    let _permit = gate.acquire();
+                    let n = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    current.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "never more than 2 permits held simultaneously"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "should actually allow up to its max, not be overly conservative"
+        );
+    }
+
+    #[test]
+    fn with_gate_none_leaves_calls_uncapped_same_as_before_the_field_existed() {
+        // A gate is opt-in — an Llm with no gate configured must behave exactly like before
+        // #166, with call_once never blocking on a permit.
+        let llm = test_llm();
+        assert!(llm.call_once(None, "task", None).is_err()); // fixture queue is empty — just proves this returns promptly, not hangs on a gate wait.
     }
 
     #[test]

@@ -1,6 +1,17 @@
-use crate::cli::{Backend, Cli};
-use crate::llm::Llm;
+use crate::cli::{Backend, Cli, Cmd};
+use crate::llm::{CallGate, Llm};
 use anyhow::{Context, Result};
+
+/// #166: the `review` subcommand's own `--concurrency` is the natural size for the shared
+/// call gate — `describe`/`improve` don't have that flag (they only ever make one main-model
+/// call at a time), so a generous fixed default there is fine; it's not actually load-bearing
+/// for those subcommands.
+fn concurrency_hint(cmd: &Cmd) -> usize {
+    match cmd {
+        Cmd::Review { concurrency, .. } => *concurrency,
+        _ => 4,
+    }
+}
 
 /// A (main model, cheap model) pair. If `--cheap-model` isn't specified, the cheap model is the
 /// same as the main model, preserving existing behavior. Both share a single usage tracker to produce combined usage totals.
@@ -72,7 +83,14 @@ pub(crate) fn build_llm(cli: &Cli) -> Result<(Llm, Llm)> {
             )
         }
     };
-    Ok((main_llm, cheap_llm))
+    // #166: one gate shared by both models — a lens par_map call and a good_things/requirements/
+    // human_voice call made on the cheap model at the same moment both draw from the same total
+    // budget instead of each having their own uncounted allowance.
+    let gate = CallGate::new(concurrency_hint(&cli.cmd));
+    Ok((
+        main_llm.with_gate(Some(gate.clone())),
+        cheap_llm.with_gate(Some(gate)),
+    ))
 }
 
 #[cfg(test)]
