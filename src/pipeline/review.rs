@@ -48,6 +48,18 @@ fn deadline_exceeded(started: std::time::Instant, deadline_minutes: Option<u64>)
     }
 }
 
+/// #169: caps semgrep::DEFAULT_TIMEOUT at whatever's left of the overall --deadline-minutes
+/// budget, mirroring Llm::effective_timeout's same base.min(remaining).max(floor) shape — a
+/// background semgrep run shouldn't be able to eat the whole deadline on its own.
+fn semgrep_timeout(deadline: Option<std::time::Instant>) -> std::time::Duration {
+    match deadline {
+        None => semgrep::DEFAULT_TIMEOUT,
+        Some(d) => semgrep::DEFAULT_TIMEOUT
+            .min(d.saturating_duration_since(std::time::Instant::now()))
+            .max(std::time::Duration::from_secs(1)),
+    }
+}
+
 type LensReviewResults = Vec<Result<(String, lens::LensOutput)>>;
 
 /// Shared by both the mandatory-lens and optional-lens `par_map` calls (#168) — kept as one
@@ -111,14 +123,16 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             inp.diff.len()
         );
     }
-    if inp.deterministic_results.is_none() {
-        if let Some(v) = semgrep::try_run(&inp.changed_files) {
-            println!(
-                "semgrep auto-detected — reflecting local run results in deterministic checks"
-            );
-            inp.deterministic_results = Some(v);
-        }
-    }
+    // #169: semgrep used to run synchronously right here, blocking lens selection on a
+    // subprocess whose result nothing in the LLM context even reads (shared_context never
+    // includes deterministic_results — only quantify::deterministic_gate does, at the very end
+    // of this function). Spawned in the background instead; joined just before that gate needs
+    // it, so it overlaps with everything from lens review through human-voice.
+    let semgrep_handle = inp.deterministic_results.is_none().then(|| {
+        let changed_files = inp.changed_files.clone();
+        let timeout = semgrep_timeout(deadline_instant);
+        std::thread::spawn(move || semgrep::try_run(&changed_files, timeout))
+    });
     let out_dir = prepare_out(args.out)?;
 
     let prior_state = match args.prior {
@@ -443,6 +457,25 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
     };
+
+    // #169: this is the earliest point that actually needs deterministic_results (quantify's
+    // deterministic gate, right below) — join the background semgrep run here instead of
+    // blocking on it before lens selection even started.
+    if let Some(handle) = semgrep_handle {
+        match handle.join() {
+            Ok(Some(v)) => {
+                println!(
+                    "semgrep auto-detected — reflecting local run results in deterministic checks"
+                );
+                inp.deterministic_results = Some(v);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                eprintln!("Warning: semgrep background thread panicked");
+                stage_errors.push("semgrep: background thread panicked".to_string());
+            }
+        }
+    }
 
     // Step 10: quantitative summary + verdict
     let mut quant = quantify::summarize(
