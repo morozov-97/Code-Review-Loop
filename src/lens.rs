@@ -1,6 +1,6 @@
 use crate::input::Input;
 use crate::llm::Llm;
-use crate::promptctx::shared_context;
+use crate::promptctx::{selection_context, shared_context};
 use crate::spec::{Lens, Spec};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -174,9 +174,13 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let ctx = shared_context(spec, input);
+    // #173 (partial): selection only needs to decide WHICH lenses fit, not review the diff
+    // itself — selection_context sends the changed-file list/stats instead of the full diff
+    // (see its doc comment for the tradeoff this makes). Each selected lens's own review call
+    // still gets shared_context's full diff.
+    let ctx = selection_context(spec, input);
     let task = format!(
-        "# Task\nChoose 1-3 review lenses that fit the nature of the diff below (no swapping after selection).\n\n\
+        "# Task\nChoose 1-3 review lenses that fit the nature of the change described below (no swapping after selection).\n\n\
          ## Candidate lenses\n{catalog}\n\n\
          ## Output (JSON only)\n{{\"selected\":[\"id\", ...]}}\n",
         catalog = catalog
