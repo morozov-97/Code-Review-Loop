@@ -9,7 +9,7 @@ otherwise lacks.
 
 This has actually been run end-to-end with `openai/gpt-oss-120b` via OpenRouter. The
 `promptfoo` harness itself works (`exec:` provider syntax, `run-codereview.sh`'s argument
-handling, `assert-report.cjs`'s grading). Two real bugs were found and fixed this way, not by
+handling, `assert-report.cjs`'s grading). Three real bugs were found and fixed this way, not by
 inspection:
 
 - `clean.patch` originally had no accompanying test/doc changes, so the deterministic policy
@@ -20,6 +20,15 @@ inspection:
 - `sql-injection.patch`'s `expectContains: ["find_user"]` was flaky — the LLM reliably quotes
   the vulnerable *line* (which includes the `username` variable) but doesn't reliably name the
   *enclosing function*. Replaced with `"username"`.
+- A per-test singular `provider: "exec:./run-codereview-default-rounds.sh"` field silently
+  didn't override anything — every result row reported the same provider id regardless, and
+  every assertion (including CI) still passed since the fast and default-rounds paths both
+  satisfy the loose bounds. Fixed by switching to `providers:` (plural) allow-lists instead
+  (see "What's here" below). **Re-confirmed with a second real run** after the fix: filtering
+  to just the SQL injection case (`--filter-pattern "SQL injection"`) now produces two visibly
+  distinct provider columns (`fast-round` / `default-rounds`) pointing at the two different
+  scripts, and `default-rounds` took ~2x as long wall-clock (225s vs. 113s) — consistent with a
+  real second discourse round actually running, not just a different label on the same call.
 
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 
