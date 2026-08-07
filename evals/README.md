@@ -34,19 +34,23 @@ supposed to.
 
 ## What's here
 
-- `promptfooconfig.yaml` — 6 test cases: a clean (test+doc-paired) diff, a SQL injection, a
+- `promptfooconfig.yaml` — 5 test cases (a clean test+doc-paired diff, a SQL injection, a
   prompt-injection attempt against the reviewer itself, a hardcoded API key, a
-  panic-on-untrusted-input `.unwrap()`, and (#176) the SQL injection fixture again run through
-  the CLI's real default `--max-rounds` instead of the fast single-round path every other case
-  uses.
+  panic-on-untrusted-input `.unwrap()`) against 2 configured providers (`fast-round` /
+  `default-rounds`, see below) — 4 cases are restricted via `providers: [fast-round]` to just the
+  fast path; the SQL injection case is left unrestricted so it runs (#176) against both, producing
+  6 result rows total. See the file's own header comment for a real bug this design replaced: an
+  earlier attempt used a per-test singular `provider:` field expecting it to override the script,
+  which silently didn't work (confirmed by actually running it against OpenRouter — every row
+  reported the same provider id) despite every assertion, including CI, passing anyway.
 - `diffs/*.patch` — the golden diffs.
-- `run-codereview.sh` — wrapper that runs `codereview review --backend openrouter --max-rounds 1`
-  on a diff and prints `report.md` plus a `MANIFEST_PROVIDER_CALLS` marker line built from
-  `manifest.json`'s `usage.calls` (this is what promptfoo's `exec` provider invokes for every
-  case except the one below).
-- `run-codereview-default-rounds.sh` — #176: identical, but without forcing `--max-rounds 1` —
-  lets the CLI's own default (2 rounds) apply, so at least one case measures the actual
-  default-path cost/behavior instead of only the cheaper path every other case exercises.
+- `run-codereview.sh` (provider `fast-round`) — wrapper that runs
+  `codereview review --backend openrouter --max-rounds 1` on a diff and prints `report.md` plus a
+  `MANIFEST_PROVIDER_CALLS` marker line built from `manifest.json`'s `usage.calls`.
+- `run-codereview-default-rounds.sh` (provider `default-rounds`, #176) — identical, but without
+  forcing `--max-rounds 1` — lets the CLI's own default (2 rounds) apply, so the SQL injection case
+  measures the actual default-path cost/behavior instead of only the cheaper path every other case
+  exercises.
 - `assert-report.cjs` — checks `report.md`'s `Verdict:` line, required/forbidden substrings, and
   (#176) optionally a loose upper bound on provider calls via `expectMaxProviderCalls` — a
   regression guard against a gross call-count blowup, not a tight cost budget (there's no real
