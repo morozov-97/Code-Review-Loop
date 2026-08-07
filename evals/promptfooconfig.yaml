@@ -12,7 +12,8 @@
 # sql-injection.patch twice, one run had discourse mark it UNCERTAIN and miss the finding (led to #75),
 # while the other run correctly reached CONFIRMED.
 # This golden set only loosely checks "verdict direction" and "presence of key keywords" to absorb
-# some of this non-determinism, but with only 5 cases it isn't yet enough to serve as a fully stable
+# some of this non-determinism, but with only 5 distinct diffs (6 test cases as of #176, since one
+# diff is now run twice under different --max-rounds) it isn't yet enough to serve as a fully stable
 # CI gate.
 
 description: "codereview golden-set regression tests"
@@ -34,6 +35,9 @@ tests:
       diff_file: diffs/clean.patch
     metadata:
       expectVerdictIn: [APPROVE, COMMENT]
+      # #176: generous — this is a regression guard against a gross blowup (e.g. a change that
+      # accidentally doubles call count), not a tight budget calibrated against real data.
+      expectMaxProviderCalls: 10
 
   - description: String-formatted SQL injection should be caught as a finding
     vars:
@@ -70,3 +74,19 @@ tests:
     metadata:
       expectVerdictIn: [REQUEST_CHANGES, COMMENT]
       expectContains: ["unwrap"]
+
+  - description: >-
+      #176: same sql-injection fixture as above, but run through the CLI's real default
+      --max-rounds (2) via run-codereview-default-rounds.sh instead of the --max-rounds 1 every
+      other case above uses — every other case exercises only the cheaper single-round path, so
+      the suite as a whole never measured the actual default path's cost or behavior.
+      expectVerdictIn is wider than the fast-path case above: this repo's own documented
+      non-determinism (see this file's header comment) means a second discourse round can
+      legitimately land on UNCERTAIN instead of CONFIRMED for the same underlying diff.
+    provider: "exec:./run-codereview-default-rounds.sh"
+    vars:
+      diff_file: diffs/sql-injection.patch
+    metadata:
+      expectVerdictIn: [REQUEST_CHANGES, COMMENT, NEEDS_CONTEXT]
+      expectContains: ["username"]
+      expectMaxProviderCalls: 20

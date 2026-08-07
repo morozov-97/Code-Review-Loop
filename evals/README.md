@@ -28,19 +28,29 @@ injection finding was left `UNCERTAIN` and dropped from the report's scored find
 (this is what led to the `discourse::run` fixes for report visibility and
 `challenge_axis` — see issues #75 and #79), and once it was correctly `CONFIRMED`. The
 `expectVerdictIn`/`expectContains` looseness in this config absorbs some of that variance, but
-5 golden cases is not enough to give a statistical reliability guarantee. Treat a single green
+5 distinct golden diffs is not enough to give a statistical reliability guarantee. Treat a single green
 run as "didn't regress obviously," not as proof the tool reliably catches everything it's
 supposed to.
 
 ## What's here
 
-- `promptfooconfig.yaml` — 5 test cases: a clean (test+doc-paired) diff, a SQL injection, a
-  prompt-injection attempt against the reviewer itself, a hardcoded API key, and a
-  panic-on-untrusted-input `.unwrap()`.
+- `promptfooconfig.yaml` — 6 test cases: a clean (test+doc-paired) diff, a SQL injection, a
+  prompt-injection attempt against the reviewer itself, a hardcoded API key, a
+  panic-on-untrusted-input `.unwrap()`, and (#176) the SQL injection fixture again run through
+  the CLI's real default `--max-rounds` instead of the fast single-round path every other case
+  uses.
 - `diffs/*.patch` — the golden diffs.
-- `run-codereview.sh` — wrapper that runs `codereview review --backend openrouter` on a diff
-  and prints `report.md` (this is what promptfoo's `exec` provider invokes).
-- `assert-report.cjs` — checks `report.md`'s `Verdict:` line and required/forbidden substrings.
+- `run-codereview.sh` — wrapper that runs `codereview review --backend openrouter --max-rounds 1`
+  on a diff and prints `report.md` plus a `MANIFEST_PROVIDER_CALLS` marker line built from
+  `manifest.json`'s `usage.calls` (this is what promptfoo's `exec` provider invokes for every
+  case except the one below).
+- `run-codereview-default-rounds.sh` — #176: identical, but without forcing `--max-rounds 1` —
+  lets the CLI's own default (2 rounds) apply, so at least one case measures the actual
+  default-path cost/behavior instead of only the cheaper path every other case exercises.
+- `assert-report.cjs` — checks `report.md`'s `Verdict:` line, required/forbidden substrings, and
+  (#176) optionally a loose upper bound on provider calls via `expectMaxProviderCalls` — a
+  regression guard against a gross call-count blowup, not a tight cost budget (there's no real
+  historical data in this repo to calibrate a tight one against).
 
 ## Running it
 
@@ -51,7 +61,7 @@ cd evals
 npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -j 1 -o result.json
 ```
 
-Costs real LLM call money per run (5 cases, each several sequential calls). `-j 1` runs cases
+Costs real LLM call money per run (6 cases, each several sequential calls). `-j 1` runs cases
 serially — safe default, raise it if you want speed over predictable ordering in the output.
 
 ## Notes

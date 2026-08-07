@@ -32,6 +32,25 @@ module.exports = (output, context) => {
     }
   }
 
+  // #176: run-codereview.sh/run-codereview-default-rounds.sh append a
+  // "<!-- MANIFEST_PROVIDER_CALLS: N -->" marker built from manifest.json's usage.calls.
+  // Previously nothing here asserted on token/call counts at all, so a change that doubled the
+  // number of provider calls for a case would still pass cleanly as long as the verdict came
+  // out right. This is a loose regression guard (generous thresholds meant to catch a gross
+  // blowup), not a tight cost budget — there's no real historical data in this repo to calibrate
+  // a tight one against.
+  const callsMatch = report.match(/MANIFEST_PROVIDER_CALLS:\s*(\d+)/);
+  const providerCalls = callsMatch ? Number(callsMatch[1]) : null;
+  if (metadata.expectMaxProviderCalls != null) {
+    if (providerCalls === null) {
+      failures.push("Could not find a MANIFEST_PROVIDER_CALLS marker in output");
+    } else if (providerCalls > metadata.expectMaxProviderCalls) {
+      failures.push(
+        `provider calls: expected <= ${metadata.expectMaxProviderCalls}, got ${providerCalls}`
+      );
+    }
+  }
+
   return failures.length === 0
     ? { pass: true, score: 1, reason: `Matches golden set (verdict=${verdict})` }
     : { pass: false, score: 0, reason: failures.join("; ") };
