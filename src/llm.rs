@@ -147,6 +147,7 @@ struct CallUsage {
     cost_usd: f64,
 }
 
+#[derive(Debug)]
 struct CallResult {
     text: String,
     usage: CallUsage,
@@ -164,6 +165,13 @@ pub struct Llm {
     deadline: Option<Instant>,
     /// #166: None means uncapped (existing behavior, unchanged) — set via `with_gate`.
     gate: Option<Arc<CallGate>>,
+    /// #175: sent as `max_tokens` on OpenAI-compatible requests (OpenRouter/Custom) — None
+    /// means no cap is sent (existing behavior, unchanged). Ignored by the claude-cli backend.
+    max_output_tokens: Option<u32>,
+    /// #175: hard ceiling on total provider calls (shared `usage.calls` — main and cheap model
+    /// combined when they share a usage tracker) — None means uncapped (existing behavior,
+    /// unchanged).
+    max_calls: Option<u64>,
 }
 
 /// An HTTP-ish failure that carries its status code as data, not just baked into a message
@@ -187,6 +195,24 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// #175: a distinct marker (rather than a plain `anyhow!(...)` string) so `is_retryable`
+/// classifies a call-budget refusal as permanent — retrying it burns backoff sleeps for no
+/// reason since `usage.calls` isn't going to shrink between attempts.
+#[derive(Debug)]
+struct CallBudgetExceeded(u64);
+
+impl std::fmt::Display for CallBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider call budget exceeded ({} calls) — raise --max-provider-calls if this run genuinely needs more",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CallBudgetExceeded {}
+
 /// #119: retries used to treat every failure identically — a permanent 401 (bad API key) got
 /// the same "retry `--retries` more times" treatment as a transient 429/5xx, wasting the whole
 /// retry budget on something no amount of retrying fixes. Only downgrades the clear-cut case
@@ -195,6 +221,9 @@ impl std::error::Error for HttpError {}
 /// as before. Defaulting unclassified errors to "retryable" is the safe direction: at worst it
 /// costs one extra wasted attempt, never skips a retry that might have succeeded.
 fn is_retryable(e: &anyhow::Error) -> bool {
+    if e.downcast_ref::<CallBudgetExceeded>().is_some() {
+        return false;
+    }
     match e.downcast_ref::<HttpError>() {
         Some(HttpError { code, .. }) => *code == 429 || *code >= 500,
         None => true,
@@ -267,6 +296,8 @@ impl Llm {
             usage,
             deadline: None,
             gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         }
     }
 
@@ -291,6 +322,8 @@ impl Llm {
             usage,
             deadline: None,
             gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         })
     }
 
@@ -319,6 +352,8 @@ impl Llm {
             usage,
             deadline: None,
             gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         }
     }
 
@@ -335,6 +370,8 @@ impl Llm {
             usage,
             deadline: None,
             gate: None,
+            max_output_tokens: None,
+            max_calls: None,
         }
     }
 
@@ -359,6 +396,19 @@ impl Llm {
     /// calls, not just one call site's own thread count.
     pub fn with_gate(mut self, gate: Option<Arc<CallGate>>) -> Self {
         self.gate = gate;
+        self
+    }
+
+    /// #175: applies to OpenAI-compatible backends only (OpenRouter/Custom) — see the field's
+    /// doc comment.
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// #175: checked in call_once before every provider call — see the field's doc comment.
+    pub fn with_max_calls(mut self, max_calls: Option<u64>) -> Self {
+        self.max_calls = max_calls;
         self
     }
 
@@ -406,6 +456,15 @@ impl Llm {
     }
 
     fn call_once(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
+        // #175: checked before acquiring a gate permit or making any actual call — a
+        // misconfigured invocation (e.g. --lenses listing every optional lens) hits this and
+        // fails fast instead of burning the provider call anyway.
+        if let Some(max) = self.max_calls {
+            let current = self.usage.lock().unwrap_or_else(|e| e.into_inner()).calls;
+            if current >= max {
+                return Err(CallBudgetExceeded(max).into());
+            }
+        }
         // #166: held for the whole call (network round trip or subprocess) — dropped at the end
         // of this function, freeing the slot for the next waiting caller.
         let _permit = self.gate.as_ref().map(|g| g.acquire());
@@ -427,6 +486,7 @@ impl Llm {
                 task,
                 system,
                 self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
+                self.max_output_tokens,
             ),
             Provider::Custom {
                 base_url,
@@ -441,6 +501,7 @@ impl Llm {
                 task,
                 system,
                 self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
+                self.max_output_tokens,
             ),
             #[cfg(test)]
             Provider::Fixture(queue) => {
@@ -798,6 +859,7 @@ fn call_openai_compatible(
     task: &str,
     system: Option<&str>,
     timeout: Duration,
+    max_output_tokens: Option<u32>,
 ) -> Result<CallResult> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(s) = system {
@@ -820,10 +882,20 @@ fn call_openai_compatible(
     };
     messages.push(serde_json::json!({"role": "user", "content": user_content}));
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": resolved_model,
         "messages": messages,
+        // #175: opts into OpenRouter's extended usage accounting (cost, and potentially
+        // provider-reported cache token counts) — without this, those fields are omitted from
+        // the response entirely on OpenRouter. An endpoint that doesn't recognize this field
+        // (e.g. some Custom/self-hosted backends) should just ignore the extra top-level key.
+        "usage": {"include": true},
     });
+    // #175: previously no output cap was sent at all — a verbose response had nothing bounding
+    // its length beyond whatever the provider defaults to.
+    if let Some(max) = max_output_tokens {
+        body["max_tokens"] = serde_json::json!(max);
+    }
 
     // #171: timeout is set per-request (via RequestBuilder::config()), not on the agent itself
     // — `agent` is shared and reused across every call this Llm instance makes (built once in
@@ -885,7 +957,7 @@ fn call_openai_compatible(
             )
         })?;
 
-    // OpenAI-compatible usage schema (prompt_tokens/completion_tokens). cost is absent from the response, so it's left at 0.
+    // OpenAI-compatible usage schema (prompt_tokens/completion_tokens).
     let usage_obj = v.get("usage");
     let get_u64 = |key: &str| {
         usage_obj
@@ -893,14 +965,32 @@ fn call_openai_compatible(
             .and_then(|x| x.as_u64())
             .unwrap_or(0)
     };
+    // #175: best-effort — OpenRouter's cache/cost reporting isn't uniformly documented across
+    // every provider it proxies, and this hasn't been validated against real traffic for every
+    // shape it might take. Tries a couple of known field shapes (Anthropic-style pass-through
+    // for cache tokens, OpenAI-style nested `prompt_tokens_details` for the read side) and
+    // defaults to 0 either way if none match — same fallback as before, just no longer
+    // hardcoded to 0 unconditionally.
+    let cache_read_tokens = get_u64("cache_read_input_tokens").max(
+        usage_obj
+            .and_then(|u| u.get("prompt_tokens_details"))
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+    );
+    let cache_creation_tokens = get_u64("cache_creation_input_tokens");
+    let cost_usd = usage_obj
+        .and_then(|u| u.get("cost"))
+        .and_then(|c| c.as_f64())
+        .unwrap_or(0.0);
     Ok(CallResult {
         text: content.to_string(),
         usage: CallUsage {
             input_tokens: get_u64("prompt_tokens"),
             output_tokens: get_u64("completion_tokens"),
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            cost_usd: 0.0,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cost_usd,
         },
     })
 }
@@ -993,6 +1083,34 @@ mod tests {
         // #166, with call_once never blocking on a permit.
         let llm = test_llm();
         assert!(llm.call_once(None, "task", None).is_err()); // fixture queue is empty — just proves this returns promptly, not hangs on a gate wait.
+    }
+
+    // --- #175: max_calls ---
+
+    #[test]
+    fn text_ctx_refuses_once_max_calls_is_reached_without_touching_the_provider() {
+        // Goes through text_ctx (not call_once directly) since record_usage — which the
+        // max_calls check reads from — is called by text_ctx/json_ctx_typed after a successful
+        // call_once, not by call_once itself.
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec!["a".to_string(), "b".to_string()], 0, usage.clone())
+            .with_max_calls(Some(1));
+        assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "a");
+        let err = llm
+            .text_ctx(None, "task", None)
+            .expect_err("must refuse the second call once max_calls(1) is reached");
+        assert!(err.to_string().contains("provider call budget exceeded"));
+        // The second fixture entry was never touched — proves the refusal happened before ever
+        // reaching the provider, not that the provider itself happened to fail.
+        assert_eq!(usage.lock().unwrap().calls, 1);
+    }
+
+    #[test]
+    fn text_ctx_is_uncapped_when_max_calls_is_none() {
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec!["a".to_string(), "b".to_string()], 0, usage);
+        assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "a");
+        assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "b");
     }
 
     #[test]
@@ -1111,6 +1229,14 @@ mod tests {
         // always-retry behavior, since defaulting to "don't retry" would be the unsafe direction.
         let e = anyhow!("some other failure that isn't an HttpError");
         assert!(is_retryable(&e));
+    }
+
+    #[test]
+    fn is_retryable_treats_call_budget_exceeded_as_permanent() {
+        // #175: usage.calls isn't going to shrink between attempts, so retrying this just burns
+        // backoff sleeps for no reason.
+        let e: anyhow::Error = CallBudgetExceeded(3).into();
+        assert!(!is_retryable(&e));
     }
 
     #[test]

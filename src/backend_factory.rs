@@ -87,9 +87,19 @@ pub(crate) fn build_llm(cli: &Cli) -> Result<(Llm, Llm)> {
     // human_voice call made on the cheap model at the same moment both draw from the same total
     // budget instead of each having their own uncounted allowance.
     let gate = CallGate::new(concurrency_hint(&cli.cmd));
+    // #175: max_output_tokens is only meaningful for the OpenAI-compatible backends (harmless,
+    // ignored, for ClaudeCli/Fixture) — applied unconditionally regardless of backend since
+    // with_max_output_tokens is a no-op where it doesn't apply. max_provider_calls is shared via
+    // the same `usage` tracker both models already share, so it's a real combined budget.
     Ok((
-        main_llm.with_gate(Some(gate.clone())),
-        cheap_llm.with_gate(Some(gate)),
+        main_llm
+            .with_gate(Some(gate.clone()))
+            .with_max_output_tokens(Some(cli.max_output_tokens))
+            .with_max_calls(cli.max_provider_calls),
+        cheap_llm
+            .with_gate(Some(gate))
+            .with_max_output_tokens(Some(cli.max_output_tokens))
+            .with_max_calls(cli.max_provider_calls),
     ))
 }
 
@@ -178,5 +188,41 @@ mod tests {
         let (main_llm, cheap_llm) = build_llm(&cli).expect("should build successfully");
         assert_eq!(main_llm.model.as_deref(), Some("llama3-70b"));
         assert_eq!(cheap_llm.model.as_deref(), Some("llama3-8b"));
+    }
+
+    #[test]
+    fn build_llm_defaults_max_output_tokens_to_8192() {
+        let cli = parse(&["review", "--spec", "s.toml", "--diff", "d.patch"]);
+        assert_eq!(cli.max_output_tokens, 8192);
+    }
+
+    #[test]
+    fn build_llm_leaves_max_provider_calls_uncapped_by_default() {
+        let cli = parse(&["review", "--spec", "s.toml", "--diff", "d.patch"]);
+        assert_eq!(cli.max_provider_calls, None);
+    }
+
+    #[test]
+    fn build_llm_wires_max_provider_calls_and_max_output_tokens_into_both_models() {
+        let cli = parse(&[
+            "--max-provider-calls",
+            "5",
+            "--max-output-tokens",
+            "1234",
+            "review",
+            "--spec",
+            "s.toml",
+            "--diff",
+            "d.patch",
+        ]);
+        let (main_llm, cheap_llm) = build_llm(&cli).expect("should build successfully");
+        // max_calls/max_output_tokens are private Llm fields — Debug (auto-derived) is the only
+        // externally observable way to check they were actually set, short of a real call.
+        let main_debug = format!("{main_llm:?}");
+        let cheap_debug = format!("{cheap_llm:?}");
+        assert!(main_debug.contains("max_calls: Some(5)"));
+        assert!(main_debug.contains("max_output_tokens: Some(1234)"));
+        assert!(cheap_debug.contains("max_calls: Some(5)"));
+        assert!(cheap_debug.contains("max_output_tokens: Some(1234)"));
     }
 }

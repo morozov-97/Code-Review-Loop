@@ -43,6 +43,19 @@ pub(crate) struct Cli {
     /// that looks like a credential in an added line. Pass this flag to send it anyway.
     #[arg(long, global = true)]
     pub(crate) allow_sensitive_input: bool,
+    /// #175: sent as max_tokens on OpenAI-compatible requests (OpenRouter/Custom backends) —
+    /// the request body previously had no output cap at all. Ignored by the claude-cli backend
+    /// (that CLI has its own limits this flag doesn't reach). Large enough for this project's
+    /// own JSON schemas (findings/discourse/requirements arrays) while still bounding
+    /// worst-case per-call output cost.
+    #[arg(long, default_value_t = 8192, global = true)]
+    pub(crate) max_output_tokens: u32,
+    /// #175: hard ceiling on total provider calls (main + cheap model combined) across the whole
+    /// run — a backstop against a misconfigured invocation (e.g. --lenses listing every optional
+    /// lens, or a discourse loop that keeps re-requesting) rather than a normal-path limit.
+    /// Unset means uncapped (existing behavior, unchanged).
+    #[arg(long, global = true)]
+    pub(crate) max_provider_calls: Option<u64>,
 
     #[command(subcommand)]
     pub(crate) cmd: Cmd,
