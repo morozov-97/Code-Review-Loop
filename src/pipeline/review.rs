@@ -48,6 +48,28 @@ fn deadline_exceeded(started: std::time::Instant, deadline_minutes: Option<u64>)
     }
 }
 
+type LensReviewResults = Vec<Result<(String, lens::LensOutput)>>;
+
+/// Shared by both the mandatory-lens and optional-lens `par_map` calls (#168) — kept as one
+/// plain fn instead of a closure defined twice so the "lens complete" logging can't drift
+/// between the two call sites.
+fn review_one_lens(
+    llm: &Llm,
+    sp: &Spec,
+    inp: &input::Input,
+    id: &str,
+    round: usize,
+) -> Result<(String, lens::LensOutput)> {
+    let out = lens::review_lens(llm, sp, inp, id, round)?;
+    println!(
+        "  Lens complete: {} — {} findings, {} unverified",
+        id,
+        out.findings.len(),
+        out.unverified.len()
+    );
+    Ok((id.to_string(), out))
+}
+
 pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<()> {
     let started = std::time::Instant::now();
     // #119: without this, --deadline-minutes only stopped new *stages* from starting — a call
@@ -116,8 +138,12 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
 
     // Steps 1-2 (input normalization, convention injection) are handled by input::normalize + each prompt builder.
 
-    // Step 4: lens selection
-    let optional_selected: Vec<String> = match args.lenses_arg {
+    // Step 4: lens selection. Manual --lenses validation is synchronous (no LLM call) and must
+    // fail before anything else starts — so it's resolved eagerly here, before the thread::scope
+    // below, rather than inside it (spawning the mandatory-lens par_map before knowing whether
+    // manual validation even passed would mean an invalid --lenses value still burns real LLM
+    // calls before the error is returned).
+    let manual_ids: Option<Vec<String>> = match args.lenses_arg {
         Some(s) => {
             // Filters out duplicate specifications ("--lenses design,design") — review_lens must
             // be called only once per lens so finding ids (position-based numbers) don't collide within it.
@@ -131,43 +157,74 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             for id in &ids {
                 let lens = sp.lens_by_id(id);
                 anyhow::ensure!(lens.is_some(), "lens id not found in spec: {id}");
-                // #96: always lenses (e.g. good_things) are already added below and, for
-                // good_things specifically, run through a dedicated review call with its own
-                // schema — letting one in here via --lenses would run it a second time through
-                // the generic defect-finding prompt, producing findings that pollute the score.
+                // #96: always lenses are already added below and run unconditionally — letting
+                // one in here via --lenses would run it a second time through the generic
+                // defect-finding prompt, producing duplicate findings that pollute the score.
                 anyhow::ensure!(
                     !lens.unwrap().always,
                     "{id} is an always lens and cannot be specified via --lenses (it's always included automatically)"
                 );
             }
-            ids
+            Some(ids)
         }
-        None => lens::select_lenses(cheap_llm, &sp, &inp)?,
+        None => None,
     };
-    let mut selected_ids: Vec<String> = optional_selected;
-    for l in sp.always_lenses() {
-        if !selected_ids.contains(&l.id) {
-            selected_ids.push(l.id.clone());
-        }
-    }
-    println!("Selected lenses: {}", selected_ids.join(", "));
+    let mandatory_ids: Vec<String> = sp.always_lenses().iter().map(|l| l.id.clone()).collect();
 
     // Step 7: independent per-lens review (seal-then-reveal in sequence — equivalent to parallel
     // execution since results never reference each other).
     // Even if one lens fails (LLM call error, etc.), the remaining lens results are kept and the
     // failure is recorded in the report — avoids aborting the whole review without partial
     // results just because of one lens.
-    let lens_results: Vec<Result<(String, lens::LensOutput)>> =
-        par_map(args.concurrency, selected_ids.clone(), |id| {
-            let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
-            println!(
-                "  Lens complete: {} — {} findings, {} unverified",
-                id,
-                out.findings.len(),
-                out.unverified.len()
-            );
-            Ok((id, out))
+    //
+    // #168: when --lenses isn't given, automatic lens selection used to be an unconditional
+    // barrier before any lens review started — even though the mandatory (always) lenses don't
+    // depend on its result at all. Running selection on its own thread alongside the
+    // mandatory-lens par_map hides that round trip behind work that has to happen anyway.
+    let (optional_selected, mandatory_results): (Result<Vec<String>>, LensReviewResults) =
+        std::thread::scope(|s| {
+            let selection_handle = manual_ids
+                .is_none()
+                .then(|| s.spawn(|| lens::select_lenses(cheap_llm, &sp, &inp)));
+            let mandatory_handle = s.spawn(|| {
+                par_map(args.concurrency, mandatory_ids.clone(), |id| {
+                    review_one_lens(llm, &sp, &inp, &id, round)
+                })
+            });
+
+            let optional_selected: Result<Vec<String>> = match manual_ids {
+                Some(ids) => Ok(ids),
+                None => selection_handle
+                    .unwrap()
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("lens selection thread panicked"))),
+            };
+            let mandatory_results = mandatory_handle
+                .join()
+                .unwrap_or_else(|_| vec![Err(anyhow::anyhow!("lens review thread panicked"))]);
+            (optional_selected, mandatory_results)
         });
+    let optional_selected = optional_selected?;
+
+    let mut selected_ids: Vec<String> = optional_selected.clone();
+    for id in &mandatory_ids {
+        if !selected_ids.contains(id) {
+            selected_ids.push(id.clone());
+        }
+    }
+    println!("Selected lenses: {}", selected_ids.join(", "));
+
+    let optional_results: LensReviewResults = if optional_selected.is_empty() {
+        Vec::new()
+    } else {
+        par_map(args.concurrency, optional_selected, |id| {
+            review_one_lens(llm, &sp, &inp, &id, round)
+        })
+    };
+    let lens_results: LensReviewResults = mandatory_results
+        .into_iter()
+        .chain(optional_results)
+        .collect();
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
