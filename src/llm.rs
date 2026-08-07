@@ -35,13 +35,29 @@ pub enum Provider {
     },
     OpenRouter {
         api_key: String,
+        agent: Arc<ureq::Agent>,
     },
     Custom {
         base_url: String,
         api_key: Option<String>,
+        agent: Arc<ureq::Agent>,
     },
     #[cfg(test)]
     Fixture(Arc<Mutex<std::collections::VecDeque<String>>>),
+}
+
+/// #171: shared across every call an `Llm` instance makes (previously, `call_openai_compatible`
+/// built a fresh `ureq::Agent` on every single call), so a run's 5-13+ logical LLM calls reuse
+/// the same underlying connection pool instead of paying TLS/TCP setup each time. No
+/// `timeout_global` set here — that stays per-request (via `RequestBuilder::config()` in
+/// `call_openai_compatible`), since different calls in the same run can have different effective
+/// timeouts once a `--deadline-minutes` budget is shrinking; ureq 3's request-level config
+/// override makes that possible on a shared agent instead of needing one agent per timeout value.
+fn new_http_agent() -> Arc<ureq::Agent> {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build();
+    Arc::new(config.into())
 }
 
 /// #166: bounds the total number of simultaneous LLM calls across every call site — lens
@@ -156,6 +172,11 @@ pub struct Llm {
 struct HttpError {
     code: u16,
     body: String,
+    /// #171: parsed from the response's Retry-After header when present (seconds form only —
+    /// the HTTP-date form isn't handled, same effect as if the header were absent). Previously
+    /// the response headers weren't captured at all, so even a well-behaved 429 that specified
+    /// exactly how long to wait got the same generic exponential backoff as any other retry.
+    retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for HttpError {
@@ -197,6 +218,34 @@ fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + jitter_ms)
 }
 
+/// #171: a 429 with an explicit Retry-After takes priority over the generic exponential
+/// backoff — the provider is telling us exactly how long it wants, and guessing shorter than
+/// that just produces another 429 tomorrow, no wiser than today.
+fn retry_delay(attempt: u32, error: &anyhow::Error) -> Duration {
+    match error.downcast_ref::<HttpError>() {
+        Some(HttpError {
+            retry_after: Some(d),
+            ..
+        }) => *d,
+        _ => backoff_delay(attempt),
+    }
+}
+
+/// #171: a schema/parse failure isn't a transient server problem — the model made a mistake in
+/// its own output, and resending the identical prompt tends to just reproduce it. Builds a
+/// follow-up task that includes the prior bad response and the specific validation error, so the
+/// model has something concrete to correct instead of guessing again from scratch.
+fn build_repair_task(original_task: &str, bad_response: &str, error: &anyhow::Error) -> String {
+    format!(
+        "{original_task}\n\n\
+         ## Your previous response failed schema validation\n\
+         Previous response:\n{prev}\n\n\
+         Validation error: {error}\n\n\
+         Fix the JSON to match the schema exactly and respond with corrected JSON only — no code fences, no commentary.",
+        prev = truncate(bad_response, 2000),
+    )
+}
+
 impl Llm {
     /// Share this across multiple Llm instances to track aggregated usage for the whole run.
     pub fn new_usage_tracker() -> Arc<Mutex<Usage>> {
@@ -232,7 +281,10 @@ impl Llm {
             "OPENROUTER_API_KEY environment variable not set (export OPENROUTER_API_KEY=...)",
         )?;
         Ok(Llm {
-            provider: Provider::OpenRouter { api_key },
+            provider: Provider::OpenRouter {
+                api_key,
+                agent: new_http_agent(),
+            },
             model: Some(model.unwrap_or_else(|| OPENROUTER_DEFAULT_MODEL.to_string())),
             retries,
             verbose,
@@ -256,7 +308,11 @@ impl Llm {
         usage: Arc<Mutex<Usage>>,
     ) -> Self {
         Llm {
-            provider: Provider::Custom { base_url, api_key },
+            provider: Provider::Custom {
+                base_url,
+                api_key,
+                agent: new_http_agent(),
+            },
             model: Some(model),
             retries,
             verbose,
@@ -362,7 +418,8 @@ impl Llm {
                 system,
                 self.effective_timeout(CLAUDE_CLI_TIMEOUT),
             ),
-            Provider::OpenRouter { api_key } => call_openai_compatible(
+            Provider::OpenRouter { api_key, agent } => call_openai_compatible(
+                agent,
                 OPENROUTER_URL,
                 Some(api_key),
                 self.model.as_deref(),
@@ -371,7 +428,12 @@ impl Llm {
                 system,
                 self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
             ),
-            Provider::Custom { base_url, api_key } => call_openai_compatible(
+            Provider::Custom {
+                base_url,
+                api_key,
+                agent,
+            } => call_openai_compatible(
+                agent,
                 base_url,
                 api_key.as_deref(),
                 self.model.as_deref(),
@@ -437,7 +499,10 @@ impl Llm {
                 break;
             }
             if attempt < self.retries {
-                self.deadline_aware_sleep(backoff_delay(attempt));
+                let delay = last
+                    .as_ref()
+                    .map_or_else(|| backoff_delay(attempt), |e| retry_delay(attempt, e));
+                self.deadline_aware_sleep(delay);
             }
         }
         Err(last.unwrap_or_else(|| anyhow!("unknown failure")))
@@ -467,8 +532,19 @@ impl Llm {
         system: Option<&str>,
     ) -> Result<T> {
         let mut last: Option<anyhow::Error> = None;
+        // #171: retries used to treat a transport failure and a schema-mismatched response
+        // identically — resend the exact same ctx/task and sleep an exponential backoff either
+        // way. A schema failure isn't a transient server problem, so backoff doesn't help it,
+        // and resending an unmodified prompt tends to just reproduce the same mistake. At most
+        // one attempt (not the whole --retries budget) becomes a targeted repair instead: same
+        // ctx, but the task is augmented with the prior bad response and the specific validation
+        // error. If the repair itself still fails, any remaining attempts fall back to a plain
+        // resend with normal backoff, same as before — this doesn't add attempts beyond
+        // self.retries, it only changes what a schema-failure retry looks like.
+        let mut current_task: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(task);
+        let mut repair_used = false;
         for attempt in 0..=self.retries {
-            let raw = match self.call_once(ctx, task, system) {
+            let raw = match self.call_once(ctx, &current_task, system) {
                 Ok(r) => {
                     self.record_usage(&r.usage);
                     r.text
@@ -477,30 +553,21 @@ impl Llm {
                     // #119: same permanent-vs-transient distinction as text_ctx — a classified
                     // 401/403 here won't succeed on retry no matter how many attempts remain.
                     let retryable = is_retryable(&e);
-                    last = Some(e);
                     if self.verbose {
-                        match last.as_ref() {
-                            Some(error) => {
-                                eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries)
-                            }
-                            None => {
-                                eprintln!(
-                                    "[json retry {}/{}] unknown json retry error",
-                                    attempt + 1,
-                                    self.retries
-                                );
-                            }
-                        }
+                        eprintln!("[json retry {}/{}] {e}", attempt + 1, self.retries);
                     }
                     if !retryable {
+                        last = Some(e);
                         break;
                     }
                     if self.deadline_passed() {
+                        last = Some(e);
                         break;
                     }
                     if attempt < self.retries {
-                        self.deadline_aware_sleep(backoff_delay(attempt));
+                        self.deadline_aware_sleep(retry_delay(attempt, &e));
                     }
+                    last = Some(e);
                     continue;
                 }
             };
@@ -510,27 +577,30 @@ impl Llm {
             match parsed {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    last = Some(e);
                     if self.verbose {
-                        match last.as_ref() {
-                            Some(error) => {
-                                eprintln!("[json retry {}/{}] {error}", attempt + 1, self.retries)
-                            }
-                            None => {
-                                eprintln!(
-                                    "[json retry {}/{}] unknown json retry error",
-                                    attempt + 1,
-                                    self.retries
-                                );
-                            }
-                        }
+                        eprintln!("[json retry {}/{}] {e}", attempt + 1, self.retries);
                     }
                     if self.deadline_passed() {
+                        last = Some(e);
                         break;
                     }
                     if attempt < self.retries {
-                        self.deadline_aware_sleep(backoff_delay(attempt));
+                        if !repair_used {
+                            repair_used = true;
+                            current_task =
+                                std::borrow::Cow::Owned(build_repair_task(task, &raw, &e));
+                            // No backoff sleep here: a schema mistake isn't a rate-limit or
+                            // server-load problem, so there's nothing gained by waiting before
+                            // the model gets a chance to correct it.
+                        } else {
+                            // Repair already attempted once and still failed — fall back to a
+                            // plain resend (original task, normal backoff) for any remaining
+                            // budget rather than compounding repair attempts.
+                            current_task = std::borrow::Cow::Borrowed(task);
+                            self.deadline_aware_sleep(backoff_delay(attempt));
+                        }
                     }
+                    last = Some(e);
                 }
             }
         }
@@ -718,7 +788,9 @@ fn supports_prompt_caching(model: &str) -> bool {
 /// cache_control(ephemeral) attached — an optimization aiming for cache hits when the same ctx
 /// is called repeatedly (e.g. per-lens reviews). Otherwise, sends a single-string content as
 /// before.
+#[allow(clippy::too_many_arguments)]
 fn call_openai_compatible(
+    agent: &ureq::Agent,
     url: &str,
     api_key: Option<&str>,
     model: Option<&str>,
@@ -753,16 +825,19 @@ fn call_openai_compatible(
         "messages": messages,
     });
 
-    // ureq 3.x: AgentBuilder was replaced by Config/ConfigBuilder. http_status_as_error(false)
-    // makes 4xx/5xx come back as Ok(response) instead of Err, so we can still include both the
-    // status code and body in our own error message as before (with the default, you'd get only
-    // an Err with no body, unable to read it).
-    let config = ureq::Agent::config_builder()
+    // #171: timeout is set per-request (via RequestBuilder::config()), not on the agent itself
+    // — `agent` is shared and reused across every call this Llm instance makes (built once in
+    // new_http_agent), while `timeout` varies call to call as --deadline-minutes shrinks.
+    // http_status_as_error(false) (set once, at agent construction) makes 4xx/5xx come back as
+    // Ok(response) instead of Err, so we can still include both the status code and body in our
+    // own error message as before (with the default, you'd get only an Err with no body, unable
+    // to read it).
+    let mut req = agent
+        .post(url)
+        .config()
         .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .build();
-    let agent: ureq::Agent = config.into();
-    let mut req = agent.post(url).header("Content-Type", "application/json");
+        .build()
+        .header("Content-Type", "application/json");
     if let Some(key) = api_key {
         req = req.header("Authorization", &format!("Bearer {key}"));
     }
@@ -771,6 +846,16 @@ fn call_openai_compatible(
     let mut resp = result.map_err(|e| anyhow!("openrouter call failed: {e}"))?;
     if !resp.status().is_success() {
         let code = resp.status().as_u16();
+        // #171: previously the response headers weren't captured at all — a 429 with an
+        // explicit Retry-After got the same generic exponential backoff as any other retry.
+        // Seconds form only; the HTTP-date form of the header falls back to None (same effect
+        // as if the header were absent, not an error).
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
         let body_text = resp.body_mut().read_to_string().unwrap_or_default();
         // #119: HttpError carries the status code through as a typed error (instead of only
         // baking it into a string) so the retry loop can tell a permanent 401/403 apart from a
@@ -778,6 +863,7 @@ fn call_openai_compatible(
         return Err(HttpError {
             code,
             body: truncate(&body_text, 400),
+            retry_after,
         }
         .into());
     }
@@ -998,6 +1084,7 @@ mod tests {
             let e: anyhow::Error = HttpError {
                 code,
                 body: String::new(),
+                retry_after: None,
             }
             .into();
             assert!(is_retryable(&e), "{code} should be retryable");
@@ -1010,6 +1097,7 @@ mod tests {
             let e: anyhow::Error = HttpError {
                 code,
                 body: String::new(),
+                retry_after: None,
             }
             .into();
             assert!(!is_retryable(&e), "{code} should not be retryable");
@@ -1045,6 +1133,84 @@ mod tests {
             past_cap < at_cap * 2,
             "attempt 20's delay ({past_cap}ms) should be capped near attempt 6's ({at_cap}ms), not keep doubling"
         );
+    }
+
+    // --- #171: retry_delay() / build_repair_task() ---
+
+    #[test]
+    fn retry_delay_prefers_an_explicit_retry_after_over_the_generic_backoff() {
+        let e: anyhow::Error = HttpError {
+            code: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(7)),
+        }
+        .into();
+        assert_eq!(retry_delay(0, &e), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_backoff_when_no_retry_after_is_present() {
+        let e: anyhow::Error = HttpError {
+            code: 500,
+            body: String::new(),
+            retry_after: None,
+        }
+        .into();
+        assert_eq!(retry_delay(2, &e), backoff_delay(2));
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_backoff_for_a_non_http_error() {
+        let e = anyhow!("some transport failure that isn't an HttpError");
+        assert_eq!(retry_delay(1, &e), backoff_delay(1));
+    }
+
+    #[test]
+    fn build_repair_task_includes_the_prior_response_and_the_validation_error() {
+        let e = anyhow!("missing field `finding_id`");
+        let task = build_repair_task("# Task\nDo the thing.", "{\"oops\": true}", &e);
+        assert!(task.contains("# Task\nDo the thing."));
+        assert!(task.contains("{\"oops\": true}"));
+        assert!(task.contains("missing field `finding_id`"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RepairTestOut {
+        ok: bool,
+    }
+
+    #[test]
+    fn json_ctx_typed_recovers_after_one_schema_failure_when_a_retry_is_available() {
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(
+            vec!["not json at all".to_string(), r#"{"ok":true}"#.to_string()],
+            1,
+            usage,
+        );
+        let out: RepairTestOut = llm
+            .json_ctx_typed(None, "task", None)
+            .expect("should recover via the repair attempt");
+        assert!(out.ok);
+    }
+
+    #[test]
+    fn json_ctx_typed_does_not_spend_a_repair_attempt_when_retries_is_zero() {
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(
+            vec!["not json at all".to_string(), r#"{"ok":true}"#.to_string()],
+            0,
+            usage,
+        );
+        let err = llm.json_ctx_typed::<RepairTestOut>(None, "task", None);
+        assert!(
+            err.is_err(),
+            "must fail outright — no repair budget available with retries=0"
+        );
+        // The second fixture entry must still be untouched — prove it by consuming it directly.
+        let second = llm
+            .call_once(None, "task", None)
+            .expect("second fixture entry must still be queued, unconsumed by a repair attempt");
+        assert_eq!(second.text, r#"{"ok":true}"#);
     }
 
     #[test]
