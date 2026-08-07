@@ -357,7 +357,10 @@ sequenceDiagram
   cap is character-based, not token-based — a rough ~4-chars-per-token estimate is included in
   the large-diff warning for context, but it isn't a real per-provider/model tokenizer, so it can
   trigger too early or too late relative to the actual context window depending on the diff's
-  language/content.
+  language/content. It's also an approximate bound, not an exact one (the trailing note/join
+  overhead can push the actual output a few hundred bytes past it), and it only applies to the
+  diff — `--requirements`/`--conventions` content has no cap of its own; only the size *warning*
+  (300k-char threshold) accounts for all three together.
 - `claude -p` runtime depends on repository size and prompt density; expect seconds to
   minutes per run.
 
@@ -367,8 +370,9 @@ sequenceDiagram
   provider is configured, verbatim — neither backend redacts secrets or PII before sending. A
   one-line warning prints to stderr on every run as a reminder; don't run this against code
   containing secrets or restricted data unless that's acceptable for your org. Before sending, a
-  local pattern-based scan checks the diff's added lines for things that look like credentials
-  (AWS/GitHub/Slack tokens, PEM private keys, JWTs, `.env`-style secret assignments) and refuses
+  local pattern-based scan checks the diff's added lines, plus `--requirements`/`--conventions`
+  content, for things that look like credentials (AWS/GitHub/Slack tokens, PEM private keys,
+  JWTs, `.env`-style secret assignments) and refuses
   to proceed if it finds one — pass `--allow-sensitive-input` to send it anyway. This is a
   best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
   formats beyond the ones listed) — it catches the obvious cases, not everything.
@@ -407,9 +411,14 @@ replacement for their judgment:
   blocks merge on its own.
 - Findings that assert something is *absent* from the diff (`"not in the diff"`,
   `"not present"`, `"missing"`) are the most failure-prone category — discourse now has the actual
-  diff to verify these against (previously it didn't; see `src/discourse.rs`'s `ctx` handling), but
-  an LLM can still be confidently wrong. Spot-check high-impact absence claims against the diff
+  diff to verify these against (previously it didn't; see `src/discourse/mod.rs`'s `ctx` handling),
+  but an LLM can still be confidently wrong. Spot-check high-impact absence claims against the diff
   before acting on them.
+- A `P0`/`P1` finding that discourse couldn't reach consensus on (`UNCERTAIN` — see the "Needs
+  Human Review" section of `report.md`) forces `verdict` to `NEEDS_CONTEXT` rather than letting it
+  fall through to `APPROVE`/`COMMENT` — but this only covers `UNCERTAIN` specifically; still read
+  the "Needs Human Review" section yourself, since `MERGED`/omitted entries there aren't reflected
+  in the verdict at all.
 - Move whatever you can out of LLM judgment and into `--deterministic-results` (see the worked
   example above) — anything mechanically checkable shouldn't be left for the LLM to assert and
   potentially contradict itself on across discourse rounds.

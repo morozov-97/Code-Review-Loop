@@ -27,4 +27,8 @@ jobs:
         working-directory: evals
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -j 1
+        # #145: pinned instead of @latest — this job runs with OPENROUTER_API_KEY in its env,
+        # and an unpinned `npx <pkg>@latest` with no lockfile both breaks eval reproducibility
+        # (different promptfoo versions can score differently) and executes whatever the latest
+        # published release is with no version pin to fall back on if one is compromised.
+        run: npx promptfoo@0.122.0 eval -c promptfooconfig.yaml --no-cache -j 1

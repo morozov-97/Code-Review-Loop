@@ -153,6 +153,21 @@ impl Spec {
             "ignored_path_patterns has an empty pattern"
         );
 
+        // #146: score() only clamps the final total at the low end (.max(0)) — a negative
+        // penalty here would make CONFIRMED findings *add* to the score instead of subtracting,
+        // with nothing else catching it. Range-check at load time instead of trusting the TOML.
+        for (name, value) in [
+            ("p0", spec.scoring.p0),
+            ("p1", spec.scoring.p1),
+            ("p2", spec.scoring.p2),
+            ("p3", spec.scoring.p3),
+        ] {
+            anyhow::ensure!(
+                (0..=100).contains(&value),
+                "scoring.{name} must be between 0 and 100, got {value}"
+            );
+        }
+
         Ok(spec)
     }
 
@@ -359,6 +374,44 @@ title = "Design"
         );
         let spec = Spec::load(&path).expect("spec without ignored_path_patterns should load");
         assert!(spec.ignored_path_patterns.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_a_negative_scoring_penalty() {
+        let path = write_spec(
+            "negative-scoring.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+[scoring]
+p0 = -50
+"#,
+        );
+        let err = Spec::load(&path).expect_err("a negative scoring penalty must be rejected");
+        assert!(err.to_string().contains("scoring.p0"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_a_scoring_penalty_over_100() {
+        let path = write_spec(
+            "huge-scoring.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+[scoring]
+p1 = 999
+"#,
+        );
+        let err = Spec::load(&path).expect_err("a scoring penalty over 100 must be rejected");
+        assert!(err.to_string().contains("scoring.p1"));
         let _ = std::fs::remove_file(&path);
     }
 }

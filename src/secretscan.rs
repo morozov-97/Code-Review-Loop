@@ -13,23 +13,38 @@ pub(crate) struct SecretHit {
     pub(crate) redacted: String,
 }
 
+/// #137: previously matched `"+++ "` against every line unconditionally, so an *added* line
+/// whose own content started with `+++`/`++` (e.g. reviewing a diff/patch file, or content that
+/// legitimately starts with `+`) was either mistaken for a file-header line (and dropped) or
+/// explicitly skipped by a follow-up `starts_with('+')` check — either way, never scanned. Mirrors
+/// `input::parse_diff_stats`'s `in_hunk_body` tracking: `"+++ "` only means "file header" in the
+/// diff header section (before the first `@@`); once inside a hunk body, every `+`-prefixed line
+/// is added content, full stop, regardless of what character comes right after that `+`.
 pub(crate) fn scan(diff: &str) -> Vec<SecretHit> {
     let mut hits = Vec::new();
     let mut current_file = String::from("(unknown file)");
+    let mut in_hunk_body = false;
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let path = rest.strip_prefix("b/").unwrap_or(rest);
-            if path != "/dev/null" {
-                current_file = path.to_string();
+        if line.starts_with("diff --git ") {
+            in_hunk_body = false;
+            continue;
+        }
+        if line.starts_with("@@") {
+            in_hunk_body = true;
+            continue;
+        }
+        if !in_hunk_body {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                let path = rest.strip_prefix("b/").unwrap_or(rest);
+                if path != "/dev/null" {
+                    current_file = path.to_string();
+                }
             }
             continue;
         }
         let Some(added) = line.strip_prefix('+') else {
             continue;
         };
-        if added.starts_with('+') {
-            continue; // "+++ " header lines already handled above; other "++..." isn't added content worth scanning twice
-        }
         for (pattern, value) in find_secrets(added) {
             hits.push(SecretHit {
                 file: current_file.clone(),
@@ -41,16 +56,35 @@ pub(crate) fn scan(diff: &str) -> Vec<SecretHit> {
     hits
 }
 
-fn redact(value: &str) -> String {
-    if value.len() <= 8 {
-        return "*".repeat(value.len());
+/// #137: requirements/conventions content is sent to the LLM verbatim just like the diff (see
+/// `promptctx::shared_context`), but wasn't scanned at all — only `scan()` (diff-shaped input)
+/// was wired up. This is the same pattern-matching core applied to plain text: every non-empty
+/// line is scanned directly, with no diff marker to strip.
+pub(crate) fn scan_text(label: &str, text: &str) -> Vec<SecretHit> {
+    let mut hits = Vec::new();
+    for line in text.lines() {
+        for (pattern, value) in find_secrets(line) {
+            hits.push(SecretHit {
+                file: label.to_string(),
+                pattern,
+                redacted: redact(value),
+            });
+        }
     }
-    format!(
-        "{}{}{}",
-        &value[..4],
-        "*".repeat(value.len() - 8),
-        &value[value.len() - 4..]
-    )
+    hits
+}
+
+/// #138: operates on chars, not bytes — the previous byte-index slicing (`&value[..4]`) panicked
+/// whenever a multi-byte UTF-8 char straddled the byte-4/byte-(len-4) boundary (e.g. a Korean/
+/// Japanese/Cyrillic secret value matched by find_env_style_secret).
+fn redact(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 8 {
+        return "*".repeat(chars.len());
+    }
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    format!("{prefix}{}{suffix}", "*".repeat(chars.len() - 8))
 }
 
 /// Returns every (pattern name, matched value) found in one added line. Hand-rolled instead of
@@ -253,6 +287,46 @@ mod tests {
     }
 
     #[test]
+    fn scan_detects_a_secret_on_an_added_line_whose_own_content_starts_with_plus() {
+        // #137: an added line whose content is "+AWS_KEY=..." produces the raw diff line
+        // "++AWS_KEY=..." — this used to be silently skipped entirely.
+        let diff = "+++ b/config.py\n@@ -1 +1 @@\n++AWS_KEY=\"AKIAABCDEFGHIJKLMNOP\"\n";
+        let hits = scan(diff);
+        assert!(hits.iter().any(|h| h.pattern == "AWS access key ID"));
+    }
+
+    #[test]
+    fn scan_does_not_mistake_an_added_line_starting_with_plus_plus_plus_for_a_file_header() {
+        // #137: mirrors input::parse_diff_stats's equivalent regression test — a hunk-body
+        // added line that happens to start with "+++" must still be scanned as content, not
+        // mistaken for a "+++ b/path" file header (which only appears before the first "@@").
+        let diff = "diff --git a/note.txt b/note.txt\n\
+                     --- a/note.txt\n\
+                     +++ b/note.txt\n\
+                     @@ -1,1 +1,2 @@\n\
+                      line one\n\
+                     +++ AWS_KEY=\"AKIAABCDEFGHIJKLMNOP\"\n";
+        let hits = scan(diff);
+        assert!(hits.iter().any(|h| h.pattern == "AWS access key ID"));
+        assert_eq!(hits[0].file, "note.txt");
+    }
+
+    #[test]
+    fn scan_text_finds_a_secret_in_plain_text_and_labels_it_with_the_given_source() {
+        let hits = scan_text(
+            "requirements",
+            "some notes\nour key is AKIAABCDEFGHIJKLMNOP\nmore notes",
+        );
+        assert!(hits.iter().any(|h| h.pattern == "AWS access key ID"));
+        assert_eq!(hits[0].file, "requirements");
+    }
+
+    #[test]
+    fn scan_text_ignores_lines_with_no_secret_shape() {
+        assert!(scan_text("conventions", "use tabs, not spaces\nprefer early returns").is_empty());
+    }
+
+    #[test]
     fn scan_returns_no_hits_on_an_ordinary_diff() {
         let diff = "+++ b/src/main.rs\n@@ -1 +1 @@\n+fn main() { println!(\"hi\"); }\n";
         assert!(scan(diff).is_empty());
@@ -262,5 +336,23 @@ mod tests {
     fn redact_masks_the_middle_and_keeps_first_and_last_four_chars() {
         assert_eq!(redact("AKIAABCDEFGHIJKLMNOP"), "AKIA************MNOP");
         assert_eq!(redact("short"), "*****");
+    }
+
+    #[test]
+    fn redact_does_not_panic_on_multi_byte_utf8_secrets() {
+        // #138: byte-index slicing used to panic here — a Korean char is 3 bytes, so byte
+        // index 4 lands mid-character.
+        let value = "한글비밀번호1234567890";
+        let redacted = redact(value);
+        assert!(redacted.starts_with("한글비밀"));
+        assert!(redacted.ends_with("7890"));
+    }
+
+    #[test]
+    fn scan_finds_and_redacts_a_non_ascii_env_style_secret_without_panicking() {
+        let diff = "+++ b/config.py\n@@ -1 +1 @@\n+PASSWORD=한글비밀번호1234567890\n";
+        let hits = scan(diff);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].redacted.starts_with("한글비밀"));
     }
 }

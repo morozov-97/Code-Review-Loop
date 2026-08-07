@@ -43,7 +43,38 @@ pub fn try_run(changed_files: &[String]) -> Option<serde_json::Value> {
         .output()
         .ok()?;
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    build_deterministic_results(output.status.success(), output.status.code(), &v)
+}
+
+/// #144: split out of `try_run` so the exit-status/errors-array handling can be unit tested
+/// without shelling out to a real `semgrep` binary.
+fn build_deterministic_results(
+    exit_success: bool,
+    exit_code: Option<i32>,
+    v: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let results = v.get("results")?.as_array()?;
+
+    // Neither the process exit status nor semgrep's own "errors" array (per-rule/per-file
+    // failures during a partial scan) used to be checked — a nonzero exit that still produced
+    // valid-but-incomplete JSON (an empty `results` from the rules that DID finish) looked
+    // identical to a genuinely clean, fully-completed run. Report a distinct "error" status
+    // instead of falling through to "pass" on an empty `results` array in that case.
+    let semgrep_errors = v
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .filter(|a| !a.is_empty());
+    if !exit_success || semgrep_errors.is_some() {
+        let evidence = format!(
+            "semgrep --config=auto exited with status {exit_code:?} and {} error(s) in its output — scan may be incomplete, not treated as pass/fail",
+            semgrep_errors.map(|a| a.len()).unwrap_or(0)
+        );
+        return Some(serde_json::json!({
+            "sast": { "status": "error", "evidence": evidence.clone() },
+            "secrets": { "status": "error", "evidence": evidence },
+        }));
+    }
+
     let has_findings = !results.is_empty();
     let secrets_hit = results.iter().any(|r| {
         r.get("check_id")
@@ -109,6 +140,49 @@ fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // --- build_deterministic_results() ---
+
+    #[test]
+    fn build_deterministic_results_reports_pass_on_a_clean_successful_run() {
+        let v = serde_json::json!({"results": []});
+        let out = build_deterministic_results(true, Some(0), &v).unwrap();
+        assert_eq!(out["sast"]["status"], "pass");
+        assert_eq!(out["secrets"]["status"], "pass");
+    }
+
+    #[test]
+    fn build_deterministic_results_reports_fail_when_results_are_present() {
+        let v = serde_json::json!({"results": [{"check_id": "some-rule"}]});
+        let out = build_deterministic_results(true, Some(0), &v).unwrap();
+        assert_eq!(out["sast"]["status"], "fail");
+    }
+
+    #[test]
+    fn build_deterministic_results_reports_error_not_pass_on_a_nonzero_exit_with_empty_results() {
+        // #144: this is the dangerous case — a partial/failed scan that still emitted valid
+        // JSON with an empty `results` array must not look identical to a genuinely clean run.
+        let v = serde_json::json!({"results": []});
+        let out = build_deterministic_results(false, Some(2), &v).unwrap();
+        assert_eq!(out["sast"]["status"], "error");
+        assert_eq!(out["secrets"]["status"], "error");
+        assert_ne!(out["sast"]["status"], "pass");
+    }
+
+    #[test]
+    fn build_deterministic_results_reports_error_when_the_errors_array_is_non_empty_even_on_a_zero_exit(
+    ) {
+        let v = serde_json::json!({"results": [], "errors": [{"message": "rule timed out"}]});
+        let out = build_deterministic_results(true, Some(0), &v).unwrap();
+        assert_eq!(out["sast"]["status"], "error");
+    }
+
+    #[test]
+    fn build_deterministic_results_ignores_an_empty_errors_array() {
+        let v = serde_json::json!({"results": [], "errors": []});
+        let out = build_deterministic_results(true, Some(0), &v).unwrap();
+        assert_eq!(out["sast"]["status"], "pass");
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("codereview-loop-semgrep-which-{name}"));

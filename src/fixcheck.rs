@@ -102,7 +102,13 @@ fn corroborate(
 /// array, so if a finding isn't mentioned at all, a previously CONFIRMED P0/P1 silently
 /// disappears from the score and report. Failure must always land on STILL_OPEN (the stricter
 /// direction, with a human looking again).
-fn fill_missing_as_still_open(
+///
+/// #135: `pub(crate)` (was private) so `pipeline/review.rs` can call this with an empty
+/// `results` when `run()` itself fails outright or is skipped for `--deadline-minutes` — every
+/// entry in `prior_confirmed` is then "missing" and gets the same safe STILL_OPEN synthesis,
+/// instead of the caller falling back to an empty `Vec` that silently drops every prior
+/// CONFIRMED finding from this round's re-fold.
+pub(crate) fn fill_missing_as_still_open(
     mut results: Vec<FixStatus>,
     prior_confirmed: &[Finding],
 ) -> Vec<FixStatus> {

@@ -29,7 +29,7 @@ pub(crate) fn run_improve(
         &None,
         lang.clone(),
     )?;
-    enforce_secret_scan(&inp.diff, allow_sensitive_input)?;
+    enforce_secret_scan(&inp, allow_sensitive_input)?;
     let out_dir = prepare_out(out)?;
     let suggestions = improve::run(llm, &sp, &inp)?;
     let path = report::write_improve(&out_dir, &suggestions)?;

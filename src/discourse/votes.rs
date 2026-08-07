@@ -18,17 +18,33 @@ pub(super) const VOTE_THRESHOLD: f64 = 0.6;
 /// Tallies only the AGREE/CHALLENGE(existence) votes that directly target one finding
 /// (excludes merge_vote_weight itself — this lets merge_vote_weight, when it calls this
 /// function recursively, isolate just "how much this finding itself was trusted").
+///
+/// #140: two rules the prompt states but didn't used to be locally enforced:
+/// - an AGREE with empty `new_evidence` counts the same as one with none — the prompt asks for
+///   AGREE "only when there's new file:line evidence," this makes that a real requirement
+///   instead of trusting the LLM's own compliance.
+/// - the same lens issuing more than one AGREE/CHALLENGE for the same target within a single
+///   round (a response quirk, not a second independent signal) used to double-count every
+///   repeat instead of counting once per (round, lens).
 pub(super) fn direct_vote_net(audit: &[DiscourseAudit], target_id: &str) -> f64 {
-    audit
-        .iter()
-        .flat_map(|a| a.moves.iter())
-        .filter(|m| m.target == target_id)
-        .map(|m| match m.kind.as_str() {
-            "AGREE" => confidence_weight(&m.confidence),
-            "CHALLENGE" if m.challenge_axis == "EXISTENCE" => -confidence_weight(&m.confidence),
-            _ => 0.0,
-        })
-        .sum()
+    let mut seen: std::collections::HashSet<(usize, &str)> = std::collections::HashSet::new();
+    let mut net = 0.0;
+    for a in audit {
+        for m in &a.moves {
+            if m.target != target_id {
+                continue;
+            }
+            if !seen.insert((a.round, m.lens.as_str())) {
+                continue;
+            }
+            net += match m.kind.as_str() {
+                "AGREE" if !m.new_evidence.trim().is_empty() => confidence_weight(&m.confidence),
+                "CHALLENGE" if m.challenge_axis == "EXISTENCE" => -confidence_weight(&m.confidence),
+                _ => 0.0,
+            };
+        }
+    }
+    net
 }
 
 /// When finding X gets MERGED into Y, discourse has decided "X and Y are the same issue,"
@@ -97,6 +113,87 @@ mod tests {
         assert_eq!(
             direct_vote_net(&canonical, "f1"),
             direct_vote_net(&miscased, "f1")
+        );
+    }
+
+    #[test]
+    fn direct_vote_net_ignores_an_agree_with_no_new_evidence() {
+        // #140: the prompt asks for AGREE "only when there's new file:line evidence" — an
+        // empty new_evidence must not carry the same weight as a real one.
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![Move {
+                kind: "AGREE".to_string(),
+                lens: "tests".to_string(),
+                target: "f1".to_string(),
+                detail: "agreed".to_string(),
+                new_evidence: String::new(),
+                confidence: "high".to_string(),
+                challenge_axis: String::new(),
+            }],
+        }];
+        assert_eq!(direct_vote_net(&audit, "f1"), 0.0);
+    }
+
+    #[test]
+    fn direct_vote_net_counts_an_agree_with_new_evidence() {
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![agree("f1", "high")],
+        }];
+        assert_eq!(direct_vote_net(&audit, "f1"), confidence_weight("high"));
+    }
+
+    #[test]
+    fn direct_vote_net_counts_a_repeated_agree_from_the_same_lens_in_the_same_round_only_once() {
+        // #140: two AGREE moves from the same lens targeting the same finding within one round
+        // used to double the vote weight instead of counting once.
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![agree("f1", "high"), agree("f1", "high")],
+        }];
+        assert_eq!(
+            direct_vote_net(&audit, "f1"),
+            confidence_weight("high"),
+            "a duplicate AGREE from the same lens in the same round must not double the vote"
+        );
+    }
+
+    #[test]
+    fn direct_vote_net_counts_the_same_lens_again_in_a_later_round() {
+        // Dedup is scoped to (round, lens) — a lens reaffirming across genuinely different
+        // rounds is still meaningful and must still count each time.
+        let audit = vec![
+            DiscourseAudit {
+                round: 1,
+                moves: vec![agree("f1", "high")],
+            },
+            DiscourseAudit {
+                round: 2,
+                moves: vec![agree("f1", "high")],
+            },
+        ];
+        assert_eq!(
+            direct_vote_net(&audit, "f1"),
+            2.0 * confidence_weight("high")
+        );
+    }
+
+    #[test]
+    fn direct_vote_net_counts_two_different_lenses_in_the_same_round() {
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![
+                agree("f1", "high"),
+                Move {
+                    lens: "other-lens".to_string(),
+                    ..agree("f1", "high")
+                },
+            ],
+        }];
+        assert_eq!(
+            direct_vote_net(&audit, "f1"),
+            2.0 * confidence_weight("high")
         );
     }
 

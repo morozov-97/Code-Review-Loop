@@ -2,6 +2,7 @@ pub(crate) mod describe;
 pub(crate) mod improve;
 pub(crate) mod review;
 
+use crate::input::Input;
 use crate::secretscan;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -13,10 +14,17 @@ pub(crate) fn prepare_out(p: &Path) -> Result<PathBuf> {
 }
 
 /// #122: called right after `input::normalize`, before any LLM call. Refuses to proceed (unless
-/// `allow_sensitive_input`) when the diff's added lines contain something that looks like a
-/// credential — the diff is about to be sent verbatim to an external LLM provider.
-pub(crate) fn enforce_secret_scan(diff: &str, allow_sensitive_input: bool) -> Result<()> {
-    let hits = secretscan::scan(diff);
+/// `allow_sensitive_input`) when the diff (or, per #137, requirements/conventions — both are
+/// sent to the LLM verbatim just like the diff, see `promptctx::shared_context`) contains
+/// something that looks like a credential.
+pub(crate) fn enforce_secret_scan(inp: &Input, allow_sensitive_input: bool) -> Result<()> {
+    let mut hits = secretscan::scan(&inp.diff);
+    if let Some(r) = &inp.requirements {
+        hits.extend(secretscan::scan_text("requirements", r));
+    }
+    if let Some(c) = &inp.conventions {
+        hits.extend(secretscan::scan_text("conventions", c));
+    }
     if hits.is_empty() || allow_sensitive_input {
         return Ok(());
     }

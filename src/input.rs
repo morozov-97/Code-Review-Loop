@@ -180,6 +180,13 @@ fn is_noisy_path(path: &str) -> bool {
 /// Unlike DIFF_WARN_CHARS (a cost warning, see pipeline/review.rs), this is an actual limit —
 /// past this, prioritize_and_cap_diff starts dropping the lowest-priority file-blocks so the
 /// diff can't grow unbounded and risk exceeding the model's context window.
+///
+/// #142: an *approximate* limit, not an exact one — the trailing `[NOTE: ... omitted/truncated
+/// ...]` text and the newlines from joining kept blocks are added after truncation, so the final
+/// output can run a few hundred bytes past this value (see the `+ 500` tolerance in
+/// `prioritize_and_cap_diff_truncates_a_lone_oversized_block_instead_of_returning_it_whole`
+/// below). Also diff-only: `--requirements`/`--conventions` content has no cap of its own at
+/// all (only the best-effort warning in `pipeline/review.rs` covers them).
 const DIFF_HARD_CAP_CHARS: usize = 1_000_000;
 
 /// #127: DIFF_HARD_CAP_CHARS/DIFF_WARN_CHARS protect against context-window overflow, but

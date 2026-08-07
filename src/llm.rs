@@ -228,6 +228,27 @@ impl Llm {
         }
     }
 
+    /// #143: true once `self.deadline` has passed. Used by the retry loops to stop retrying
+    /// entirely, instead of still burning a sleep + another attempt (with effective_timeout's
+    /// 1s floor) after the budget is already gone.
+    fn deadline_passed(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// Sleeps `base`, capped at whatever's left until `self.deadline` (if set). The plain
+    /// backoff sleep used to run its full duration regardless of the deadline, undermining the
+    /// "wall-clock bound" `--deadline-minutes` is documented to provide (`effective_timeout`
+    /// only shrinks the *call* timeout, not the sleep between calls).
+    fn deadline_aware_sleep(&self, base: Duration) {
+        let capped = match self.deadline {
+            None => base,
+            Some(d) => base.min(d.saturating_duration_since(Instant::now())),
+        };
+        if !capped.is_zero() {
+            std::thread::sleep(capped);
+        }
+    }
+
     fn record_usage(&self, u: &CallUsage) {
         let mut g = self.usage.lock().unwrap_or_else(|e| e.into_inner());
         g.calls += 1;
@@ -307,8 +328,13 @@ impl Llm {
             if !retryable {
                 break;
             }
+            // #143: once the deadline's passed, another attempt (even at effective_timeout's
+            // 1s floor) is budget --deadline-minutes was supposed to have cut off already.
+            if self.deadline_passed() {
+                break;
+            }
             if attempt < self.retries {
-                std::thread::sleep(backoff_delay(attempt));
+                self.deadline_aware_sleep(backoff_delay(attempt));
             }
         }
         Err(last.unwrap_or_else(|| anyhow!("unknown failure")))
@@ -366,8 +392,11 @@ impl Llm {
                     if !retryable {
                         break;
                     }
+                    if self.deadline_passed() {
+                        break;
+                    }
                     if attempt < self.retries {
-                        std::thread::sleep(backoff_delay(attempt));
+                        self.deadline_aware_sleep(backoff_delay(attempt));
                     }
                     continue;
                 }
@@ -393,8 +422,11 @@ impl Llm {
                             }
                         }
                     }
+                    if self.deadline_passed() {
+                        break;
+                    }
                     if attempt < self.retries {
-                        std::thread::sleep(backoff_delay(attempt));
+                        self.deadline_aware_sleep(backoff_delay(attempt));
                     }
                 }
             }
@@ -763,6 +795,51 @@ mod tests {
         assert_eq!(
             llm.effective_timeout(Duration::from_secs(600)),
             Duration::from_secs(1)
+        );
+    }
+
+    // --- #143: deadline_passed() / deadline_aware_sleep() ---
+
+    #[test]
+    fn deadline_passed_is_false_when_no_deadline_is_set() {
+        assert!(!test_llm().deadline_passed());
+    }
+
+    #[test]
+    fn deadline_passed_is_false_before_the_deadline() {
+        let llm = test_llm().with_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        assert!(!llm.deadline_passed());
+    }
+
+    #[test]
+    fn deadline_passed_is_true_once_the_deadline_is_behind_now() {
+        let llm = test_llm().with_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        assert!(llm.deadline_passed());
+    }
+
+    #[test]
+    fn deadline_aware_sleep_does_not_block_past_a_deadline_that_has_already_passed() {
+        // #143: the previous unconditional std::thread::sleep(backoff_delay(attempt)) would
+        // have slept the full ~500ms+ here regardless of the deadline already being gone.
+        let llm = test_llm().with_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        let started = Instant::now();
+        llm.deadline_aware_sleep(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "expected an immediate return, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn deadline_aware_sleep_caps_at_the_remaining_budget_instead_of_the_full_backoff() {
+        let llm = test_llm().with_deadline(Some(Instant::now() + Duration::from_millis(50)));
+        let started = Instant::now();
+        llm.deadline_aware_sleep(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "expected to be capped near 50ms, took {:?}",
+            started.elapsed()
         );
     }
 

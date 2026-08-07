@@ -59,14 +59,17 @@ fn score(
     for f in findings {
         if resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED") {
             let p = severity_penalty(scoring, &f.severity);
-            total -= p;
+            total = total.saturating_sub(p);
             deductions.push(format!(
                 "[{}] {}:{} -{} pts — {}",
                 f.severity, f.file, f.line, p, f.claim
             ));
         }
     }
-    (total.max(0), deductions)
+    // #146: Spec::load now validates each scoring.pN into 0..=100, but clamping both ends here
+    // too is cheap defense in depth against a `Finding` built directly (not via Spec::load —
+    // e.g. a future caller, or a test) with an out-of-range ScoringConfig.
+    (total.clamp(0, 100), deductions)
 }
 
 /// Estimated review effort based on change size. Assumption: the thresholds are a design choice (uncertain), should be adjusted per team size.
@@ -108,6 +111,17 @@ fn verdict(
     }
     if policies.iter().any(|p| p.status == PolicyStatus::Fail) {
         return "REQUEST_CHANGES".to_string();
+    }
+    // #136: verdict/score used to look at CONFIRMED findings only — a P0/P1 that discourse
+    // couldn't reach consensus on (UNCERTAIN) had zero influence here, so a diff with a
+    // genuinely unresolved high-severity finding could still land on APPROVE as long as nothing
+    // else failed. MERGED is deliberately excluded — that status means "folded into another
+    // finding," not "unresolved," and the merge target's own status is checked independently.
+    if findings.iter().any(|f| {
+        matches!(f.severity.as_str(), "P0" | "P1")
+            && resolved.get(&f.id).map(|r| r.status.as_str()) == Some("UNCERTAIN")
+    }) {
+        return "NEEDS_CONTEXT".to_string();
     }
     if confirmed.iter().any(|f| f.severity == "P1") {
         return "COMMENT".to_string();
@@ -265,6 +279,25 @@ mod tests {
     }
 
     #[test]
+    fn score_clamps_at_100_even_with_a_scoring_config_that_bypassed_spec_load_validation() {
+        // #146: Spec::load now rejects a negative penalty, but score() defensively clamps the
+        // upper end too — in case a ScoringConfig is ever built directly rather than parsed
+        // from spec.toml.
+        let scoring = ScoringConfig {
+            p0: -50,
+            ..Default::default()
+        };
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        let (sc, _) = score(&scoring, &findings, &resolved);
+        assert_eq!(
+            sc, 100,
+            "score must never exceed 100 regardless of penalty sign"
+        );
+    }
+
+    #[test]
     fn score_uses_custom_scoring_config_instead_of_the_hardcoded_defaults() {
         // #106: severity weights used to be hardcoded with no way to tune per team policy.
         let findings = vec![finding("a", "P0")];
@@ -297,6 +330,53 @@ mod tests {
             verdict(&[], &HashMap::new(), &policies, &None),
             "REQUEST_CHANGES"
         );
+    }
+
+    #[test]
+    fn verdict_needs_context_on_an_uncertain_p0_even_with_nothing_else_confirmed() {
+        // #136: an UNCERTAIN P0 (discourse couldn't reach consensus) used to have zero
+        // influence on the verdict — nothing else failing meant APPROVE despite the unresolved
+        // high-severity finding.
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "NEEDS_CONTEXT");
+    }
+
+    #[test]
+    fn verdict_needs_context_on_an_uncertain_p1() {
+        let findings = vec![finding("a", "P1")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "NEEDS_CONTEXT");
+    }
+
+    #[test]
+    fn verdict_ignores_an_uncertain_p2_since_it_is_not_high_severity() {
+        let findings = vec![finding("a", "P2")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "APPROVE");
+    }
+
+    #[test]
+    fn verdict_ignores_a_merged_p0_since_merged_means_folded_not_unresolved() {
+        // MERGED is deliberately excluded from the #136 check — it means "folded into another
+        // finding," and that survivor's own status is what should matter, not this entry.
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "MERGED"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "APPROVE");
+    }
+
+    #[test]
+    fn verdict_request_changes_still_wins_over_an_unrelated_uncertain_p1() {
+        // A confirmed P0 elsewhere must still take priority over the new NEEDS_CONTEXT check.
+        let findings = vec![finding("a", "P0"), finding("b", "P1")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        resolved.insert("b".to_string(), resolution("b", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "REQUEST_CHANGES");
     }
 
     #[test]

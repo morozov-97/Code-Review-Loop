@@ -29,7 +29,7 @@ pub(crate) fn run_describe(
         &None,
         lang.clone(),
     )?;
-    enforce_secret_scan(&inp.diff, allow_sensitive_input)?;
+    enforce_secret_scan(&inp, allow_sensitive_input)?;
     let out_dir = prepare_out(out)?;
     let d = describe::run(llm, &sp, &inp)?;
     let todos = describe::todo_sections(&inp.diff);

@@ -24,7 +24,7 @@ use schema::{
     surface_id, DiscourseRound,
 };
 use std::collections::HashMap;
-use votes::{confidence_weight, merge_vote_weight, VOTE_THRESHOLD};
+use votes::{direct_vote_net, merge_vote_weight, VOTE_THRESHOLD};
 
 pub struct DiscourseAudit {
     pub round: usize,
@@ -99,6 +99,28 @@ pub fn run(
 
         for mut r in dr.resolutions.clone() {
             r.status = normalize_status(&r.status);
+            // #140: mirrors fixcheck::verify_supersedes's treatment of superseded_by — a
+            // MERGED resolution naming a merged_into that isn't an actual finding id would
+            // otherwise vanish (excluded from `confirmed` as MERGED, but its vote weight never
+            // credited to anything real either, since the target it names doesn't exist).
+            if r.status == "MERGED" && !findings.iter().any(|f| f.id == r.merged_into) {
+                r.reason = format!(
+                    "{} [Verification failed: merged_into(\"{}\") is not among this round's findings — safely reverted to UNCERTAIN]",
+                    r.reason, r.merged_into
+                );
+                r.status = "UNCERTAIN".to_string();
+            }
+            // #140: the prompt says resolutions "should only judge findings that are UNRESOLVED
+            // or were UNCERTAIN in the previous round," but nothing enforced that — a later
+            // round's LLM output re-judging an already-CONFIRMED/REJECTED id would silently
+            // replace it. Once a finding has a final verdict, keep it.
+            let already_final = matches!(
+                resolved.get(&r.finding_id).map(|e| e.status.as_str()),
+                Some("CONFIRMED") | Some("REJECTED")
+            );
+            if already_final {
+                continue;
+            }
             resolved.insert(r.finding_id.clone(), r);
         }
 
@@ -130,20 +152,11 @@ pub fn run(
             continue;
         }
 
-        let net: f64 = audit
-            .iter()
-            .flat_map(|a| a.moves.iter())
-            .filter(|m| m.target == f.id)
-            .map(|m| match m.kind.as_str() {
-                "AGREE" => confidence_weight(&m.confidence),
-                // A severity-axis CHALLENGE doesn't dispute the finding's existence, so it's
-                // excluded from the vote (0 votes, same as CONNECT/SURFACE) — only the
-                // existence axis counts toward rejection.
-                "CHALLENGE" if m.challenge_axis == "EXISTENCE" => -confidence_weight(&m.confidence),
-                _ => 0.0,
-            })
-            .sum::<f64>()
-            + merge_vote_weight(&resolved, &audit, &f.id);
+        // #140: was a hand-duplicated copy of votes::direct_vote_net's own logic (missing its
+        // new_evidence/dedup enforcement) — now calls it directly, so both fixes apply to the
+        // actual tally that decides CONFIRMED/REJECTED, not just to direct_vote_net's own
+        // internal use inside merge_vote_weight.
+        let net: f64 = direct_vote_net(&audit, &f.id) + merge_vote_weight(&resolved, &audit, &f.id);
 
         let (status, reason) = if net >= VOTE_THRESHOLD {
             (
@@ -171,6 +184,32 @@ pub fn run(
                 reason,
             },
         );
+    }
+
+    // #140: a severity-axis CHALLENGE deliberately never affects the confirm/reject vote (see
+    // #75) or `finding.severity` itself — auto-adjusting severity off an unvalidated LLM
+    // proposal risks silently downgrading a real P0 with nothing to catch it, worse than the
+    // status quo. But a CONFIRMED finding the panel also disputed the severity of currently has
+    // zero visibility next to the score-affecting entry itself (only the separate Discourse
+    // Audit table shows raw moves) — this makes that dispute visible right on the finding.
+    for f in findings.iter() {
+        let is_confirmed = resolved
+            .get(&f.id)
+            .map(|r| r.status == "CONFIRMED")
+            .unwrap_or(false);
+        if !is_confirmed {
+            continue;
+        }
+        let disputed = audit
+            .iter()
+            .flat_map(|a| a.moves.iter())
+            .any(|m| m.target == f.id && m.kind == "CHALLENGE" && m.challenge_axis == "SEVERITY");
+        if disputed {
+            if let Some(r) = resolved.get_mut(&f.id) {
+                r.reason =
+                    format!("{} [severity disputed by a discourse CHALLENGE — see Discourse Audit for detail]", r.reason);
+            }
+        }
     }
 
     Ok((audit, resolved))
@@ -390,6 +429,179 @@ mod tests {
         assert_eq!(
             resolved["security-r1-1"].status, "UNCERTAIN",
             "the survivor must not be laundered into confirmation just because a disputed finding was merged into it"
+        );
+    }
+
+    #[test]
+    fn run_reverts_a_merged_resolution_whose_merged_into_does_not_name_a_real_finding() {
+        // #140: mirrors fixcheck::verify_supersedes's treatment of an invalid superseded_by —
+        // a hallucinated merged_into used to make the finding vanish (MERGED, excluded from
+        // `confirmed`, but its vote weight never credited to anything real either).
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                "detail": "d", "confidence": "high", "challenge_axis": "existence"
+            }],
+            "resolutions": [{
+                "finding_id": "a", "status": "MERGED",
+                "merged_into": "does-not-exist", "reason": "merged as same issue"
+            }],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "MERGED",
+            "a MERGED resolution naming a nonexistent merged_into must not stand as-is"
+        );
+    }
+
+    #[test]
+    fn run_does_not_let_a_later_round_overwrite_an_already_confirmed_finding() {
+        // #140: the prompt says resolutions should only judge UNRESOLVED/UNCERTAIN findings,
+        // but nothing enforced it — a later round re-judging an already-CONFIRMED id used to
+        // silently replace it.
+        let mut findings = vec![
+            test_finding("finding a", "evidence A"),
+            test_finding("finding b", "evidence B"),
+        ];
+        findings[0].id = "a".to_string();
+        findings[1].id = "b".to_string();
+
+        // Round 1: confirms "a" outright; "b" stays unresolved (nothing targets it), so the
+        // loop continues into round 2.
+        let round1 = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                "detail": "d", "confidence": "high", "challenge_axis": "existence"
+            }],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "round1 confirm"}],
+            "surfaced": []
+        })
+        .to_string();
+        // Round 2: legitimately confirms "b", but also tries to flip already-CONFIRMED "a" to
+        // REJECTED — that flip must not take effect.
+        let round2 = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target-2",
+                "detail": "d", "confidence": "high", "challenge_axis": "existence"
+            }],
+            "resolutions": [
+                {"finding_id": "a", "status": "REJECTED", "reason": "round2 tries to flip"},
+                {"finding_id": "b", "status": "CONFIRMED", "reason": "round2 confirm b"}
+            ],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![round1, round2], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            2,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved["a"].status, "CONFIRMED",
+            "an already-CONFIRMED finding must not be flipped by a later round"
+        );
+        assert!(
+            resolved["a"].reason.contains("round1 confirm"),
+            "the original round-1 resolution must survive, got: {}",
+            resolved["a"].reason
+        );
+        assert_eq!(resolved["b"].status, "CONFIRMED");
+    }
+
+    #[test]
+    fn run_notes_a_severity_dispute_on_a_confirmed_finding_without_changing_its_status() {
+        // #140: a severity-axis CHALLENGE deliberately never flips confirm/reject or touches
+        // finding.severity (see #75) — but it should be visible next to the finding itself,
+        // not only in the separate Discourse Audit table.
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+        findings[0].severity = "P0".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "a",
+                "detail": "severity is overstated", "confidence": "high", "challenge_axis": "severity"
+            }],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "confirmed"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved["a"].status, "CONFIRMED",
+            "a severity-axis challenge must not change confirm/reject"
+        );
+        assert!(
+            resolved["a"].reason.contains("severity disputed"),
+            "the severity dispute must be visible on the finding itself, got: {}",
+            resolved["a"].reason
         );
     }
 }
