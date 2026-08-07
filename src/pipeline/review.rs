@@ -128,6 +128,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // includes deterministic_results — only quantify::deterministic_gate does, at the very end
     // of this function). Spawned in the background instead; joined just before that gate needs
     // it, so it overlaps with everything from lens review through human-voice.
+    let semgrep_started = std::time::Instant::now();
     let semgrep_handle = inp.deterministic_results.is_none().then(|| {
         let changed_files = inp.changed_files.clone();
         let timeout = semgrep_timeout(deadline_instant);
@@ -195,6 +196,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // barrier before any lens review started — even though the mandatory (always) lenses don't
     // depend on its result at all. Running selection on its own thread alongside the
     // mandatory-lens par_map hides that round trip behind work that has to happen anyway.
+    let lens_stage_started = std::time::Instant::now();
     let (optional_selected, mandatory_results): (Result<Vec<String>>, LensReviewResults) =
         std::thread::scope(|s| {
             let selection_handle = manual_ids
@@ -235,6 +237,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             review_one_lens(llm, &sp, &inp, &id, round)
         })
     };
+    let lens_selection_and_review_ms = lens_stage_started.elapsed().as_millis();
     let lens_results: LensReviewResults = mandatory_results
         .into_iter()
         .chain(optional_results)
@@ -294,6 +297,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // (unresolved), so none of it can be wrongly CONFIRMED off a failed round; verdict/score
     // simply don't count anything from this stage, same fail-safe direction as a missing
     // resolution already gets treated everywhere else in this function.
+    let discourse_started = std::time::Instant::now();
     let (audit, mut resolved) = if findings.is_empty() {
         println!("No findings — skipping discourse");
         (Vec::new(), std::collections::HashMap::new())
@@ -314,6 +318,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
     };
+    let discourse_ms = discourse_started.elapsed().as_millis();
     // #139: discourse's SURFACE moves can add brand-new findings straight into `findings`
     // (src/discourse/mod.rs) without ever going through evidence::verify — the earlier call at
     // the top of this function only saw the original per-lens findings. Re-running here is
@@ -322,6 +327,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
 
     // Compared to the previous round (--prior): determine whether previously confirmed findings
     // were fixed in this diff. If STILL_OPEN, re-fold them into this round's working set (keeps affecting score/verdict).
+    let fixcheck_started = std::time::Instant::now();
     let mut fix_results: Vec<fixcheck::FixStatus> = Vec::new();
     if let Some(ps) = &prior_state {
         let prior_confirmed: Vec<Finding> = ps
@@ -409,6 +415,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
     }
+    let fixcheck_ms = fixcheck_started.elapsed().as_millis();
 
     // Step 6: policy lens (local, deterministic)
     let policies = policy::check_all(&sp, &inp);
@@ -429,6 +436,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // rewritten" (None), but recorded in stage_errors so the two aren't conflated — since
     // requirements factors into the verdict's NEEDS_CONTEXT judgment, this beats silently
     // letting it pass, but neither stage kills the whole review the way a lens failure would.
+    let req_hv_started = std::time::Instant::now();
     let (req_results, hv): (Option<Vec<requirements::RequirementCheck>>, Option<String>) =
         std::thread::scope(|s| {
             let req_handle = s.spawn(|| {
@@ -474,11 +482,12 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             });
             (req_results, hv)
         });
+    let requirements_and_human_voice_ms = req_hv_started.elapsed().as_millis();
 
     // #169: this is the earliest point that actually needs deterministic_results (quantify's
     // deterministic gate, right below) — join the background semgrep run here instead of
     // blocking on it before lens selection even started.
-    if let Some(handle) = semgrep_handle {
+    let semgrep_ms = semgrep_handle.map(|handle| {
         match handle.join() {
             Ok(Some(v)) => {
                 println!(
@@ -492,7 +501,8 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
                 stage_errors.push("semgrep: background thread panicked".to_string());
             }
         }
-    }
+        semgrep_started.elapsed().as_millis()
+    });
 
     // Step 10: quantitative summary + verdict
     let mut quant = quantify::summarize(
@@ -556,6 +566,14 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         stage_errors.clone(),
         dropped_files,
         llm.usage(),
+        manifest::StageTimings {
+            semgrep_ms,
+            lens_selection_and_review_ms,
+            discourse_ms,
+            fixcheck_ms,
+            requirements_and_human_voice_ms,
+            total_ms: started.elapsed().as_millis(),
+        },
     )
     .and_then(|m| manifest::write(&out_dir, &m))
     {

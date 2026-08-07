@@ -2,15 +2,42 @@
 //! (which model, which spec, what got dropped/truncated, how many lenses actually returned
 //! results) — so debugging "why did this run behave differently from last time" means
 //! eyeballing stdout/stderr after the fact. This is v1: only what's already cheaply available
-//! by the end of `run_review`, written alongside report.md/state.json. Not attempting the
-//! fuller per-call/per-stage latency and retry tracking the issue also floats — that needs
-//! instrumenting `Llm` itself, a bigger change than this pass.
+//! by the end of `run_review`, written alongside report.md/state.json.
+//!
+//! #172: added per-stage wall-clock timing (`StageTimings`) on top of that v1 — but still not
+//! attempting the fuller per-call latency/retry-reason/queue-wait tracking the issue also asks
+//! for, since that needs instrumenting `Llm` itself (a bigger, separate change: every call site
+//! would need to identify which stage it's calling from, and `Llm`'s retry loop would need to
+//! record attempts/latency per call, not just aggregate `Usage`). Stage timings below are wired
+//! up from `pipeline/review.rs`'s existing stage boundaries — where two stages now run
+//! concurrently (#168's lens selection + mandatory review, #170's requirements + human_voice),
+//! the reported field covers the whole overlapping phase rather than fabricating an attribution
+//! split neither stage's own thread reports back on its own.
 use crate::llm::Usage;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+/// Wall-clock milliseconds per stage of `run_review`. Fields stay 0 when a stage didn't run at
+/// all (e.g. `discourse_ms` on a clean diff with no findings, `fixcheck_ms` without --prior) —
+/// that's a legitimate measurement (the stage really did take ~0ms because it was skipped), not
+/// a missing value, so plain `u128` rather than `Option<u128>` throughout except `semgrep_ms`
+/// (which is meaningfully absent, not zero, when deterministic_results was already provided and
+/// the background semgrep thread never spawned at all).
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct StageTimings {
+    pub(crate) semgrep_ms: Option<u128>,
+    /// Combined: lens selection (when --lenses isn't given) and mandatory-lens review run
+    /// concurrently (#168), followed by optional-lens review once selection returns.
+    pub(crate) lens_selection_and_review_ms: u128,
+    pub(crate) discourse_ms: u128,
+    pub(crate) fixcheck_ms: u128,
+    /// Combined: requirements verification and human-voice rewrite run concurrently (#170).
+    pub(crate) requirements_and_human_voice_ms: u128,
+    pub(crate) total_ms: u128,
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Manifest {
@@ -31,6 +58,7 @@ pub(crate) struct Manifest {
     /// Files `prioritize_and_cap_diff` dropped from what was actually sent to the LLM.
     pub(crate) dropped_files: Vec<String>,
     pub(crate) usage: Usage,
+    pub(crate) stages: StageTimings,
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -53,6 +81,7 @@ pub(crate) fn build(
     stage_errors: Vec<String>,
     dropped_files: Vec<String>,
     usage: Usage,
+    stages: StageTimings,
 ) -> Result<Manifest> {
     Ok(Manifest {
         codereview_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -67,6 +96,7 @@ pub(crate) fn build(
         stage_errors,
         dropped_files,
         usage,
+        stages,
     })
 }
 
@@ -118,6 +148,10 @@ mod tests {
             vec!["good_things: boom".to_string()],
             vec!["Cargo.lock".to_string()],
             Usage::default(),
+            StageTimings {
+                total_ms: 1234,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -126,6 +160,7 @@ mod tests {
         assert!(contents.contains("\"round\": 2"));
         assert!(contents.contains("some-model"));
         assert!(contents.contains("Cargo.lock"));
+        assert!(contents.contains("\"total_ms\": 1234"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
