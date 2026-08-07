@@ -418,45 +418,62 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         .iter()
         .filter(|f| resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED"))
         .collect();
-    // On failure, treated the same as "requirements not provided" (None), but recorded in
-    // stage_errors so the two aren't conflated — since requirements factors into the verdict's
-    // NEEDS_CONTEXT judgment, this beats silently letting it pass, but this single stage still
-    // doesn't kill the whole review the way a lens failure would.
-    let req_results = if deadline_exceeded(started, args.deadline_minutes) {
-        eprintln!("Warning: --deadline-minutes exceeded — skipping requirements verification");
-        stage_errors.push("requirements: skipped, --deadline-minutes exceeded".to_string());
-        None
-    } else {
-        match requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Warning: requirements verification failed — {e:#}");
-                stage_errors.push(format!("requirements: {e:#}"));
-                None
-            }
-        }
-    };
 
-    // #117: human-voice doesn't read `quant` at all, so it can run before summarize() — moved
-    // up from after it so a failure here (now caught instead of propagated via `?`) is already
-    // reflected in stage_errors by the time summarize()/report::write need it, instead of
-    // landing after the verdict was already computed.
-    let hv = if !args.human_voice {
-        None
-    } else if deadline_exceeded(started, args.deadline_minutes) {
-        eprintln!("Warning: --deadline-minutes exceeded — skipping human-voice rewrite");
-        stage_errors.push("human_voice: skipped, --deadline-minutes exceeded".to_string());
-        None
-    } else {
-        match humanvoice::rewrite(llm, &sp, &inp, &confirmed_refs, &good_things) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("Warning: human-voice rewrite failed — {e:#}");
-                stage_errors.push(format!("human_voice: {e:#}"));
-                None
-            }
-        }
-    };
+    // #170: requirements verification and human-voice rewrite don't read each other's output —
+    // human-voice doesn't read `quant` either (#117: that's why it can run before summarize()
+    // below), and requirements doesn't read human-voice's rewritten text. They only share
+    // confirmed_refs/good_things, both already available here. Run them concurrently instead of
+    // one after the other.
+    //
+    // On failure (or a deadline skip), each is treated the same as "not provided"/"not
+    // rewritten" (None), but recorded in stage_errors so the two aren't conflated — since
+    // requirements factors into the verdict's NEEDS_CONTEXT judgment, this beats silently
+    // letting it pass, but neither stage kills the whole review the way a lens failure would.
+    let (req_results, hv): (Option<Vec<requirements::RequirementCheck>>, Option<String>) =
+        std::thread::scope(|s| {
+            let req_handle = s.spawn(|| {
+                if deadline_exceeded(started, args.deadline_minutes) {
+                    return Err("skipped, --deadline-minutes exceeded".to_string());
+                }
+                requirements::verify(cheap_llm, &sp, &inp, &confirmed_refs)
+                    .map_err(|e| format!("{e:#}"))
+            });
+            let hv_handle = args.human_voice.then(|| {
+                s.spawn(|| {
+                    if deadline_exceeded(started, args.deadline_minutes) {
+                        return Err("skipped, --deadline-minutes exceeded".to_string());
+                    }
+                    humanvoice::rewrite(llm, &sp, &inp, &confirmed_refs, &good_things)
+                        .map_err(|e| format!("{e:#}"))
+                })
+            });
+
+            let req_results = match req_handle
+                .join()
+                .unwrap_or_else(|_| Err("requirements thread panicked".to_string()))
+            {
+                Ok(r) => r,
+                Err(msg) => {
+                    eprintln!("Warning: requirements verification failed — {msg}");
+                    stage_errors.push(format!("requirements: {msg}"));
+                    None
+                }
+            };
+            let hv = hv_handle.and_then(|h| {
+                match h
+                    .join()
+                    .unwrap_or_else(|_| Err("human_voice thread panicked".to_string()))
+                {
+                    Ok(v) => Some(v),
+                    Err(msg) => {
+                        eprintln!("Warning: human-voice rewrite failed — {msg}");
+                        stage_errors.push(format!("human_voice: {msg}"));
+                        None
+                    }
+                }
+            });
+            (req_results, hv)
+        });
 
     // #169: this is the earliest point that actually needs deterministic_results (quantify's
     // deterministic gate, right below) — join the background semgrep run here instead of
