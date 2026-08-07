@@ -29,7 +29,7 @@ pub(crate) fn enforce_secret_scan(inp: &Input, allow_sensitive_input: bool) -> R
         return Ok(());
     }
     let mut msg = format!(
-        "refusing to send diff to the LLM: found {} value(s) that look like credentials in added lines:\n",
+        "refusing to send diff to the LLM: found {} value(s) that look like credentials:\n",
         hits.len()
     );
     for h in &hits {

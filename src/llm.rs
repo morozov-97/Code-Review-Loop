@@ -24,7 +24,10 @@ const HTTP_TIMEOUT_GLOBAL: Duration = Duration::from_secs(600);
 const CLAUDE_CLI_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// LLM call backend. ClaudeCli = `claude -p` subprocess, OpenRouter = REST API,
-/// Fixture = test-only (returns pre-set responses in order, no network/subprocess).
+/// Custom = #156: any other OpenAI-compatible endpoint (self-hosted vLLM/Ollama/internal
+/// gateway) — same request/response shape as OpenRouter, just a different base URL and an
+/// optional (rather than required) API key, Fixture = test-only (returns pre-set responses in
+/// order, no network/subprocess).
 #[derive(Clone, Debug)]
 pub enum Provider {
     ClaudeCli {
@@ -32,6 +35,10 @@ pub enum Provider {
     },
     OpenRouter {
         api_key: String,
+    },
+    Custom {
+        base_url: String,
+        api_key: Option<String>,
     },
     #[cfg(test)]
     Fixture(Arc<Mutex<std::collections::VecDeque<String>>>),
@@ -185,6 +192,29 @@ impl Llm {
         })
     }
 
+    /// #156: any OpenAI-compatible endpoint that isn't OpenRouter — self-hosted vLLM/Ollama/an
+    /// internal gateway. Unlike `openrouter()`, `model` is required here: there's no sensible
+    /// universal default model for an arbitrary self-hosted endpoint the way
+    /// `OPENROUTER_DEFAULT_MODEL` is for OpenRouter specifically. `api_key` is optional since
+    /// many self-hosted endpoints (e.g. a local Ollama) don't require one.
+    pub fn custom_endpoint(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        retries: u32,
+        verbose: bool,
+        usage: Arc<Mutex<Usage>>,
+    ) -> Self {
+        Llm {
+            provider: Provider::Custom { base_url, api_key },
+            model: Some(model),
+            retries,
+            verbose,
+            usage,
+            deadline: None,
+        }
+    }
+
     /// Test-only — returns `responses` one by one in call order (no network/subprocess).
     /// Only deterministic when concurrency=1, since call order then matches source code order,
     /// so E2E tests must run with concurrency=1.
@@ -269,8 +299,18 @@ impl Llm {
                 system,
                 self.effective_timeout(CLAUDE_CLI_TIMEOUT),
             ),
-            Provider::OpenRouter { api_key } => call_openrouter(
-                api_key,
+            Provider::OpenRouter { api_key } => call_openai_compatible(
+                OPENROUTER_URL,
+                Some(api_key),
+                self.model.as_deref(),
+                ctx,
+                task,
+                system,
+                self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
+            ),
+            Provider::Custom { base_url, api_key } => call_openai_compatible(
+                base_url,
+                api_key.as_deref(),
                 self.model.as_deref(),
                 ctx,
                 task,
@@ -607,12 +647,17 @@ fn supports_prompt_caching(model: &str) -> bool {
     model.to_ascii_lowercase().contains("claude")
 }
 
-/// A single call to the OpenRouter chat completions API. If ctx is given and the target model is
-/// Claude-family, it's split into a separate content block with cache_control(ephemeral) attached
-/// — an optimization aiming for cache hits when the same ctx is called repeatedly (e.g. per-lens
-/// reviews). Otherwise, sends a single-string content as before.
-fn call_openrouter(
-    api_key: &str,
+/// A single call to an OpenAI-compatible chat completions endpoint — OpenRouter, or (#156) any
+/// other such endpoint (self-hosted vLLM/Ollama/an internal gateway) via `Provider::Custom`.
+/// `api_key` is optional since not every self-hosted endpoint requires one; when absent, no
+/// `Authorization` header is sent at all rather than sending an empty/bogus one. If ctx is given
+/// and the target model is Claude-family, it's split into a separate content block with
+/// cache_control(ephemeral) attached — an optimization aiming for cache hits when the same ctx
+/// is called repeatedly (e.g. per-lens reviews). Otherwise, sends a single-string content as
+/// before.
+fn call_openai_compatible(
+    url: &str,
+    api_key: Option<&str>,
     model: Option<&str>,
     ctx: Option<&str>,
     task: &str,
@@ -654,11 +699,11 @@ fn call_openrouter(
         .http_status_as_error(false)
         .build();
     let agent: ureq::Agent = config.into();
-    let result = agent
-        .post(OPENROUTER_URL)
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .send_json(body);
+    let mut req = agent.post(url).header("Content-Type", "application/json");
+    if let Some(key) = api_key {
+        req = req.header("Authorization", &format!("Bearer {key}"));
+    }
+    let result = req.send_json(body);
 
     let mut resp = result.map_err(|e| anyhow!("openrouter call failed: {e}"))?;
     if !resp.status().is_success() {

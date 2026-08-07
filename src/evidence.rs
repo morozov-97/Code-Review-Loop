@@ -36,19 +36,23 @@ fn diff_line_set(diff: &str) -> HashSet<(String, u32)> {
             }
             continue;
         }
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let path = rest.strip_prefix("b/").unwrap_or(rest);
-            if path != "/dev/null" {
-                current_file = path.to_string();
-            }
-            continue;
-        }
         if let Some(new_start) = parse_hunk_new_start(line) {
             in_hunk = true;
             new_line_no = new_start;
             continue;
         }
+        // #150: "+++ " only means "file header" outside a hunk body — gated behind `!in_hunk`
+        // the same way input::parse_diff_stats and secretscan::scan already are. An *added*
+        // line whose own content happens to start with "++" (raw diff form: "+" marker + "+..."
+        // content) used to be mistaken for a second file header here, dropping that line from
+        // the tracked set and corrupting `current_file` for everything after it in the hunk.
         if !in_hunk {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                let path = rest.strip_prefix("b/").unwrap_or(rest);
+                if path != "/dev/null" {
+                    current_file = path.to_string();
+                }
+            }
             continue;
         }
         if line.starts_with('+') {
@@ -169,5 +173,31 @@ mod tests {
         let mut findings = vec![finding("x.rs", "2")];
         verify(&mut findings, diff);
         assert!(findings[0].evidence_unverified);
+    }
+
+    #[test]
+    fn verify_does_not_mistake_an_added_line_starting_with_plus_plus_plus_for_a_file_header() {
+        // #150: a hunk-body added line whose own content starts with "++" (raw diff form
+        // "+++ ...") used to be swallowed as if it were a second "+++ b/path" file header,
+        // dropping it from the tracked set and corrupting current_file for lines after it.
+        let diff = concat!(
+            "diff --git a/note.txt b/note.txt\n",
+            "--- a/note.txt\n",
+            "+++ b/note.txt\n",
+            "@@ -1,1 +1,3 @@\n",
+            " line one\n",
+            "+++ line two starts with plus plus\n",
+            "+line three\n",
+        );
+        let mut findings = vec![finding("note.txt", "2"), finding("note.txt", "3")];
+        verify(&mut findings, diff);
+        assert!(
+            !findings[0].evidence_unverified,
+            "line 2 (the +++-prefixed added content) must be tracked as real content"
+        );
+        assert!(
+            !findings[1].evidence_unverified,
+            "line 3 must still resolve to the real file, not a corrupted current_file"
+        );
     }
 }

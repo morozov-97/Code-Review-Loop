@@ -26,6 +26,12 @@ pub(super) const VOTE_THRESHOLD: f64 = 0.6;
 /// - the same lens issuing more than one AGREE/CHALLENGE for the same target within a single
 ///   round (a response quirk, not a second independent signal) used to double-count every
 ///   repeat instead of counting once per (round, lens).
+///
+/// #149: the (round, lens) dedup slot used to be claimed by the *first* move seen regardless of
+/// its weight — a no-op move (CONNECT/SURFACE, or an AGREE with empty new_evidence) listed
+/// before a real vote-bearing move from the same lens/round claimed the slot first, silently
+/// dropping the real one right after it. The slot is now only claimed by a move that actually
+/// carries non-zero weight, so a no-op move never blocks a real vote that follows it.
 pub(super) fn direct_vote_net(audit: &[DiscourseAudit], target_id: &str) -> f64 {
     let mut seen: std::collections::HashSet<(usize, &str)> = std::collections::HashSet::new();
     let mut net = 0.0;
@@ -34,14 +40,18 @@ pub(super) fn direct_vote_net(audit: &[DiscourseAudit], target_id: &str) -> f64 
             if m.target != target_id {
                 continue;
             }
-            if !seen.insert((a.round, m.lens.as_str())) {
-                continue;
-            }
-            net += match m.kind.as_str() {
+            let weight = match m.kind.as_str() {
                 "AGREE" if !m.new_evidence.trim().is_empty() => confidence_weight(&m.confidence),
                 "CHALLENGE" if m.challenge_axis == "EXISTENCE" => -confidence_weight(&m.confidence),
                 _ => 0.0,
             };
+            if weight == 0.0 {
+                continue;
+            }
+            if !seen.insert((a.round, m.lens.as_str())) {
+                continue;
+            }
+            net += weight;
         }
     }
     net
@@ -194,6 +204,36 @@ mod tests {
         assert_eq!(
             direct_vote_net(&audit, "f1"),
             2.0 * confidence_weight("high")
+        );
+    }
+
+    #[test]
+    fn direct_vote_net_does_not_let_a_leading_noop_move_consume_the_dedup_slot() {
+        // #149: a CONNECT (no vote weight) from a lens, followed by a real AGREE from the same
+        // lens targeting the same finding in the same round, used to have the CONNECT claim
+        // the (round, lens) dedup slot first — silently dropping the real AGREE right after it.
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![
+                Move {
+                    kind: "CONNECT".to_string(),
+                    lens: "security".to_string(),
+                    target: "f1".to_string(),
+                    detail: "connects to another finding".to_string(),
+                    new_evidence: String::new(),
+                    confidence: String::new(),
+                    challenge_axis: String::new(),
+                },
+                Move {
+                    lens: "security".to_string(),
+                    ..agree("f1", "high")
+                },
+            ],
+        }];
+        assert_eq!(
+            direct_vote_net(&audit, "f1"),
+            confidence_weight("high"),
+            "the real AGREE right after a no-op CONNECT from the same lens must still count"
         );
     }
 

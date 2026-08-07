@@ -210,7 +210,20 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     for r in lens_results {
         match r {
             Ok((id, out)) => {
-                successful_lens_count += 1;
+                // #158: a response of literally `{}` (no findings, no unverified, no summary)
+                // used to count toward successful_lens_count exactly the same as a thorough
+                // review that happened to find nothing — is_degenerate distinguishes them via
+                // the summary field, which the prompt now requires even on a clean result.
+                if out.is_degenerate() {
+                    eprintln!(
+                        "Warning: lens {id} returned an empty response (no findings, no unverified items, no summary) — not counted as a completed review"
+                    );
+                    stage_errors.push(format!(
+                        "{id}: empty lens response (no findings/unverified/summary)"
+                    ));
+                } else {
+                    successful_lens_count += 1;
+                }
                 findings.extend(out.findings);
                 for u in out.unverified {
                     unverified.push((id.clone(), u));
@@ -543,10 +556,16 @@ always = true
         let out_dir = dir.join("out");
 
         // 1) review_lens("test_lens", round=1) response — id can be left arbitrary since review_lens overwrites it.
-        let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"10","claim":"test claim","evidence":"test evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
+        //    line "1" is deliberately verifiable against the diff below (evidence::verify), and
+        //    #148 now requires a CONFIRMED resolution to be backed by both a real vote AND a
+        //    verified citation, not just the LLM's say-so.
+        let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"1","claim":"test claim","evidence":"test evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
         // 2) discourse round 1 response — must include a CHALLENGE, or an automatic re-request (3rd call) gets attached.
         //    the target id must match "test_lens-r1-1", the id review_lens actually assigns, for resolutions to take effect.
-        let discourse_response = r#"{"moves":[{"move":"CHALLENGE","lens":"reviewer","target":"test_lens-r1-1","detail":"needs more evidence","new_evidence":"","confidence":"medium"}],"resolutions":[{"finding_id":"test_lens-r1-1","status":"CONFIRMED","merged_into":"","reason":"confirmed for e2e test"}],"surfaced":[]}"#.to_string();
+        //    A real AGREE (with new_evidence) is required alongside the CHALLENGE so the stated
+        //    CONFIRMED resolution actually clears VOTE_THRESHOLD (#148) — the CHALLENGE here is
+        //    severity-axis, so it doesn't offset that AGREE's vote weight.
+        let discourse_response = r#"{"moves":[{"move":"CHALLENGE","lens":"reviewer","target":"test_lens-r1-1","detail":"severity may be overstated","new_evidence":"","confidence":"medium","challenge_axis":"severity"},{"move":"AGREE","lens":"other-reviewer","target":"test_lens-r1-1","detail":"confirmed independently","new_evidence":"corroborating evidence","confidence":"high"}],"resolutions":[{"finding_id":"test_lens-r1-1","status":"CONFIRMED","merged_into":"","reason":"confirmed for e2e test"}],"surfaced":[]}"#.to_string();
 
         let usage = Llm::new_usage_tracker();
         let llm = Llm::fixture(vec![lens_response, discourse_response], 0, usage.clone());
@@ -591,6 +610,76 @@ always = true
         assert!(
             std::fs::metadata(out_dir.join("state.json")).is_ok(),
             "state.json should be written for --prior to pick up next round"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_does_not_confirm_off_an_llm_stated_resolution_alone() {
+        // #148 repro at the full pipeline level: a finding whose citation isn't verifiable
+        // (line 10 doesn't exist in this 1-line diff), challenged but never AGREEd by anyone,
+        // used to still end up CONFIRMED (and scored) purely because the discourse response's
+        // "resolutions" array said so — this is now blocked.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-no-bare-confirm-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            "name = \"e2e test spec\"\nlabels = [\"possible bug\"]\n\n[[lenses]]\nid = \"test_lens\"\ntitle = \"Test Lens\"\nguide = \"test\"\nalways = true\n",
+        );
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+        let out_dir = dir.join("out");
+
+        let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"10","claim":"test claim","evidence":"test evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
+        let discourse_response = r#"{"moves":[{"move":"CHALLENGE","lens":"reviewer","target":"test_lens-r1-1","detail":"needs more evidence","new_evidence":"","confidence":"medium"}],"resolutions":[{"finding_id":"test_lens-r1-1","status":"CONFIRMED","merged_into":"","reason":"confirmed for e2e test"}],"surfaced":[]}"#.to_string();
+
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![lens_response, discourse_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: None,
+                allow_sensitive_input: false,
+            },
+        )
+        .expect("run_review should complete end-to-end against the fixture LLM");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            !report.contains("Score: 88/100"),
+            "an unbacked, unverified CONFIRMED must not be scored as if it were real:\n{report}"
+        );
+        assert!(
+            report.contains("Score: 100/100"),
+            "with no genuinely confirmed finding, score should stay at 100:\n{report}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -845,6 +934,74 @@ always = true
         assert!(
             verdict_line.contains("(FAILED"),
             "verdict line must say FAILED when every lens errored out, not just PARTIAL:\n{verdict_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_does_not_count_a_degenerate_empty_lens_response_as_successful() {
+        // #158: a lens response of literally `{}` parses without error — no missing-field
+        // failure, no malformed JSON — but it's indistinguishable from a genuinely clean,
+        // thoroughly-reviewed diff unless something in the response says the LLM actually
+        // engaged with it. Must get the same FAILED treatment as an outright parse failure.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-degenerate-lens-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            "name = \"e2e test spec\"\nlabels = [\"possible bug\"]\n\n[[lenses]]\nid = \"test_lens\"\ntitle = \"Test Lens\"\nguide = \"test\"\nalways = true\n",
+        );
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+        let out_dir = dir.join("out");
+        let degenerate_lens_response = "{}".to_string();
+
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![degenerate_lens_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: None,
+                allow_sensitive_input: false,
+            },
+        )
+        .expect("run_review must still succeed on a degenerate lens response");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        let verdict_line = report
+            .lines()
+            .find(|l| l.starts_with("**Verdict:"))
+            .unwrap();
+        assert!(
+            verdict_line.contains("(FAILED"),
+            "a degenerate {{}} response must not count as a completed review:\n{verdict_line}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

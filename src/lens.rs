@@ -97,6 +97,24 @@ pub struct LensOutput {
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub unverified: Vec<String>,
+    /// #158: stays `#[serde(default)]` (empty string, not a hard requirement) — making it
+    /// serde-required would reintroduce the exact fragility the other fields were loosened to
+    /// avoid: one missing field killing the parse of an otherwise-valid `findings` array. Used
+    /// only to distinguish "the LLM engaged with the diff and found nothing" (summary present,
+    /// findings/unverified empty — a legitimately clean review) from "the response was
+    /// essentially a no-op that still happened to parse" (see `is_degenerate`).
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl LensOutput {
+    /// True when nothing in the response indicates the LLM actually engaged with the diff —
+    /// no findings, no unverified suspicions, and no summary. A response of literally `{}`
+    /// used to count toward `successful_lens_count` exactly the same as a thorough review that
+    /// happened to find nothing, since both parse to this same all-defaulted shape.
+    pub fn is_degenerate(&self) -> bool {
+        self.findings.is_empty() && self.unverified.is_empty() && self.summary.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,10 +192,17 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
                 .collect()
         })
         .unwrap_or_default();
+    // #153: the manual --lenses path explicitly rejects an always-lens id (pipeline/review.rs)
+    // — this validation used to check `spec.lens_by_id(id).is_some()`, which matches the FULL
+    // lens list, not just the `optional` catalog actually shown to the LLM above. An
+    // always-lens id returned here (hallucinated, or copied from elsewhere in context) slipped
+    // through and got run a second time through the generic defect-finding schema.
+    let optional_ids: std::collections::HashSet<&str> =
+        optional.iter().map(|l| l.id.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
     let valid: Vec<String> = selected
         .into_iter()
-        .filter(|id| spec.lens_by_id(id).is_some())
+        .filter(|id| optional_ids.contains(id.as_str()))
         .filter(|id| seen.insert(id.clone()))
         .take(MAX_AUTO_SELECTED_LENSES)
         .collect();
@@ -196,10 +221,14 @@ fn build_review_task(spec: &Spec, lens_title: &str, lens_guide: &str) -> String 
          - Every finding requires file:line evidence. Suspicions without evidence go under unverified.\n\
          - severity must be one of P0 (critical) through P3 (minor).\n\
          - label must be exactly one of: {labels}\n\n\
+         - summary is required even when findings is empty: one sentence on what you actually\n\
+         looked at and whether you found anything, so an empty findings array is distinguishable\n\
+         from a response that didn't engage with the diff at all.\n\n\
          ## Output (JSON only, no code fences)\n\
          {{\"findings\":[{{\"file\":\"...\",\"line\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\
          \"impact\":\"...\",\"severity\":\"P0|P1|P2|P3\",\"label\":<one of the allowed values>,\
-         \"confidence\":\"high|medium|low\",\"recommendation\":\"...\"}}],\"unverified\":[\"...\"]}}\n",
+         \"confidence\":\"high|medium|low\",\"recommendation\":\"...\"}}],\"unverified\":[\"...\"],\
+         \"summary\":\"...\"}}\n",
         lens_title = lens_title,
         lens_guide = lens_guide,
         labels = spec.labels_prompt(),
@@ -312,6 +341,13 @@ mod tests {
         }
     }
 
+    fn always_lens(id: &str) -> crate::spec::Lens {
+        crate::spec::Lens {
+            always: true,
+            ..optional_lens(id)
+        }
+    }
+
     fn test_spec(lens_ids: &[&str]) -> crate::spec::Spec {
         crate::spec::Spec {
             name: "test".to_string(),
@@ -356,6 +392,27 @@ mod tests {
         let unique: std::collections::HashSet<_> = selected.iter().collect();
         assert_eq!(unique.len(), selected.len(), "no duplicates expected");
         assert_eq!(selected, vec!["design", "complexity", "tests"]);
+    }
+
+    #[test]
+    fn select_lenses_rejects_an_always_lens_id_even_if_the_llm_returns_it() {
+        // #153: the manual --lenses path already rejects an always-lens id explicitly
+        // (pipeline/review.rs) — auto-selection must reject it too, not just check that the id
+        // exists somewhere in the full spec.lenses list.
+        let mut spec = test_spec(&["design", "complexity"]);
+        spec.lenses.push(always_lens("good_things"));
+        let inp = test_input();
+        let response = r#"{"selected":["design","good_things"]}"#.to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+
+        let selected = select_lenses(&llm, &spec, &inp).unwrap();
+
+        assert_eq!(selected, vec!["design"]);
+        assert!(
+            !selected.contains(&"good_things".to_string()),
+            "an always-lens id must never come back from auto-selection"
+        );
     }
 
     #[test]
@@ -409,6 +466,36 @@ mod tests {
         assert_eq!(out.findings.len(), 2);
         assert_eq!(out.findings[0].claim, "ok");
         assert_eq!(out.findings[1].evidence, "");
+    }
+
+    // --- #158: LensOutput::is_degenerate() ---
+
+    #[test]
+    fn is_degenerate_true_for_a_completely_empty_response() {
+        let out: LensOutput = serde_json::from_str("{}").unwrap();
+        assert!(out.is_degenerate());
+    }
+
+    #[test]
+    fn is_degenerate_false_when_summary_is_present_even_with_no_findings() {
+        // A genuinely clean, thoroughly-reviewed diff — summary present, nothing to report.
+        let out: LensOutput =
+            serde_json::from_str(r#"{"summary":"Reviewed the diff, no issues found."}"#).unwrap();
+        assert!(!out.is_degenerate());
+    }
+
+    #[test]
+    fn is_degenerate_false_when_findings_are_present_even_without_a_summary() {
+        let json = r#"{"findings":[{"file":"a.rs","line":"1","claim":"ok","evidence":"e","severity":"P1","label":"possible bug"}]}"#;
+        let out: LensOutput = serde_json::from_str(json).unwrap();
+        assert!(!out.is_degenerate());
+    }
+
+    #[test]
+    fn is_degenerate_false_when_unverified_is_present() {
+        let out: LensOutput =
+            serde_json::from_str(r#"{"unverified":["suspicious but no evidence"]}"#).unwrap();
+        assert!(!out.is_degenerate());
     }
 
     #[test]

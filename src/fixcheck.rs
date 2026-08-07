@@ -73,10 +73,19 @@ fn evidence_still_present(evidence: &str, diff: &str) -> bool {
 /// Doesn't let the LLM make the FIXED call alone — if the original evidence is still present
 /// verbatim in the diff despite a FIXED verdict, downgrade to UNKNOWN so a human looks again
 /// (failure should always lean stricter, never quietly leak a STILL_OPEN).
+///
+/// #159: nothing here previously checked whether the finding's file was even part of the new
+/// diff at all — fixcheck operates purely on diff text (no filesystem access anywhere in this
+/// module), so a finding whose file simply isn't touched by this round's diff has nothing for
+/// `evidence_still_present` to check against, and the LLM's own FIXED judgment went completely
+/// unchallenged in exactly the case where "not mentioned in the diff" and "verified absent from
+/// the codebase" are most likely to be conflated. Downgraded the same way an unchanged-evidence
+/// FIXED already is.
 fn corroborate(
     mut results: Vec<FixStatus>,
     prior_confirmed: &[Finding],
     diff: &str,
+    changed_files: &[String],
 ) -> Vec<FixStatus> {
     for r in results.iter_mut() {
         if r.status != "FIXED" {
@@ -85,7 +94,13 @@ fn corroborate(
         let Some(orig) = prior_confirmed.iter().find(|f| f.id == r.finding_id) else {
             continue;
         };
-        if evidence_still_present(&orig.evidence, diff) {
+        if !changed_files.iter().any(|f| f == &orig.file) {
+            r.evidence = format!(
+                "{} [Deterministic re-check: {} isn't part of this round's diff at all, so a FIXED verdict can't be corroborated — downgrading to UNKNOWN]",
+                r.evidence, orig.file
+            );
+            r.status = "UNKNOWN".to_string();
+        } else if evidence_still_present(&orig.evidence, diff) {
             r.evidence = format!(
                 "{} [Deterministic re-check: original evidence is still present verbatim in the new diff, downgrading FIXED verdict to UNKNOWN]",
                 r.evidence
@@ -250,7 +265,12 @@ pub fn run(
     }
     let results = fill_missing_as_still_open(out.results, prior_confirmed);
     let results = verify_supersedes(results, prior_confirmed, this_round_confirmed);
-    Ok(corroborate(results, prior_confirmed, &input.diff))
+    Ok(corroborate(
+        results,
+        prior_confirmed,
+        &input.diff,
+        &input.changed_files,
+    ))
 }
 
 #[cfg(test)]
@@ -289,9 +309,38 @@ mod tests {
         let prior = vec![finding("a", "unsafe { *ptr }")];
         let results = vec![fix_status("a", "FIXED", "diff no longer touches this")];
         let diff = "some context\nunsafe { *ptr }\nmore context";
-        let out = corroborate(results, &prior, diff);
+        let out = corroborate(results, &prior, diff, &["src/x.rs".to_string()]);
         assert_eq!(out[0].status, "UNKNOWN");
         assert!(out[0].evidence.contains("Deterministic re-check"));
+    }
+
+    #[test]
+    fn corroborate_downgrades_fixed_to_unknown_when_the_file_is_not_in_this_rounds_diff() {
+        // #159: "not mentioned in the new diff" must not be treated as "verified fixed" — with
+        // nothing to check the evidence against (the file wasn't touched at all), a FIXED
+        // verdict is downgraded the same way an unchanged-evidence FIXED already is.
+        let prior = vec![finding("a", "unsafe { *ptr }")];
+        let results = vec![fix_status(
+            "a",
+            "FIXED",
+            "this file wasn't in the diff this round",
+        )];
+        let diff = "diff --git a/src/other.rs b/src/other.rs\n+something unrelated\n";
+        let out = corroborate(results, &prior, diff, &["src/other.rs".to_string()]);
+        assert_eq!(out[0].status, "UNKNOWN");
+        assert!(out[0].evidence.contains("isn't part of this round's diff"));
+    }
+
+    #[test]
+    fn corroborate_still_checks_evidence_when_the_file_is_in_this_rounds_diff() {
+        // The file-touched check must not itself become a bypass — a file that IS in the diff
+        // still goes through the existing evidence_still_present check.
+        let prior = vec![finding("a", "unsafe { *ptr }")];
+        let results = vec![fix_status("a", "FIXED", "claims it's fixed")];
+        let diff = "unsafe { *ptr }";
+        let out = corroborate(results, &prior, diff, &["src/x.rs".to_string()]);
+        assert_eq!(out[0].status, "UNKNOWN");
+        assert!(out[0].evidence.contains("still present verbatim"));
     }
 
     #[test]
@@ -299,7 +348,7 @@ mod tests {
         let prior = vec![finding("a", "unsafe { *ptr }")];
         let results = vec![fix_status("a", "FIXED", "replaced with safe accessor")];
         let diff = "some context\nlet v = safe_accessor();\nmore context";
-        let out = corroborate(results, &prior, diff);
+        let out = corroborate(results, &prior, diff, &["src/x.rs".to_string()]);
         assert_eq!(out[0].status, "FIXED");
     }
 
@@ -308,7 +357,7 @@ mod tests {
         let prior = vec![finding("a", "unsafe { *ptr }")];
         let results = vec![fix_status("a", "STILL_OPEN", "still there")];
         let diff = "unsafe { *ptr }";
-        let out = corroborate(results, &prior, diff);
+        let out = corroborate(results, &prior, diff, &["src/x.rs".to_string()]);
         assert_eq!(out[0].status, "STILL_OPEN");
     }
 

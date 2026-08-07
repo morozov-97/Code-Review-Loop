@@ -9,7 +9,12 @@ computes the final score, effort estimate, and pass/fail verdict.
 
 Default LLM backend is Claude Code CLI (`claude -p --output-format json`); an
 OpenRouter backend (`--backend openrouter` + `OPENROUTER_API_KEY`) is also available
-and does not require the `claude` CLI.
+and does not require the `claude` CLI. A third backend, `--backend custom` (#156),
+targets any other OpenAI-compatible chat completions endpoint — a self-hosted
+vLLM/Ollama instance, or an internal gateway — via `--base-url` and `--model` (both
+required; there's no universal default model for an arbitrary endpoint). An optional
+`CODEREVIEW_API_KEY` env var is sent as a bearer token if set; many self-hosted
+endpoints don't require one, so it's fine to leave unset.
 
 ## Quick start
 
@@ -370,14 +375,19 @@ sequenceDiagram
   provider is configured, verbatim — neither backend redacts secrets or PII before sending. A
   one-line warning prints to stderr on every run as a reminder; don't run this against code
   containing secrets or restricted data unless that's acceptable for your org. Before sending, a
-  local pattern-based scan checks the diff's added lines, plus `--requirements`/`--conventions`
-  content, for things that look like credentials (AWS/GitHub/Slack tokens, PEM private keys,
+  local pattern-based scan checks every line of the diff (added, removed, and context — not
+  just added lines, since the whole diff is what's actually sent), plus `--requirements`/
+  `--conventions` content, for things that look like credentials (AWS/GitHub/Slack tokens, PEM private keys,
   JWTs, `.env`-style secret assignments) and refuses
   to proceed if it finds one — pass `--allow-sensitive-input` to send it anyway. This is a
   best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
   formats beyond the ones listed) — it catches the obvious cases, not everything.
 - heuristic-only policy signals for behavior vs surface changes can produce false
-  positives depending on project structure.
+  positives depending on project structure. The default spec's test/doc policy is presence-only
+  (some test/doc file appears anywhere in the diff, not mapped per changed file) and strict
+  enough that even this project's own "clean diff" eval fixture needed a padded test+changelog
+  change to pass it — treat `specs/default.toml` as a starting point to adapt to your repo's
+  conventions, not a lenient default.
 - severity penalties are heuristic defaults (P0: 25, P1: 12, P2: 5, P3: 1) — configurable per
   spec via an optional `[scoring]` table (`p0`/`p1`/`p2`/`p3`); unset fields keep their default,
   so a partial table only overrides what it mentions. Effort/time budgets (`quantify.rs`'s

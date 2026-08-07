@@ -7,6 +7,10 @@ pub(crate) enum Backend {
     Claude,
     /// OpenRouter REST API (requires OPENROUTER_API_KEY)
     Openrouter,
+    /// #156: any other OpenAI-compatible chat completions endpoint — self-hosted vLLM/Ollama/an
+    /// internal gateway. Requires --base-url and --model; CODEREVIEW_API_KEY is optional (many
+    /// self-hosted endpoints don't require one).
+    Custom,
 }
 
 #[derive(Parser, Debug)]
@@ -20,6 +24,10 @@ pub(crate) struct Cli {
     pub(crate) claude_bin: String,
     #[arg(long, value_enum, default_value = "claude", global = true)]
     pub(crate) backend: Backend,
+    /// #156: base URL for --backend custom (e.g. http://localhost:11434/v1/chat/completions for
+    /// a local Ollama). Ignored by the other backends.
+    #[arg(long, global = true)]
+    pub(crate) base_url: Option<String>,
     #[arg(long, global = true)]
     pub(crate) model: Option<String>,
     /// Low-cost model used for simple judgment stages like lens selection, good things,

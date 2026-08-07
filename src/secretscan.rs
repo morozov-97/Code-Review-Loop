@@ -1,9 +1,14 @@
 //! #122: the diff (and any --requirements/--conventions content) is sent verbatim to an
 //! external LLM provider with no redaction. This is a best-effort, local, pattern-based scan
-//! over the diff's *added* lines only (removed/context lines aren't what's about to be sent
-//! forward as new content) that runs before any LLM call, so an accidentally-committed secret
+//! that runs before any LLM call, so a secret visible anywhere in what's about to be sent
 //! doesn't leave the machine silently. It is not a substitute for a real secret scanner
 //! (gitleaks/trufflehog) in CI — see the README caveat this links to.
+//!
+//! #155: scans every line inside a diff hunk body — added, removed, *and* context — not just
+//! added ones. The transmission boundary is "the whole diff text" (see promptctx::shared_context,
+//! which fences `input.diff` in full), not "the added lines" — a PR that *removes* a leaked
+//! secret still has that secret's line sitting in the diff text sent to the LLM, so scanning
+//! only `+` lines missed it.
 
 pub(crate) struct SecretHit {
     pub(crate) file: String,
@@ -42,10 +47,15 @@ pub(crate) fn scan(diff: &str) -> Vec<SecretHit> {
             }
             continue;
         }
-        let Some(added) = line.strip_prefix('+') else {
-            continue;
-        };
-        for (pattern, value) in find_secrets(added) {
+        // #155: every hunk-body line is scanned regardless of its leading marker (+/-/space) —
+        // strip exactly one marker char if present so the pattern matchers see the same content
+        // whether it's an added, removed, or context line.
+        let content = line
+            .strip_prefix('+')
+            .or_else(|| line.strip_prefix('-'))
+            .or_else(|| line.strip_prefix(' '))
+            .unwrap_or(line);
+        for (pattern, value) in find_secrets(content) {
             hits.push(SecretHit {
                 file: current_file.clone(),
                 pattern,
@@ -278,12 +288,23 @@ mod tests {
     }
 
     #[test]
-    fn scan_ignores_removed_and_context_lines() {
+    fn scan_detects_a_secret_on_a_removed_line() {
+        // #155: a PR that *removes* a leaked secret still has that secret's line in the diff
+        // text sent to the LLM — the scan must catch it there too, not just on added lines.
         let diff = "+++ b/config.py\n@@ -1 +1 @@\n\
                      -AWS_KEY = \"AKIAABCDEFGHIJKLMNOP\"\n\
                      +AWS_KEY = os.environ[\"AWS_KEY\"]\n";
         let hits = scan(diff);
-        assert!(hits.is_empty());
+        assert!(hits.iter().any(|h| h.pattern == "AWS access key ID"));
+    }
+
+    #[test]
+    fn scan_detects_a_secret_on_a_context_line() {
+        let diff = "+++ b/config.py\n@@ -1,2 +1,3 @@\n\
+                     \x20AWS_KEY = \"AKIAABCDEFGHIJKLMNOP\"\n\
+                     +unrelated_added_line = 1\n";
+        let hits = scan(diff);
+        assert!(hits.iter().any(|h| h.pattern == "AWS access key ID"));
     }
 
     #[test]

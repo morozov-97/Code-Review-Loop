@@ -7,6 +7,13 @@ Each lens has a distinctly defined persona (in the open-code-review style) — t
 """
 
 diff_size_limit = 400
+# #157: strict by design, not a lenient "arbitrary repo" default — any source-file change fails
+# these two unless *some* test/doc path also appears anywhere in the same diff (presence-only,
+# not mapped per changed file). Even this project's own "clean diff" eval fixture failed it on
+# first attempt and needed a padded test+changelog change added just to pass (see
+# evals/README.md). Treat this spec as a strict example configuration to adapt, not a sensible
+# default for every repo — loosen test_path_patterns/doc_path_patterns/ignored_path_patterns
+# (or drop them to NOT_CONFIGURED) if that strictness isn't what you want.
 test_path_patterns = ["test/", "tests/", "__tests__/", "_test.", ".test.", ".spec.", "spec/"]
 doc_path_patterns = ["README", "CHANGELOG", "docs/"]
 # #126: files that are neither behavior nor test/docs — don't penalize a PR for not adding a
