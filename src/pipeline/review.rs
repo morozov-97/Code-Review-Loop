@@ -48,11 +48,6 @@ fn deadline_exceeded(started: std::time::Instant, deadline_minutes: Option<u64>)
     }
 }
 
-type LensReviewResults = (
-    Vec<Result<(String, lens::LensOutput)>>,
-    Option<Result<lens::GoodThingsOutput>>,
-);
-
 pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<()> {
     let started = std::time::Instant::now();
     // #119: without this, --deadline-minutes only stopped new *stages* from starting — a call
@@ -151,7 +146,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     };
     let mut selected_ids: Vec<String> = optional_selected;
     for l in sp.always_lenses() {
-        if l.id != "good_things" && !selected_ids.contains(&l.id) {
+        if !selected_ids.contains(&l.id) {
             selected_ids.push(l.id.clone());
         }
     }
@@ -162,43 +157,17 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // Even if one lens fails (LLM call error, etc.), the remaining lens results are kept and the
     // failure is recorded in the report — avoids aborting the whole review without partial
     // results just because of one lens.
-    // good_things is an independent LLM call that doesn't depend on findings (only needs
-    // diff/spec), yet it used to run sequentially after all lens reviews finished — adding one
-    // review's worth of round-trip time to the critical path for no real reason. Now it runs
-    // concurrently with the lens par_map on a separate thread.
-    let (lens_results, good_things_result): LensReviewResults = std::thread::scope(|s| {
-        let lens_handle = s.spawn(|| {
-            par_map(args.concurrency, selected_ids.clone(), |id| {
-                let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
-                println!(
-                    "  Lens complete: {} — {} findings, {} unverified",
-                    id,
-                    out.findings.len(),
-                    out.unverified.len()
-                );
-                Ok((id, out))
-            })
+    let lens_results: Vec<Result<(String, lens::LensOutput)>> =
+        par_map(args.concurrency, selected_ids.clone(), |id| {
+            let out = lens::review_lens(llm, &sp, &inp, &id, round)?;
+            println!(
+                "  Lens complete: {} — {} findings, {} unverified",
+                id,
+                out.findings.len(),
+                out.unverified.len()
+            );
+            Ok((id, out))
         });
-        let good_things_handle = sp
-            .lens_by_id("good_things")
-            .is_some()
-            .then(|| s.spawn(|| lens::review_good_things(cheap_llm, &sp, &inp)));
-
-        // #113: par_map already isolates per-item worker panics into a Result — this thread
-        // itself panicking (outside per-item processing) shouldn't be treated any differently
-        // and take the whole CLI down with it. A single synthetic error entry composes with the
-        // existing "for r in lens_results { ... Err(e) => stage_errors.push(...) }" loop below
-        // exactly like a normal per-lens failure would.
-        let lens_results: Vec<Result<(String, lens::LensOutput)>> = match lens_handle.join() {
-            Ok(r) => r,
-            Err(_) => vec![Err(anyhow::anyhow!("lens review thread panicked"))],
-        };
-        let good_things_result = good_things_handle.map(|h| {
-            h.join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("good_things thread panicked")))
-        });
-        (lens_results, good_things_result)
-    });
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut unverified: Vec<(String, String)> = Vec::new();
@@ -207,6 +176,10 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // real findings and "every lens errored out" both leave `findings` empty, but only the
     // latter means the review has zero defect-finding coverage (completeness::Failed below).
     let mut successful_lens_count = 0usize;
+    // #174: good_things used to come from a fully separate always-on lens/call joined on its own
+    // thread — it's now just whichever lens is lens::GOOD_THINGS_HOST_LENS's own `good_things`
+    // field, extracted in the same pass as findings/unverified below.
+    let mut good_things: Vec<lens::GoodThing> = Vec::new();
     for r in lens_results {
         match r {
             Ok((id, out)) => {
@@ -224,6 +197,9 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
                 } else {
                     successful_lens_count += 1;
                 }
+                if id == lens::GOOD_THINGS_HOST_LENS {
+                    good_things = out.good_things.clone();
+                }
                 findings.extend(out.findings);
                 for u in out.unverified {
                     unverified.push((id.clone(), u));
@@ -239,18 +215,6 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     // corresponds to a line the diff shows — before discourse spends LLM calls debating
     // findings whose evidence may be hallucinated.
     evidence::verify(&mut findings, &inp.diff);
-
-    // good_things is supplementary info that doesn't affect findings/score/verdict, so there's no
-    // reason for its failure to discard the core review result entirely — just log a warning and continue with an empty list.
-    let good_things = match good_things_result {
-        Some(Ok(out)) => out.good_things,
-        Some(Err(e)) => {
-            eprintln!("Warning: good_things lens failed — {e:#}");
-            stage_errors.push(format!("good_things: {e:#}"));
-            Vec::new()
-        }
-        None => Vec::new(),
-    };
 
     // Steps 8-9: discourse rounds
     // #117: discourse used to propagate failure via `?`, aborting the whole run (no report.md
@@ -1329,10 +1293,12 @@ always = true
 
     #[test]
     fn run_review_still_carries_a_prior_confirmed_finding_downgraded_to_unknown() {
-        // #135: fixcheck::corroborate() downgrades a wrongly-FIXED verdict to UNKNOWN when the
-        // original evidence is still present verbatim in the diff — but UNKNOWN wasn't
-        // previously re-folded (only STILL_OPEN was), so this safety net produced the exact
-        // silent drop it was built to prevent.
+        // #135: a finding whose original evidence is still present verbatim in the diff must
+        // downgrade to UNKNOWN — but UNKNOWN wasn't previously re-folded (only STILL_OPEN was),
+        // so this safety net produced the exact silent drop it was built to prevent.
+        // #174: this downgrade is now resolved locally (fixcheck::locally_resolvable) before
+        // ever reaching the LLM — see the fixture below, which only queues the round-2 lens
+        // call's response, not a fixcheck one.
         let dir = std::env::temp_dir().join("codereview-loop-e2e-prior-unknown-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1358,11 +1324,11 @@ always = true
         let out_dir = dir.join("out");
 
         let lens_response = r#"{"findings":[],"unverified":[]}"#.to_string();
-        let fixcheck_response =
-            r#"{"results":[{"finding_id":"prior-r1-1","status":"FIXED","evidence":"looks fixed"}]}"#
-                .to_string();
         let usage = Llm::new_usage_tracker();
-        let llm = Llm::fixture(vec![lens_response, fixcheck_response], 0, usage.clone());
+        // Only the round-2 lens response is queued — if fixcheck called the LLM instead of
+        // resolving this finding locally, the empty queue would error instead of run_review
+        // completing successfully.
+        let llm = Llm::fixture(vec![lens_response], 0, usage.clone());
         let cheap_llm = llm.clone();
 
         run_review(

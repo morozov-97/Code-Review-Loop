@@ -1,7 +1,7 @@
 use crate::input::Input;
 use crate::lens::{Finding, GoodThing};
 use crate::llm::Llm;
-use crate::promptctx::{fenced, shared_context};
+use crate::promptctx::{fenced, rewrite_context};
 use crate::spec::Spec;
 use anyhow::{Context, Result};
 
@@ -69,7 +69,10 @@ pub fn rewrite(
         .collect::<Vec<_>>()
         .join("\n");
     let good_text = format_good_things(good_things);
-    let ctx = shared_context(spec, input);
+    // #174: rewrite_context (unlike shared_context) drops the diff/changed-files/conventions/
+    // requirements — this stage only rephrases findings_text/good_text into prose, it never
+    // reads the diff itself.
+    let ctx = rewrite_context(spec, input);
     let task = build_task(&findings_text, &good_text);
     llm.text_ctx(Some(&ctx), &task, Some(HUMANVOICE_SYSTEM))
         .context("human-voice rewrite failed")

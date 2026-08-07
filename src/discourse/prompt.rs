@@ -22,6 +22,14 @@ You must respond only in the specified JSON schema, and nothing else.";
 /// could tip discourse toward deferring to "authority" instead of evidence (based on research
 /// on collusion/bias). The original lens is already preserved in finding.id's prefix (e.g.
 /// design-1), so this doesn't hurt final report mapping.
+///
+/// #174: the prompt itself already says "only unresolved ones are up for a new verdict", but
+/// every finding's full claim/evidence/severity/label used to be resent regardless — on round 2+
+/// that's mostly findings settled in round 1. A CONFIRMED/REJECTED/MERGED finding gets a compact
+/// one-line reference instead (still nameable as a MERGED target or a CONNECT reference); only
+/// genuinely open ones (UNRESOLVED, or UNCERTAIN from a previous round — matching exactly what
+/// the "resolutions should only judge..." rule below says is up for a new verdict) keep the full
+/// block.
 fn findings_catalog(findings: &[Finding], resolved: &HashMap<String, Resolution>) -> String {
     findings
         .iter()
@@ -30,10 +38,17 @@ fn findings_catalog(findings: &[Finding], resolved: &HashMap<String, Resolution>
                 .get(&f.id)
                 .map(|r| r.status.as_str())
                 .unwrap_or("UNRESOLVED");
-            format!(
-                "- id={} | {}:{} | severity={} | label={} | status={}\n  claim: {}\n  evidence: {}",
-                f.id, f.file, f.line, f.severity, f.label, status, f.claim, f.evidence
-            )
+            if matches!(status, "CONFIRMED" | "REJECTED" | "MERGED") {
+                format!(
+                    "- id={} | status={} (settled in an earlier round — full detail omitted, still nameable as a MERGED target or CONNECT reference)",
+                    f.id, status
+                )
+            } else {
+                format!(
+                    "- id={} | {}:{} | severity={} | label={} | status={}\n  claim: {}\n  evidence: {}",
+                    f.id, f.file, f.line, f.severity, f.label, status, f.claim, f.evidence
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -84,6 +99,58 @@ pub(super) fn build_round_prompt(
 mod tests {
     use super::super::test_support::{test_finding, test_spec};
     use super::*;
+
+    #[test]
+    fn findings_catalog_compacts_a_confirmed_finding_instead_of_resending_its_full_detail() {
+        let f = test_finding("a sensitive claim", "sensitive evidence text");
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            f.id.clone(),
+            Resolution {
+                finding_id: f.id.clone(),
+                status: "CONFIRMED".to_string(),
+                merged_into: String::new(),
+                reason: "confirmed in round 1".to_string(),
+            },
+        );
+        let catalog = findings_catalog(std::slice::from_ref(&f), &resolved);
+        assert!(catalog.contains(&f.id));
+        assert!(catalog.contains("CONFIRMED"));
+        assert!(
+            !catalog.contains("a sensitive claim"),
+            "a settled finding's full claim text must not be resent:\n{catalog}"
+        );
+        assert!(
+            !catalog.contains("sensitive evidence text"),
+            "a settled finding's full evidence text must not be resent:\n{catalog}"
+        );
+    }
+
+    #[test]
+    fn findings_catalog_keeps_full_detail_for_an_uncertain_finding() {
+        let f = test_finding("still under debate", "still under debate evidence");
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            f.id.clone(),
+            Resolution {
+                finding_id: f.id.clone(),
+                status: "UNCERTAIN".to_string(),
+                merged_into: String::new(),
+                reason: "not enough votes yet".to_string(),
+            },
+        );
+        let catalog = findings_catalog(&[f], &resolved);
+        assert!(catalog.contains("still under debate"));
+        assert!(catalog.contains("still under debate evidence"));
+    }
+
+    #[test]
+    fn findings_catalog_keeps_full_detail_for_an_unresolved_finding_with_no_prior_verdict() {
+        let f = test_finding("brand new claim", "brand new evidence");
+        let catalog = findings_catalog(&[f], &HashMap::new());
+        assert!(catalog.contains("brand new claim"));
+        assert!(catalog.contains("brand new evidence"));
+    }
 
     #[test]
     fn build_round_prompt_fences_findings_catalog_so_embedded_backticks_cannot_break_out() {
