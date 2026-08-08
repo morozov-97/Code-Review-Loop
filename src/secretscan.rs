@@ -243,6 +243,40 @@ fn contains_marker_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// True when the `=`/`:` at `idx` is actually part of a comparison/relational operator
+/// (`==`, `!=`, `<=`, `>=`) rather than an assignment — found via a real false positive on
+/// `if (token == null) {`, where the first `=` of `==` was mistaken for an assignment separator
+/// and everything after the *second* `=` (`" null) {"`) was captured as "the value".
+fn is_comparison_operator_at(trimmed: &str, idx: usize) -> bool {
+    let bytes = trimmed.as_bytes();
+    if bytes.get(idx + 1) == Some(&b'=') {
+        return true; // `==`
+    }
+    if idx > 0 && matches!(bytes[idx - 1], b'!' | b'<' | b'>' | b'=') {
+        return true; // `!=`, `<=`, `>=`, or a second `=` in `==`
+    }
+    false
+}
+
+/// True when `value` is nothing but a dotted identifier/property-access chain (e.g.
+/// `AppConfig.supabaseAnonKey`) — found via a real false positive where a *reference* to a
+/// config value, not the value itself, sat on the right of `=` and was indistinguishable from a
+/// literal secret by length/placeholder checks alone. A real credential is an opaque token, not
+/// a chain of identifiers joined by `.` — this doesn't cover every non-literal expression (e.g.
+/// a function call), just the shape that actually produced a false positive.
+fn is_dotted_identifier_chain(value: &str) -> bool {
+    let stripped = value.trim_end_matches([';', ')', '{', '}']);
+    !stripped.is_empty()
+        && stripped.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        && stripped.contains('.')
+        && stripped
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
 /// Catches `.env`-style `KEY=value` (or `KEY: "value"` in YAML/JSON-ish config) lines where the
 /// key name looks secret-flavored and the value isn't an obvious placeholder or an
 /// interpolation reference like `${VAR}`/`$VAR`.
@@ -250,7 +284,8 @@ fn find_env_style_secret(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     let sep_idx = trimmed
         .find(['=', ':'])
-        .filter(|&i| i > 0 && i < trimmed.len() - 1)?;
+        .filter(|&i| i > 0 && i < trimmed.len() - 1)
+        .filter(|&i| !is_comparison_operator_at(trimmed, i))?;
     let raw_key = trimmed[..sep_idx].trim();
     // #181: only the identifier immediately before the separator is "the key" — a line like
     // `model, max_tokens: value` (a destructured/positional parameter list, not a single
@@ -278,6 +313,9 @@ fn find_env_style_secret(line: &str) -> Option<&str> {
     }
     if value.starts_with('$') || value.starts_with('{') || value.starts_with('<') {
         return None; // interpolated/templated, not a literal secret
+    }
+    if is_dotted_identifier_chain(value) {
+        return None; // a reference to another value (e.g. `AppConfig.supabaseAnonKey`), not a literal
     }
     let value_lower = value.to_ascii_lowercase();
     if PLACEHOLDER_VALUES.iter().any(|p| value_lower.contains(p)) {
@@ -339,6 +377,46 @@ mod tests {
     }
 
     // --- #181: bare "TOKEN" marker false-positiving on non-secret identifiers ---
+
+    #[test]
+    fn scan_does_not_flag_a_comparison_against_null_as_a_secret_assignment() {
+        // Real false positive: the first `=` of `==` was mistaken for an assignment separator,
+        // capturing "null) {" as if it were a credential value for a "token"-named identifier.
+        let diff = "+++ b/lib/x.dart\n@@ -1 +1 @@\n\
+                     +    if (token == null) {\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a `== null` comparison is not a secret assignment: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_a_dotted_property_reference_as_a_secret_value() {
+        // Real false positive: `AppConfig.supabaseAnonKey` is a *reference* to a config value,
+        // not a literal credential — indistinguishable from a real secret by length/placeholder
+        // checks alone, since it's a plausible-length non-placeholder string.
+        let diff = "+++ b/lib/x.dart\n@@ -1 +1 @@\n\
+                     +    const supabaseKey = AppConfig.supabaseAnonKey;\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a dotted identifier chain is a reference, not a literal secret: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_still_flags_a_real_looking_api_key_value_assigned_to_a_key_named_variable() {
+        // Guards against `is_dotted_identifier_chain` overreaching — a real credential-shaped
+        // value must still be caught even when assigned to a similarly-named variable.
+        let diff = "+++ b/lib/x.dart\n@@ -1 +1 @@\n\
+                     +    const supabaseKey = \"AKIAABCDEFGHIJKLMNOP\";\n";
+        let hits = scan(diff);
+        assert!(
+            !hits.is_empty(),
+            "a real credential-shaped literal must still be flagged"
+        );
+    }
 
     #[test]
     fn scan_does_not_flag_an_ordinary_max_tokens_api_parameter() {
