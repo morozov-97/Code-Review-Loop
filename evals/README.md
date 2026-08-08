@@ -174,19 +174,52 @@ mean running the same 41 diffs through a stripped-down single-pass config too, n
 41 is still small next to the 100-500 the issue names. Posted as a real data point on #161 rather
 than closing it — the comparison-matrix and larger-N gaps remain open.
 
-**Two more real secret-scanner false positives found while running this**, distinct from #181's
-(fixed as [#185](https://github.com/Loop-Suite/Code-Review-Loop/issues/185)/
-[#186](https://github.com/Loop-Suite/Code-Review-Loop/pull/186)): a `token == null` comparison
+**Four more real secret-scanner false positives found while running this**, distinct from #181's,
+all now fixed ([#186](https://github.com/Loop-Suite/Code-Review-Loop/pull/186)/
+[#192](https://github.com/Loop-Suite/Code-Review-Loop/pull/192), tracked as
+[#185](https://github.com/Loop-Suite/Code-Review-Loop/issues/185)): a `token == null` comparison
 had the first `=` of `==` mistaken for an assignment, capturing `"null) {"` as a fake secret value;
-and `const supabaseKey = AppConfig.supabaseAnonKey;` had a property *reference* (not a literal)
-flagged as a credential. A third class — a bare identifier assigned to a `KEY`/`TOKEN`-flavored
-variable, e.g. `'apikey': supabaseKey` — is real and still open (#185), not fixed in the same pass
-since distinguishing "reads like an English identifier" from "looks like a random credential" is a
-fuzzier heuristic than the other two and risks new false negatives. Separately, one diff assigned
-real-shaped Google API key values to client-side Firebase config (`apiKey: 'AIzaSy...'`) — a
-correct pattern match, not a bug: sent with `--allow-sensitive-input` after manual confirmation,
-since Firebase web API keys are documented by Google as safe to embed client-side (access is
-controlled by Firebase Security Rules, not by hiding this value).
+`const supabaseKey = AppConfig.supabaseAnonKey;` had a property *reference* (not a literal)
+flagged as a credential; `(await freshToken()) ?? supabaseKey;` had a whole expression captured as
+"the value"; and a bare identifier with no digits (`'apikey': supabaseKey`) read far more like a
+variable name than a generated secret. Separately, one diff assigned real-shaped Google API key
+values to client-side Firebase config (`apiKey: 'AIzaSy...'`) — a correct pattern match, not a
+bug: sent with `--allow-sensitive-input` after manual confirmation, since Firebase web API keys
+are documented by Google as safe to embed client-side (access is controlled by Firebase Security
+Rules, not by hiding this value).
+
+### Comparison matrix: full pipeline vs. a single-lens baseline
+
+The 41-case run above only exercised the full persona+discourse pipeline — it couldn't say
+whether that pipeline actually beats something simpler, which is the comparison #161 explicitly
+asked for. Ran the same 41 diffs a second time with `--lenses ""` (only the always-included
+generalist lens, no persona selection) — the closest approximation to "one strong reviewer"
+buildable from existing flags, still with the unavoidable minimum of one discourse round (there's
+no flag to skip discourse entirely).
+
+| | full pipeline | single-lens baseline |
+|---|---|---|
+| Recall (caught the known defect) | 19/24 = **0.792** | 9/24 = **0.375** |
+| False-positive rate (flagged a "clean" commit) | 11/17 = **0.647** | 5/17 = **0.294** |
+| Precision | 19/30 = **0.633** | 9/14 = **0.643** |
+| F1 | **0.704** | **0.474** |
+| Avg. cost/calls per diff | $0.0035 / 5.9 calls | $0.0012 / 1.8 calls |
+
+**Reading this honestly:** the full pipeline catches more than twice as many known defects
+(recall roughly doubles), but also flags "clean" commits more than twice as often — precision is
+nearly identical between the two (0.633 vs 0.643). The full pipeline isn't more accurate *per
+flag*; it's more sensitive *overall*, catching more of everything (real and spurious alike) at
+~3x the cost. F1 favors the full pipeline (0.704 vs 0.474), but F1 assumes precision and recall
+matter equally, which is a team's call, not a technical fact this benchmark can settle. Of the 41
+cases, both configurations agreed 21 times (12 both-flagged, 9 both-clean); the full pipeline
+alone caught 18 the baseline missed; the baseline alone caught 2 the full pipeline missed
+(including one real BIC that discourse's vote-gating left `UNCERTAIN` on the full run — the
+cheaper single-pass config isn't strictly dominated on every case).
+
+This is real data toward #161, not a settled verdict: it's one repo, one spec, 41 diffs, and
+`--lenses ""` isn't identical to "the best possible single-strong-reviewer prompt" — a
+purpose-built single-pass reviewer prompt might do better than the generalist lens used here as a
+stand-in.
 
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 
