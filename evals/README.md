@@ -5,6 +5,46 @@ actual `codereview` binary (`--backend openrouter`) against a few fixed diffs an
 `report.md`'s verdict and key finding keywords — the empirical accuracy check this project
 otherwise lacks.
 
+## TL;DR — real cost and results, across every run documented in this file
+
+Every number below is from an actual `--backend openrouter` call against a real model, not
+estimated. Full detail (methodology, caveats, what each run does and doesn't prove) is in the
+sections below — this is the summary for someone who wants the bottom line first.
+
+| Run | Reviews | LLM calls | Real cost |
+|---|---|---|---|
+| 41-case benchmark, full pipeline | 41 | 243 | $0.1446 |
+| 41-case benchmark, single-lens baseline (comparison) | 41 | 73 | $0.0480 |
+| 24-case rerun (discourse-move-confidence data) | 24 | 139 | $0.0774 |
+| 78-case scale-up | 78 | 451 | $0.3022 |
+| **Total** | **184** | **906** | **$0.5722** |
+
+**What this bought:**
+
+- **The full persona+discourse pipeline catches meaningfully more real defects than a single
+  reviewer does** — recall roughly doubled (0.79–0.82 vs. 0.375) across two separate runs.
+  Precision was close between the two configs in both runs (roughly 0.53–0.63 either way) — the
+  extra findings the full pipeline surfaces aren't disproportionately noise, it's genuinely more
+  sensitive, not just louder. Cost: about 3x more calls per diff.
+- **`verdict` used to be structurally useless as a quality signal** on a repo whose commit style
+  didn't match the default spec's test/changelog policy (a single unrelated policy failure forced
+  the same `REQUEST_CHANGES` as a confirmed critical defect). Fixed, and the fix is verified
+  working on real data — verdicts are now genuinely distributed instead of saturated at one value.
+- **Discourse's own self-reported confidence (high/medium/low) is not a reliable signal.** Checked
+  twice, at two sample sizes, against real historical ground truth (not self-graded) — the
+  relationship between stated confidence and actual correctness is weak and, at smaller sample
+  sizes, direction-unstable enough that an early "medium beats high" result reversed once the
+  sample grew. Don't trust a single high-confidence discourse AGREE more than a medium one without
+  independent verification.
+- None of this is a finished verdict on the architecture — see each section's own caveats (sample
+  sizes, one repo, one spec, methodology limits). It's real, measured evidence in place of pure
+  speculation, not proof the design is optimal.
+
+**Privacy note:** every run above was against a real, unrelated private production codebase — not
+part of this repo, not the golden-set fixtures. App name, file paths, and any in-app text are
+deliberately omitted throughout this document; only the review mechanics and aggregate numbers are
+recorded.
+
 ## Validated against a real model
 
 This has actually been run end-to-end with `openai/gpt-oss-120b` via OpenRouter. The
