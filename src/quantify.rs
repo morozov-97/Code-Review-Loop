@@ -132,8 +132,9 @@ fn deterministic_gate(deterministic_results: &Option<serde_json::Value>) -> Opti
 pub enum VerdictReason {
     /// A CONFIRMED P0 finding — an actual, discourse-confirmed defect.
     ConfirmedP0Defect,
-    /// A policy check (tests-accompany-changes, changelog-updated, diff-size) failed — a
-    /// process signal, not a claim that the code itself has a confirmed defect.
+    /// A policy check (tests-accompany-changes, changelog-updated, diff-size) failed and nothing
+    /// stronger fired — a process signal, not a claim that the code itself has a confirmed
+    /// defect. Caps at COMMENT (see `verdict()`'s own comment) rather than REQUEST_CHANGES.
     PolicyFailure,
     /// An external deterministic tool (semgrep/cargo-audit/`--deterministic-results`) reported
     /// `"fail"` on at least one check.
@@ -189,9 +190,6 @@ fn verdict(
             VerdictReason::ConfirmedP0Defect,
         );
     }
-    if policies.iter().any(|p| p.status == PolicyStatus::Fail) {
-        return ("REQUEST_CHANGES".to_string(), VerdictReason::PolicyFailure);
-    }
     if let Some(v) = deterministic_gate(deterministic_results) {
         let reason = if v == "REQUEST_CHANGES" {
             VerdictReason::DeterministicCheckFailed
@@ -228,11 +226,20 @@ fn verdict(
             );
         }
     }
-    if confirmed.is_empty() {
-        ("APPROVE".to_string(), VerdictReason::NoConfirmedFindings)
-    } else {
-        ("COMMENT".to_string(), VerdictReason::ConfirmedMinorDefect)
+    if !confirmed.is_empty() {
+        return ("COMMENT".to_string(), VerdictReason::ConfirmedMinorDefect);
     }
+    // #189 follow-up: a policy failure (missing tests/changelog, oversized diff) used to force
+    // REQUEST_CHANGES on its own, same tier as a confirmed P0 — on a real 41-case benchmark
+    // (evals/README.md) that saturated verdict to REQUEST_CHANGES on 41/41 diffs, because this
+    // project's actual commit style never satisfies the default test/changelog policy, drowning
+    // out any signal about the code itself. Checked last (after every code-defect-driven check
+    // above already had a chance to fire) and capped at COMMENT — a policy gap is still visible
+    // and still worth asking about, just not blocking-tier the way a confirmed defect is.
+    if policies.iter().any(|p| p.status == PolicyStatus::Fail) {
+        return ("COMMENT".to_string(), VerdictReason::PolicyFailure);
+    }
+    ("APPROVE".to_string(), VerdictReason::NoConfirmedFindings)
 }
 
 pub fn summarize(
@@ -428,12 +435,24 @@ mod tests {
     }
 
     #[test]
-    fn verdict_request_changes_on_policy_failure_even_with_no_findings() {
+    fn verdict_comment_on_policy_failure_alone_with_no_findings() {
+        // #189 follow-up: a policy failure alone no longer forces REQUEST_CHANGES — it caps at
+        // COMMENT unless a real code-defect signal also fired.
         let policies = vec![policy(PolicyStatus::Fail)];
-        assert_eq!(
-            verdict(&[], &HashMap::new(), &policies, &None, &None).0,
-            "REQUEST_CHANGES"
-        );
+        let (v, r) = verdict(&[], &HashMap::new(), &policies, &None, &None);
+        assert_eq!(v, "COMMENT");
+        assert_eq!(r, VerdictReason::PolicyFailure);
+    }
+
+    #[test]
+    fn verdict_a_confirmed_p0_still_wins_over_a_policy_failure_when_both_are_present() {
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        let policies = vec![policy(PolicyStatus::Fail)];
+        let (v, r) = verdict(&findings, &resolved, &policies, &None, &None);
+        assert_eq!(v, "REQUEST_CHANGES");
+        assert_eq!(r, VerdictReason::ConfirmedP0Defect);
     }
 
     #[test]
@@ -593,8 +612,9 @@ mod tests {
 
     #[test]
     fn verdict_reason_distinguishes_a_policy_failure_from_a_confirmed_p0_defect() {
-        // The exact complaint #189 was filed over: both produce REQUEST_CHANGES, but callers
-        // need to tell them apart.
+        // The exact complaint #189 was filed over — these two must never collapse into the same
+        // signal. Since the #189 follow-up, they don't even share a verdict tier anymore: a
+        // confirmed P0 still blocks (REQUEST_CHANGES), a policy failure alone only comments.
         let (v1, r1) = verdict(
             &[finding("a", "P0")],
             &{
@@ -614,10 +634,10 @@ mod tests {
             &None,
         );
         assert_eq!(v1, "REQUEST_CHANGES");
-        assert_eq!(v2, "REQUEST_CHANGES");
+        assert_eq!(v2, "COMMENT");
         assert_eq!(r1, VerdictReason::ConfirmedP0Defect);
         assert_eq!(r2, VerdictReason::PolicyFailure);
-        assert_ne!(r1, r2, "same verdict string, but the reason must differ");
+        assert_ne!(r1, r2, "reason must differ regardless of verdict tier");
     }
 
     #[test]

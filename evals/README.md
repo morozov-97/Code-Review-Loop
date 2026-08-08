@@ -133,6 +133,14 @@ doesn't match the default spec's assumptions**, regardless of how good or bad th
 review is. Anyone evaluating this tool against their own repo should check their spec's policy
 pass rate before trusting `verdict` at all.
 
+**Fixed structurally, not just diagnosed**, in a follow-up to #189: a policy failure alone no
+longer forces `REQUEST_CHANGES` — it caps at `COMMENT` unless a confirmed code defect (or a
+deterministic tool failure) also fired. `verdict_reason` (the earlier #189 fix) still tells you
+which branch produced a verdict; this closes the saturation at its source rather than only
+labeling it. The 41-case numbers above predate this fix and are left as-is (they're an accurate
+record of what was actually measured); a re-run against the same diffs today would show fewer
+policy-driven `REQUEST_CHANGES`/`COMMENT` results without any change to the underlying reviews.
+
 Because of that, the numbers below use "did the review produce at least one `CONFIRMED` finding"
 (the `## Findings` table, which the report generator populates only with `CONFIRMED`-status
 findings) as the actual signal, not the saturated `verdict` field:
