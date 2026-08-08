@@ -170,10 +170,14 @@ assumed:
   discourse left those specific claims `UNCERTAIN` rather than `CONFIRMED` (visible in each
   report's "Needs Human Review" section). So "flagged nothing" is a real category, but doesn't
   describe most of the misses.
-- **This does not give issue #163 (confidence-weight calibration) usable data.** That needs
-  per-finding ground truth — was *this specific claim* correct — matched against the historical
-  fix. What's here is per-diff (did anything get confirmed), which is a coarser signal. #163 stays
-  blocked on that finer-grained labeling, not solved by this.
+- **Follow-up work did eventually get real (if partial) data for #163.** This per-diff run alone
+  didn't — that needed per-finding, and later per-discourse-move, ground truth. Both were built as
+  follow-ups (`evals/szz-bench/calibrate_confidence.py`, `calibrate_move_confidence.py`) and
+  produced a genuinely surprising result: AGREE moves at "medium" self-reported confidence had a
+  *higher* location-match rate against the real defect (0.929, n=14) than "high" confidence ones
+  (0.44, n=50) — the opposite of what `confidence_weight`'s 1.0-for-high/0.6-for-medium weighting
+  assumes. Small samples, not a settled result, no constants changed — full numbers and caveats on
+  the #163 thread.
 
 **What this does and doesn't answer for #161:** it's real data at 41 cases instead of 5 or 1, with
 a methodology that doesn't require fabricating ground truth. It does not include the
