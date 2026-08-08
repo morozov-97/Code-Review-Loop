@@ -1,5 +1,4 @@
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use crate::procutil::{spawn_and_wait, which};
 use std::time::Duration;
 
 /// Higher than semgrep::DEFAULT_TIMEOUT (120s) — `cargo audit`'s first run on a machine clones
@@ -16,13 +15,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 /// (and semgrep's) follows.
 pub fn try_run(timeout: Duration) -> Option<serde_json::Value> {
     let bin = which("cargo")?;
-    let child = Command::new(&bin)
-        .args(["audit", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let output = wait_with_timeout(child, timeout)?;
+    let output = spawn_and_wait(&bin, &["audit", "--json"], timeout)?;
     // #144-style leniency: cargo-audit not being installed as a subcommand, or a network
     // failure fetching the advisory database, both land here as "stdout wasn't valid JSON" —
     // falls back to NOT_RUN like every other failure mode in this module, never a guessed result.
@@ -49,86 +42,6 @@ fn build_deterministic_result(v: &serde_json::Value) -> Option<serde_json::Value
             "evidence": format!("cargo audit found {count} known vulnerabilit{plural} in the dependency tree"),
         }
     }))
-}
-
-/// Same reasoning as `semgrep::wait_with_timeout` (this module intentionally doesn't share code
-/// with it — two ~15-line copies is less churn than extracting a shared `process_runner` module
-/// for exactly two call sites, see #169's discussion of the same tradeoff).
-fn wait_with_timeout(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> Option<std::process::Output> {
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stdout_pipe {
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stderr_pipe {
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-        }
-        buf
-    });
-
-    let start = std::time::Instant::now();
-    let status = loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            break status;
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-
-    Some(std::process::Output {
-        status,
-        stdout: stdout_handle.join().ok()?,
-        stderr: stderr_handle.join().ok()?,
-    })
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| find_executable(&dir, bin))
-}
-
-#[cfg(unix)]
-fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let full = dir.join(bin);
-    let meta = full.metadata().ok()?;
-    if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-        Some(full)
-    } else {
-        None
-    }
-}
-
-#[cfg(windows)]
-fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
-    let exact = dir.join(bin);
-    if exact.is_file() {
-        return Some(exact);
-    }
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
-    pathext.split(';').find_map(|ext| {
-        let candidate = dir.join(format!("{bin}{ext}"));
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
-    let full = dir.join(bin);
-    full.is_file().then_some(full)
 }
 
 #[cfg(test)]

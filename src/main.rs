@@ -14,6 +14,7 @@ mod llm;
 mod manifest;
 mod pipeline;
 mod policy;
+mod procutil;
 mod promptctx;
 mod quantify;
 mod report;

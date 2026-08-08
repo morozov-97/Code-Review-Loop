@@ -1,5 +1,4 @@
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use crate::procutil::{spawn_and_wait, which};
 use std::time::Duration;
 
 /// #169: a generous default for callers (like the CLI's automatic semgrep detection) that don't
@@ -50,60 +49,9 @@ pub fn try_run(changed_files: &[String], timeout: Duration) -> Option<serde_json
         return None;
     }
 
-    let child = Command::new(&bin)
-        .args(build_args(&existing))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let output = wait_with_timeout(child, timeout)?;
+    let output = spawn_and_wait(&bin, &build_args(&existing), timeout)?;
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     build_deterministic_results(output.status.success(), output.status.code(), &v)
-}
-
-/// Drains stdout/stderr on separate threads before polling starts (prevents the child from
-/// blocking on a full pipe — same deadlock-avoidance reasoning as `llm.rs`'s wait_with_timeout),
-/// then polls with `try_wait()` and kills on timeout. Returns None on timeout or any I/O error —
-/// callers here already treat every failure mode identically (fall back to NOT_RUN).
-fn wait_with_timeout(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> Option<std::process::Output> {
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stdout_pipe {
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stderr_pipe {
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-        }
-        buf
-    });
-
-    let start = std::time::Instant::now();
-    let status = loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            break status;
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-
-    Some(std::process::Output {
-        status,
-        stdout: stdout_handle.join().ok()?,
-        stderr: stderr_handle.join().ok()?,
-    })
 }
 
 /// #144: split out of `try_run` so the exit-status/errors-array handling can be unit tested
@@ -155,83 +103,9 @@ fn build_deterministic_results(
     }))
 }
 
-fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| find_executable(&dir, bin))
-}
-
-/// `is_file()` alone isn't enough — on Unix, files without the executable permission bit would
-/// pass this check (and only fail at spawn time), while on Windows, semgrep is typically
-/// installed as "semgrep.exe"/"semgrep.cmd" rather than extension-less "semgrep", so it wouldn't
-/// be found at all without checking PATHEXT. If both fail, semgrep silently falls through to
-/// NOT_RUN even when it's actually present.
-#[cfg(unix)]
-fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let full = dir.join(bin);
-    let meta = full.metadata().ok()?;
-    if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-        Some(full)
-    } else {
-        None
-    }
-}
-
-#[cfg(windows)]
-fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
-    let exact = dir.join(bin);
-    if exact.is_file() {
-        return Some(exact);
-    }
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
-    pathext.split(';').find_map(|ext| {
-        let candidate = dir.join(format!("{bin}{ext}"));
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn find_executable(dir: &std::path::Path, bin: &str) -> Option<PathBuf> {
-    let full = dir.join(bin);
-    full.is_file().then_some(full)
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    // --- #169: wait_with_timeout() ---
-
-    #[test]
-    fn wait_with_timeout_returns_output_when_process_finishes_in_time() {
-        let child = Command::new("sh")
-            .args(["-c", "echo hi"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let out = wait_with_timeout(child, Duration::from_secs(5)).unwrap();
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
-    }
-
-    #[test]
-    fn wait_with_timeout_kills_and_returns_none_when_the_process_hangs() {
-        let child = Command::new("sh")
-            .args(["-c", "sleep 5"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let start = std::time::Instant::now();
-        let out = wait_with_timeout(child, Duration::from_millis(300));
-        assert!(out.is_none(), "a hanging process must time out to None");
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "must return promptly around the timeout, not wait for the full sleep"
-        );
-    }
 
     // --- build_deterministic_results() ---
 
@@ -274,37 +148,6 @@ mod tests {
         let v = serde_json::json!({"results": [], "errors": []});
         let out = build_deterministic_results(true, Some(0), &v).unwrap();
         assert_eq!(out["sast"]["status"], "pass");
-    }
-
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("codereview-loop-semgrep-which-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn find_executable_rejects_non_executable_file() {
-        let dir = temp_dir("non-exec");
-        let bin_path = dir.join("semgrep");
-        std::fs::write(&bin_path, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert!(find_executable(&dir, "semgrep").is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn find_executable_accepts_executable_file() {
-        let dir = temp_dir("exec");
-        let bin_path = dir.join("semgrep");
-        std::fs::write(&bin_path, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(find_executable(&dir, "semgrep"), Some(bin_path));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
