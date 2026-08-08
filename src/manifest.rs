@@ -4,16 +4,19 @@
 //! eyeballing stdout/stderr after the fact. This is v1: only what's already cheaply available
 //! by the end of `run_review`, written alongside report.md/state.json.
 //!
-//! #172: added per-stage wall-clock timing (`StageTimings`) on top of that v1 — but still not
-//! attempting the fuller per-call latency/retry-reason/queue-wait tracking the issue also asks
-//! for, since that needs instrumenting `Llm` itself (a bigger, separate change: every call site
-//! would need to identify which stage it's calling from, and `Llm`'s retry loop would need to
-//! record attempts/latency per call, not just aggregate `Usage`). Stage timings below are wired
-//! up from `pipeline/review.rs`'s existing stage boundaries — where two stages now run
+//! #172: added per-stage wall-clock timing (`StageTimings`) on top of that v1. Stage timings are
+//! wired up from `pipeline/review.rs`'s existing stage boundaries — where two stages now run
 //! concurrently (#168's lens selection + mandatory review, #170's requirements + human_voice),
 //! the reported field covers the whole overlapping phase rather than fabricating an attribution
-//! split neither stage's own thread reports back on its own.
-use crate::llm::Usage;
+//! split neither stage's own thread reports back on its own. Also added `calls`: one
+//! `CallRecord` (attempts, latency, success) per logical LLM call across the whole run, via
+//! `Llm::with_calls_log` — this is the per-call half the header comment above used to say was
+//! out of scope. Still doesn't attribute each call to a stage (every call site would need to
+//! thread a stage label through, a larger change) or track queue-wait/peak-in-flight
+//! (`CallGate` enforces the cap but doesn't currently expose its own occupancy over time) — a
+//! call's rough stage can be inferred by cross-referencing its position in `calls` against
+//! `stages`' timings, not read off directly.
+use crate::llm::{CallRecord, Usage};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
@@ -29,6 +32,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct StageTimings {
     pub(crate) semgrep_ms: Option<u128>,
+    /// #164: absent for the same reason semgrep_ms is — never spawned when deterministic_results
+    /// was already supplied externally.
+    pub(crate) cargo_audit_ms: Option<u128>,
     /// Combined: lens selection (when --lenses isn't given) and mandatory-lens review run
     /// concurrently (#168), followed by optional-lens review once selection returns.
     pub(crate) lens_selection_and_review_ms: u128,
@@ -59,6 +65,8 @@ pub(crate) struct Manifest {
     pub(crate) dropped_files: Vec<String>,
     pub(crate) usage: Usage,
     pub(crate) stages: StageTimings,
+    /// #172: one entry per logical LLM call across the whole run (main + cheap model combined).
+    pub(crate) calls: Vec<CallRecord>,
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -82,6 +90,7 @@ pub(crate) fn build(
     dropped_files: Vec<String>,
     usage: Usage,
     stages: StageTimings,
+    calls: Vec<CallRecord>,
 ) -> Result<Manifest> {
     Ok(Manifest {
         codereview_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -97,6 +106,7 @@ pub(crate) fn build(
         dropped_files,
         usage,
         stages,
+        calls,
     })
 }
 
@@ -152,6 +162,11 @@ mod tests {
                 total_ms: 1234,
                 ..Default::default()
             },
+            vec![CallRecord {
+                attempts: 1,
+                latency_ms: 42,
+                success: true,
+            }],
         )
         .unwrap();
 
@@ -160,6 +175,7 @@ mod tests {
         assert!(contents.contains("\"round\": 2"));
         assert!(contents.contains("some-model"));
         assert!(contents.contains("Cargo.lock"));
+        assert!(contents.contains("\"latency_ms\": 42"));
         assert!(contents.contains("\"total_ms\": 1234"));
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -72,6 +72,8 @@ It favors traceability and auditability:
 - `claude` CLI in PATH (for LLM-backed review modes, default backend) —
   or `--backend openrouter` with `OPENROUTER_API_KEY` set, which needs no `claude` CLI
 - optional: `semgrep` for local deterministic SAST/secrets/semi-static checks
+- optional: `cargo-audit` (`cargo install cargo-audit`) for local deterministic dependency
+  vulnerability checks
 
 ### Build
 
@@ -273,17 +275,31 @@ flowchart TD
 
 ### External tool output (non-judged)
 
-`--deterministic-results` expects the tool's own per-check JSON shape —
-`{ "<check_id>": { "status": "...", "evidence": "..." }, ... }` keyed by the ids in
-`spec.deterministic_checks` (e.g. `sast`, `secrets`) — not raw `semgrep --json` output, which has
-a different top-level shape (`results`/`errors`/`paths`) and will silently read back as `NOT_RUN`
-for every check if passed through directly.
-If not provided, and if `semgrep` is available, Code-Review-Loop currently executes:
+`--deterministic-results` expects the tool's own per-check JSON shape — a flat JSON object whose
+values are each an object with a `status` field:
 
-`semgrep --config=auto`
+```json
+{ "<check_id>": { "status": "pass" | "fail" | "error", "evidence": "..." }, ... }
+```
 
-It fills only SAST and secret-like checks; SCA/taint/deprecation remain `NOT_RUN` unless available
-by upstream tooling. Those results are presented as-is and are **not re-decided by LLM**.
+Any top-level key name is accepted (not restricted to a fixed set) — `quantify::deterministic_gate`
+only reads `status` off each entry, keyed by the ids in `spec.deterministic_checks` (e.g. `sast`,
+`secrets`, `dependency_sca`). A single `"fail"` anywhere forces `REQUEST_CHANGES` immediately; an
+`"error"` (with no `"fail"` present) forces `NEEDS_CONTEXT`; this is **not raw tool output** —
+`semgrep --json` and `cargo audit --json` each have their own top-level shape
+(`results`/`errors`/`paths` for semgrep, `vulnerabilities`/`warnings` for cargo-audit) and will
+silently read back as `NOT_RUN` for every check if passed through directly instead of translated
+into the shape above.
+
+If not provided, Code-Review-Loop auto-runs whichever of these is available on `PATH`, in the
+background, concurrently with lens review — neither blocks the other:
+
+- `semgrep --config=auto` — fills `sast`/secret-like checks
+- `cargo audit --json` — fills `dependency_sca`
+
+Results from both are merged by key, not overwritten by whichever finishes second. SCA/taint/
+deprecation checks outside what these two cover remain `NOT_RUN` unless supplied externally. Those
+results are presented as-is and are **not re-decided by LLM**.
 
 **Worked example — move a mechanically-checkable claim out of LLM judgment.** A lens/discourse
 finding might claim "this `dispose()` doesn't cancel the `StreamSubscription` it created." That's
@@ -313,7 +329,7 @@ flowchart TD
         voice2["Human-voice rewriting"]
     end
     subgraph ext["External tool output (non-judged)"]
-        semgrep2["semgrep --config=auto<br/><sub>or --deterministic-results file</sub>"]
+        semgrep2["semgrep --config=auto<br/><sub>or cargo audit --json<br/>or --deterministic-results file</sub>"]
     end
     llm --> det
     ext --> det
@@ -381,7 +397,14 @@ sequenceDiagram
   JWTs, `.env`-style secret assignments) and refuses
   to proceed if it finds one — pass `--allow-sensitive-input` to send it anyway. This is a
   best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
-  formats beyond the ones listed) — it catches the obvious cases, not everything.
+  formats beyond the ones listed) — it catches the obvious cases, not everything. Scope boundary,
+  spelled out since "no redaction" undersells how narrow this is: it is credential-*pattern*
+  matching only. It is not PII detection (no names/emails/phone numbers/addresses/government IDs),
+  not a path allowlist/denylist (no way to say "never send anything under `secrets/` or
+  `infra/prod/` regardless of content"), not an audit log of what was actually transmitted to
+  which provider, and not any data-residency or no-retention enforcement on the provider side. For
+  a repo with PII references or compliance-scoped paths, that gap is real — content scanners
+  always miss things path rules wouldn't.
 - heuristic-only policy signals for behavior vs surface changes can produce false
   positives depending on project structure. The default spec's test/doc policy is presence-only
   (some test/doc file appears anywhere in the diff, not mapped per changed file) and strict
@@ -392,7 +415,16 @@ sequenceDiagram
   spec via an optional `[scoring]` table (`p0`/`p1`/`p2`/`p3`); unset fields keep their default,
   so a partial table only overrides what it mentions. Effort/time budgets (`quantify.rs`'s
   `effort_and_time`) are still hardcoded — there's no config field for those yet.
-- fixed persona mapping (e.g., design→Fowler) is customizable but opinionated.
+- fixed persona mapping (e.g., design→Fowler) is customizable but opinionated. More importantly:
+  persona diversity is not model diversity. Every lens, the discourse pass, and the judge draw
+  from the same underlying model by default — differentiated only by system prompt. The premise
+  behind running multiple "reviewers" at all is that their errors are somewhat independent, so
+  cross-verification catches something a single pass would miss; three personas answering as the
+  same model are far more likely to share failure modes than genuinely different models would be.
+  A `model` field on a `[[lenses]]` entry in spec.toml overrides `--model`/`--cheap-model` for
+  just that lens (works with `--backend openrouter`/`custom`, where distinct model ids resolve to
+  distinct endpoints) — set it on one or two lenses to actually test whether model diversity
+  changes what gets caught, rather than assuming persona diversity already covers it.
 - `--prior` assumes compatible finding identity across re-runs with the same spec.
 - repository-independent claim matching can become noisy when file renames are common
   without supporting heuristics.

@@ -87,6 +87,9 @@ pub(crate) fn build_llm(cli: &Cli) -> Result<(Llm, Llm)> {
     // human_voice call made on the cheap model at the same moment both draw from the same total
     // budget instead of each having their own uncounted allowance.
     let gate = CallGate::new(concurrency_hint(&cli.cmd));
+    // #172: one shared per-call log, same reasoning as the shared gate/usage — a manifest built
+    // from it after the run sees every call made on either model, not just one.
+    let calls_log = Llm::new_calls_log();
     // #175: max_output_tokens is only meaningful for the OpenAI-compatible backends (harmless,
     // ignored, for ClaudeCli/Fixture) — applied unconditionally regardless of backend since
     // with_max_output_tokens is a no-op where it doesn't apply. max_provider_calls is shared via
@@ -95,11 +98,13 @@ pub(crate) fn build_llm(cli: &Cli) -> Result<(Llm, Llm)> {
         main_llm
             .with_gate(Some(gate.clone()))
             .with_max_output_tokens(Some(cli.max_output_tokens))
-            .with_max_calls(cli.max_provider_calls),
+            .with_max_calls(cli.max_provider_calls)
+            .with_calls_log(Some(calls_log.clone())),
         cheap_llm
             .with_gate(Some(gate))
             .with_max_output_tokens(Some(cli.max_output_tokens))
-            .with_max_calls(cli.max_provider_calls),
+            .with_max_calls(cli.max_provider_calls)
+            .with_calls_log(Some(calls_log)),
     ))
 }
 

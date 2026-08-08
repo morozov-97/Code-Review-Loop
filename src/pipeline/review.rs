@@ -1,3 +1,4 @@
+use crate::cargo_audit;
 use crate::discourse;
 use crate::evidence;
 use crate::fixcheck;
@@ -40,6 +41,29 @@ pub(crate) struct ReviewArgs<'a> {
     pub(crate) allow_sensitive_input: bool,
 }
 
+/// #164: folds a newly-arrived deterministic tool's result object into whatever's accumulated so
+/// far, key by key — so semgrep's `sast`/`secrets` entries and cargo-audit's `dependency_sca`
+/// entry coexist in one object instead of the second tool to finish clobbering the first.
+/// `quantify::deterministic_gate` only cares that each entry has a `status` field, not which
+/// top-level key it lives under, so any two tools contributing disjoint keys just merge cleanly.
+fn merge_deterministic_results(
+    existing: &mut Option<serde_json::Value>,
+    incoming: serde_json::Value,
+) {
+    match existing {
+        None => *existing = Some(incoming),
+        Some(current) => {
+            if let (Some(current_obj), Some(incoming_obj)) =
+                (current.as_object_mut(), incoming.as_object())
+            {
+                for (k, v) in incoming_obj {
+                    current_obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+}
+
 /// True once `started.elapsed()` has passed `deadline_minutes` — always false when unset.
 fn deadline_exceeded(started: std::time::Instant, deadline_minutes: Option<u64>) -> bool {
     match deadline_minutes {
@@ -48,19 +72,38 @@ fn deadline_exceeded(started: std::time::Instant, deadline_minutes: Option<u64>)
     }
 }
 
-/// #169: caps semgrep::DEFAULT_TIMEOUT at whatever's left of the overall --deadline-minutes
-/// budget, mirroring Llm::effective_timeout's same base.min(remaining).max(floor) shape — a
-/// background semgrep run shouldn't be able to eat the whole deadline on its own.
-fn semgrep_timeout(deadline: Option<std::time::Instant>) -> std::time::Duration {
+/// #169/#164: caps a deterministic tool's own default timeout at whatever's left of the overall
+/// --deadline-minutes budget, mirroring Llm::effective_timeout's same base.min(remaining).max(floor)
+/// shape — a background semgrep/cargo-audit run shouldn't be able to eat the whole deadline on
+/// its own.
+fn deterministic_tool_timeout(
+    base: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+) -> std::time::Duration {
     match deadline {
-        None => semgrep::DEFAULT_TIMEOUT,
-        Some(d) => semgrep::DEFAULT_TIMEOUT
+        None => base,
+        Some(d) => base
             .min(d.saturating_duration_since(std::time::Instant::now()))
             .max(std::time::Duration::from_secs(1)),
     }
 }
 
 type LensReviewResults = Vec<Result<(String, lens::LensOutput)>>;
+
+/// #162: a lens with a `model` override in its spec runs on a clone of `llm` with just that
+/// field swapped — same provider/gate/usage tracker/calls_log, different model id. Returns
+/// `None` when no override applies (the overwhelmingly common case), so callers can fall back
+/// to the shared `llm` reference without an allocation.
+fn lens_specific_llm(llm: &Llm, sp: &Spec, id: &str) -> Option<Llm> {
+    let lens = sp.lenses.iter().find(|l| l.id == id)?;
+    let model = lens.model.as_ref()?;
+    if llm.model.as_ref() == Some(model) {
+        return None;
+    }
+    let mut overridden = llm.clone();
+    overridden.model = Some(model.clone());
+    Some(overridden)
+}
 
 /// Shared by both the mandatory-lens and optional-lens `par_map` calls (#168) — kept as one
 /// plain fn instead of a closure defined twice so the "lens complete" logging can't drift
@@ -72,7 +115,9 @@ fn review_one_lens(
     id: &str,
     round: usize,
 ) -> Result<(String, lens::LensOutput)> {
-    let out = lens::review_lens(llm, sp, inp, id, round)?;
+    let overridden = lens_specific_llm(llm, sp, id);
+    let effective_llm = overridden.as_ref().unwrap_or(llm);
+    let out = lens::review_lens(effective_llm, sp, inp, id, round)?;
     println!(
         "  Lens complete: {} — {} findings, {} unverified",
         id,
@@ -131,8 +176,17 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     let semgrep_started = std::time::Instant::now();
     let semgrep_handle = inp.deterministic_results.is_none().then(|| {
         let changed_files = inp.changed_files.clone();
-        let timeout = semgrep_timeout(deadline_instant);
+        let timeout = deterministic_tool_timeout(semgrep::DEFAULT_TIMEOUT, deadline_instant);
         std::thread::spawn(move || semgrep::try_run(&changed_files, timeout))
+    });
+    // #164: a second deterministic source, run concurrently with semgrep for the same reason
+    // (nothing in the LLM context reads it before the deterministic gate at the very end) —
+    // gated on the same is_none() check, since an externally-supplied --deterministic-results
+    // means neither auto-detected tool should run or override what the caller passed in.
+    let cargo_audit_started = std::time::Instant::now();
+    let cargo_audit_handle = inp.deterministic_results.is_none().then(|| {
+        let timeout = deterministic_tool_timeout(cargo_audit::DEFAULT_TIMEOUT, deadline_instant);
+        std::thread::spawn(move || cargo_audit::try_run(timeout))
     });
     let out_dir = prepare_out(args.out)?;
 
@@ -493,7 +547,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
                 println!(
                     "semgrep auto-detected — reflecting local run results in deterministic checks"
                 );
-                inp.deterministic_results = Some(v);
+                merge_deterministic_results(&mut inp.deterministic_results, v);
             }
             Ok(None) => {}
             Err(_) => {
@@ -502,6 +556,25 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
         semgrep_started.elapsed().as_millis()
+    });
+    // #164: joined right alongside semgrep — both were spawned at the same point and neither
+    // blocks lens selection/review, so joining them back to back here doesn't add wall-clock
+    // beyond whichever of the two ran longer.
+    let cargo_audit_ms = cargo_audit_handle.map(|handle| {
+        match handle.join() {
+            Ok(Some(v)) => {
+                println!(
+                    "cargo audit auto-detected — reflecting local run results in deterministic checks"
+                );
+                merge_deterministic_results(&mut inp.deterministic_results, v);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                eprintln!("Warning: cargo audit background thread panicked");
+                stage_errors.push("cargo_audit: background thread panicked".to_string());
+            }
+        }
+        cargo_audit_started.elapsed().as_millis()
     });
 
     // Step 10: quantitative summary + verdict
@@ -568,12 +641,14 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         llm.usage(),
         manifest::StageTimings {
             semgrep_ms,
+            cargo_audit_ms,
             lens_selection_and_review_ms,
             discourse_ms,
             fixcheck_ms,
             requirements_and_human_voice_ms,
             total_ms: started.elapsed().as_millis(),
         },
+        llm.calls(),
     )
     .and_then(|m| manifest::write(&out_dir, &m))
     {
@@ -608,6 +683,75 @@ mod e2e_tests {
         }
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
+    }
+
+    fn spec_with_lens_models(dir: &std::path::Path) -> Spec {
+        let spec_path = dir.join("model-override-spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "model override test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "no_override"
+title = "No Override"
+always = true
+
+[[lenses]]
+id = "same_as_shared"
+title = "Same As Shared"
+always = true
+model = "shared-model"
+
+[[lenses]]
+id = "different_model"
+title = "Different Model"
+always = true
+model = "diverse-model"
+"#,
+        );
+        Spec::load(&spec_path).unwrap()
+    }
+
+    #[test]
+    fn lens_specific_llm_returns_none_for_a_lens_with_no_model_field() {
+        let dir = std::env::temp_dir().join("codereview-loop-lens-specific-llm-test-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = spec_with_lens_models(&dir);
+        let mut llm = Llm::fixture(vec![], 0, Llm::new_usage_tracker());
+        llm.model = Some("shared-model".to_string());
+
+        assert!(lens_specific_llm(&llm, &sp, "no_override").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lens_specific_llm_returns_none_when_the_override_matches_the_shared_model() {
+        let dir = std::env::temp_dir().join("codereview-loop-lens-specific-llm-test-2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = spec_with_lens_models(&dir);
+        let mut llm = Llm::fixture(vec![], 0, Llm::new_usage_tracker());
+        llm.model = Some("shared-model".to_string());
+
+        assert!(lens_specific_llm(&llm, &sp, "same_as_shared").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lens_specific_llm_returns_an_overridden_clone_when_the_lens_names_a_different_model() {
+        let dir = std::env::temp_dir().join("codereview-loop-lens-specific-llm-test-3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = spec_with_lens_models(&dir);
+        let mut llm = Llm::fixture(vec![], 0, Llm::new_usage_tracker());
+        llm.model = Some("shared-model".to_string());
+
+        let overridden = lens_specific_llm(&llm, &sp, "different_model").unwrap();
+        assert_eq!(overridden.model.as_deref(), Some("diverse-model"));
+        // Everything else about the lens's own shared client (usage tracker, gate, etc.) still
+        // comes along via the clone — only `model` diverges from `llm`.
+        assert_eq!(overridden.retries, llm.retries);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

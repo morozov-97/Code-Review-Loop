@@ -24,6 +24,14 @@ pub struct Lens {
     /// generalist | specialist | famous_engineer | custom. Display-only, doesn't affect logic.
     #[serde(default)]
     pub tier: String,
+    /// #162: overrides `--model`/`--cheap-model` for just this lens, when set. Every persona
+    /// otherwise runs on the same underlying model differentiated only by system prompt — their
+    /// failure modes are more likely to be correlated than genuinely independent reviewers' would
+    /// be (see README's caveats section). Wiring one or two lenses to a different model via
+    /// `--backend openrouter`/`custom` is a way to actually test whether that matters, not a
+    /// claim that it does by default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Checklist item for a deterministic tool (Semgrep/CodeQL, etc). The LLM doesn't judge this — external results are shown as-is.

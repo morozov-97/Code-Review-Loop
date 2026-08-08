@@ -345,6 +345,7 @@ mod tests {
             persona_name: String::new(),
             persona_voice: String::new(),
             tier: String::new(),
+            model: None,
         }
     }
 

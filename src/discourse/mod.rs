@@ -31,6 +31,33 @@ pub struct DiscourseAudit {
     pub moves: Vec<Move>,
 }
 
+/// #183: a claim that something is undefined / doesn't compile requires knowing the full symbol
+/// table (every field/variable/import declared anywhere in the file) to actually verify or
+/// refute — no lens has that, since every lens only ever sees `shared_context`'s diff, never
+/// full file contents (see `promptctx::shared_context`). A finding in this category clearing the
+/// vote threshold isn't evidence the claim is *true*; it only means no lens happened to
+/// construct a counter-argument, which for this claim category isn't the same thing (contrast a
+/// claim like "this method isn't called anywhere in the diff" — that a diff-only lens genuinely
+/// can verify or refute, and discourse routinely does correctly). Observed in practice: a
+/// discourse-AGREE'd P0 "undefined variable" claim that turned out to be wrong on inspection of
+/// the real source file, caught only incidentally (by evidence_unverified, because the LLM's
+/// evidence field happened to be a paraphrase rather than a verbatim diff quote) — a
+/// differently-worded version of the identical wrong claim would have sailed through as
+/// CONFIRMED. This treats the whole claim category as inherently unconfirmable from a diff
+/// alone, not dependent on how the evidence field happens to be phrased.
+fn claims_undefined_or_compile_error(claim: &str) -> bool {
+    let lower = claim.to_ascii_lowercase();
+    const MARKERS: [&str; 6] = [
+        "undefined variable",
+        "undefined reference",
+        "is not defined",
+        "isn't defined",
+        "compile error",
+        "compile-time error",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// Iterates discourse rounds. Stops once there are no unresolved/UNCERTAIN findings left, or
 /// max_rounds is reached. Retries once per round if a round comes back with no CHALLENGE.
 ///
@@ -149,14 +176,19 @@ pub fn run(
             if r.status == "CONFIRMED" {
                 let net = direct_vote_net(&audit, &r.finding_id)
                     + merge_vote_weight(&resolved, &audit, &r.finding_id);
-                let unverified = findings
+                let (unverified, whole_file_claim) = findings
                     .iter()
                     .find(|f| f.id == r.finding_id)
-                    .map(|f| f.evidence_unverified)
-                    .unwrap_or(true);
-                if net < VOTE_THRESHOLD || unverified {
+                    .map(|f| {
+                        (
+                            f.evidence_unverified,
+                            claims_undefined_or_compile_error(&f.claim),
+                        )
+                    })
+                    .unwrap_or((true, false));
+                if net < VOTE_THRESHOLD || unverified || whole_file_claim {
                     r.reason = format!(
-                        "{} [Verification failed: local vote net={net:.2} (need >= {VOTE_THRESHOLD}) or evidence_unverified={unverified} — reverted to UNCERTAIN instead of trusting the stated CONFIRMED]",
+                        "{} [Verification failed: local vote net={net:.2} (need >= {VOTE_THRESHOLD}) or evidence_unverified={unverified} or claim needs whole-file context no lens has={whole_file_claim} — reverted to UNCERTAIN instead of trusting the stated CONFIRMED]",
                         r.reason
                     );
                     r.status = "UNCERTAIN".to_string();
@@ -202,11 +234,25 @@ pub fn run(
         // #148: same evidence_unverified gate applied to an LLM-authored CONFIRMED above — a
         // finding whose citation didn't check out shouldn't get confirmed here either just
         // because the vote net alone clears the threshold.
-        let (status, reason) = if net >= VOTE_THRESHOLD && f.evidence_unverified {
+        // #183: same for a claim needing whole-file context no lens has (see
+        // claims_undefined_or_compile_error's doc comment) — the vote net clearing threshold
+        // here just means no lens challenged it, not that it's actually true.
+        let whole_file_claim = claims_undefined_or_compile_error(&f.claim);
+        let (status, reason) = if net >= VOTE_THRESHOLD
+            && (f.evidence_unverified || whole_file_claim)
+        {
+            let why = match (f.evidence_unverified, whole_file_claim) {
+                (true, true) => {
+                    "evidence is unverified and the claim needs whole-file context no lens has"
+                }
+                (true, false) => "evidence is unverified",
+                (false, true) => "the claim needs whole-file context no lens has",
+                (false, false) => unreachable!("outer condition requires at least one to be true"),
+            };
             (
                 "UNCERTAIN".to_string(),
                 format!(
-                    "discourse rounds exhausted, vote net={net:.2} clears the threshold but evidence is unverified — not confirmed"
+                    "discourse rounds exhausted, vote net={net:.2} clears the threshold but {why} — not confirmed"
                 ),
             )
         } else if net >= VOTE_THRESHOLD {
@@ -524,6 +570,85 @@ mod tests {
         assert_ne!(
             resolved["a"].status, "CONFIRMED",
             "a CONFIRMED whose citation is evidence_unverified must not stand as-is even with a real vote"
+        );
+    }
+
+    // --- #183: claims_undefined_or_compile_error() / its gate ---
+
+    #[test]
+    fn claims_undefined_or_compile_error_matches_the_documented_phrasings() {
+        assert!(claims_undefined_or_compile_error(
+            "References an undefined variable `foo`, causing a compile-time error."
+        ));
+        assert!(claims_undefined_or_compile_error(
+            "This will not compile: undefined reference to `bar`."
+        ));
+        assert!(claims_undefined_or_compile_error(
+            "`baz` is not defined here."
+        ));
+    }
+
+    #[test]
+    fn claims_undefined_or_compile_error_does_not_match_an_ordinary_claim() {
+        assert!(!claims_undefined_or_compile_error(
+            "The removed method is still referenced elsewhere in this diff."
+        ));
+    }
+
+    #[test]
+    fn run_reverts_an_llm_authored_confirmed_whose_claim_needs_whole_file_context() {
+        // #183: a genuine vote and verified evidence, but the claim itself asserts something
+        // (undefined variable / compile error) that no diff-only lens can actually confirm or
+        // refute — must not stand as CONFIRMED even though neither the vote nor
+        // evidence_unverified alone would have blocked it.
+        let mut findings = vec![test_finding(
+            "References an undefined variable, a compile error.",
+            "evidence",
+        )];
+        findings[0].id = "a".to_string();
+        findings[0].evidence_unverified = false;
+
+        let response = serde_json::json!({
+            "moves": [
+                {
+                    "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                    "detail": "d", "confidence": "high", "challenge_axis": "existence"
+                },
+                {
+                    "move": "AGREE", "lens": "reviewer", "target": "a",
+                    "confidence": "high", "new_evidence": "e"
+                }
+            ],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "confirmed"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "CONFIRMED",
+            "an undefined-variable/compile-error claim must not stand as CONFIRMED off a vote alone"
         );
     }
 

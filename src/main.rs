@@ -1,4 +1,5 @@
 mod backend_factory;
+mod cargo_audit;
 mod cli;
 mod core;
 mod describe;

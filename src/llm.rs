@@ -172,6 +172,25 @@ pub struct Llm {
     /// combined when they share a usage tracker) — None means uncapped (existing behavior,
     /// unchanged).
     max_calls: Option<u64>,
+    /// #172: per-logical-call latency/attempt-count telemetry — None means not collected
+    /// (existing behavior for any caller that doesn't opt in via `with_calls_log`, e.g. tests
+    /// constructing `Llm::fixture` directly). Shared across main/cheap the same way `usage` is,
+    /// so a manifest built from it sees every call in the run, not just one model's.
+    calls_log: Option<Arc<Mutex<Vec<CallRecord>>>>,
+}
+
+/// #172: one entry per logical call (a whole `text_ctx`/`json_ctx_typed` invocation, including
+/// all its retries — not one entry per raw HTTP/subprocess attempt). `manifest.rs`'s own header
+/// comment previously scoped this out as needing "instrumenting Llm itself" — this is that
+/// instrumentation. Deliberately doesn't carry a `stage` label: every call site (lens review,
+/// discourse, requirements, ...) would need to thread one through, a larger change than this
+/// pass; a `CallRecord`'s position in the shared log combined with `manifest.rs`'s own per-stage
+/// wall-clock timings is enough to roughly correlate the two without that.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CallRecord {
+    pub attempts: u32,
+    pub latency_ms: u128,
+    pub success: bool,
 }
 
 /// An HTTP-ish failure that carries its status code as data, not just baked into a message
@@ -298,6 +317,7 @@ impl Llm {
             gate: None,
             max_output_tokens: None,
             max_calls: None,
+            calls_log: None,
         }
     }
 
@@ -324,6 +344,7 @@ impl Llm {
             gate: None,
             max_output_tokens: None,
             max_calls: None,
+            calls_log: None,
         })
     }
 
@@ -354,6 +375,7 @@ impl Llm {
             gate: None,
             max_output_tokens: None,
             max_calls: None,
+            calls_log: None,
         }
     }
 
@@ -372,6 +394,7 @@ impl Llm {
             gate: None,
             max_output_tokens: None,
             max_calls: None,
+            calls_log: None,
         }
     }
 
@@ -410,6 +433,38 @@ impl Llm {
     pub fn with_max_calls(mut self, max_calls: Option<u64>) -> Self {
         self.max_calls = max_calls;
         self
+    }
+
+    /// #172: share this across multiple Llm instances (main + cheap) to collect one combined
+    /// per-call log for the whole run, the same pattern as `new_usage_tracker`.
+    pub fn new_calls_log() -> Arc<Mutex<Vec<CallRecord>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    pub fn with_calls_log(mut self, calls_log: Option<Arc<Mutex<Vec<CallRecord>>>>) -> Self {
+        self.calls_log = calls_log;
+        self
+    }
+
+    /// Snapshot of every call recorded so far, in call order. Empty if no log was attached via
+    /// `with_calls_log`.
+    pub fn calls(&self) -> Vec<CallRecord> {
+        self.calls_log
+            .as_ref()
+            .map(|log| log.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .unwrap_or_default()
+    }
+
+    fn record_call(&self, attempts: u32, started: Instant, success: bool) {
+        if let Some(log) = &self.calls_log {
+            log.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(CallRecord {
+                    attempts,
+                    latency_ms: started.elapsed().as_millis(),
+                    success,
+                });
+        }
     }
 
     /// Caps `base` at whatever's left until `self.deadline`, if set. Floors at 1s so a deadline
@@ -523,13 +578,17 @@ impl Llm {
     /// cache hits when the same ctx is called repeatedly. The claude-cli backend gets no caching
     /// benefit since each call is a fresh subprocess, so it just concatenates them.
     pub fn text_ctx(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<String> {
+        let started = Instant::now();
         let mut last: Option<anyhow::Error> = None;
+        let mut attempts_made = 0u32;
         for attempt in 0..=self.retries {
+            attempts_made = attempt + 1;
             let mut retryable = true;
             match self.call_once(ctx, task, system) {
                 Ok(r) => {
                     self.record_usage(&r.usage);
                     if !r.text.trim().is_empty() {
+                        self.record_call(attempt + 1, started, true);
                         return Ok(r.text);
                     }
                     last = Some(anyhow!("empty response"));
@@ -566,6 +625,7 @@ impl Llm {
                 self.deadline_aware_sleep(delay);
             }
         }
+        self.record_call(attempts_made, started, false);
         Err(last.unwrap_or_else(|| anyhow!("unknown failure")))
     }
 
@@ -592,7 +652,9 @@ impl Llm {
         task: &str,
         system: Option<&str>,
     ) -> Result<T> {
+        let started = Instant::now();
         let mut last: Option<anyhow::Error> = None;
+        let mut attempts_made = 0u32;
         // #171: retries used to treat a transport failure and a schema-mismatched response
         // identically — resend the exact same ctx/task and sleep an exponential backoff either
         // way. A schema failure isn't a transient server problem, so backoff doesn't help it,
@@ -605,6 +667,7 @@ impl Llm {
         let mut current_task: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(task);
         let mut repair_used = false;
         for attempt in 0..=self.retries {
+            attempts_made = attempt + 1;
             let raw = match self.call_once(ctx, &current_task, system) {
                 Ok(r) => {
                     self.record_usage(&r.usage);
@@ -636,7 +699,10 @@ impl Llm {
                 serde_json::from_value::<T>(v).context("response does not match expected schema")
             });
             match parsed {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    self.record_call(attempts_made, started, true);
+                    return Ok(v);
+                }
                 Err(e) => {
                     if self.verbose {
                         eprintln!("[json retry {}/{}] {e}", attempt + 1, self.retries);
@@ -665,6 +731,7 @@ impl Llm {
                 }
             }
         }
+        self.record_call(attempts_made, started, false);
         Err(last.unwrap_or_else(|| anyhow!("JSON response failed")))
     }
 }
@@ -1111,6 +1178,72 @@ mod tests {
         let llm = Llm::fixture(vec!["a".to_string(), "b".to_string()], 0, usage);
         assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "a");
         assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "b");
+    }
+
+    // --- #172: per-call telemetry ---
+
+    #[test]
+    fn calls_is_empty_when_no_log_is_attached() {
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec!["a".to_string()], 0, usage);
+        let _ = llm.text_ctx(None, "task", None);
+        assert!(llm.calls().is_empty());
+    }
+
+    #[test]
+    fn text_ctx_records_one_call_with_attempts_1_on_first_try_success() {
+        let usage = Llm::new_usage_tracker();
+        let log = Llm::new_calls_log();
+        let llm = Llm::fixture(vec!["a".to_string()], 0, usage).with_calls_log(Some(log));
+        llm.text_ctx(None, "task", None).unwrap();
+        let calls = llm.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].attempts, 1);
+        assert!(calls[0].success);
+    }
+
+    #[test]
+    fn text_ctx_records_attempts_greater_than_1_after_a_retryable_failure_then_success() {
+        let usage = Llm::new_usage_tracker();
+        let log = Llm::new_calls_log();
+        // Empty text first (triggers "empty response" retry per text_ctx's own logic), then a
+        // real response — with retries=1, exactly 2 attempts should be recorded.
+        let llm =
+            Llm::fixture(vec!["".to_string(), "a".to_string()], 1, usage).with_calls_log(Some(log));
+        llm.text_ctx(None, "task", None).unwrap();
+        let calls = llm.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].attempts, 2);
+        assert!(calls[0].success);
+    }
+
+    #[test]
+    fn text_ctx_records_a_failed_call_with_success_false() {
+        let usage = Llm::new_usage_tracker();
+        let log = Llm::new_calls_log();
+        let llm = Llm::fixture(vec![], 0, usage).with_calls_log(Some(log));
+        let _ = llm.text_ctx(None, "task", None);
+        let calls = llm.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].attempts, 1);
+        assert!(!calls[0].success);
+    }
+
+    #[test]
+    fn calls_log_is_shared_across_clones_via_with_calls_log() {
+        // backend_factory shares one log between the main and cheap Llm the same way it already
+        // shares `usage` — proving here that two Llm values built from the same shared log
+        // (as if they were main_llm/cheap_llm) both contribute to and can both read the same
+        // combined call history.
+        let log = Llm::new_calls_log();
+        let main = Llm::fixture(vec!["a".to_string()], 0, Llm::new_usage_tracker())
+            .with_calls_log(Some(log.clone()));
+        let cheap = Llm::fixture(vec!["b".to_string()], 0, Llm::new_usage_tracker())
+            .with_calls_log(Some(log));
+        main.text_ctx(None, "task", None).unwrap();
+        cheap.text_ctx(None, "task", None).unwrap();
+        assert_eq!(main.calls().len(), 2);
+        assert_eq!(cheap.calls().len(), 2);
     }
 
     #[test]

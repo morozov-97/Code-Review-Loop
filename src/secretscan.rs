@@ -10,6 +10,7 @@
 //! secret still has that secret's line sitting in the diff text sent to the LLM, so scanning
 //! only `+` lines missed it.
 
+#[derive(Debug)]
 pub(crate) struct SecretHit {
     pub(crate) file: String,
     pub(crate) pattern: &'static str,
@@ -195,6 +196,21 @@ const SECRET_KEY_MARKERS: [&str; 8] = [
     "TOKEN",
 ];
 
+/// #181: key names that are TOKEN-flavored but name a plain count/size, not a credential — a
+/// bare `"TOKEN"` marker with only word-boundary checking still matches these exactly (e.g.
+/// `MAX_TOKENS` has real boundaries — `_` before, end-of-string after), so they need an explicit
+/// carve-out. Checked as an exact match on the narrowed `key` (see below), not a substring, so
+/// this stays a narrow exception rather than a way to defeat the scanner — `TOKEN_SECRET` still
+/// trips the generic marker check since it isn't in this list.
+const BENIGN_TOKEN_KEY_NAMES: [&str; 6] = [
+    "MAX_TOKENS",
+    "NUM_TOKENS",
+    "TOKEN_COUNT",
+    "TOKEN_LIMIT",
+    "TOKENIZER",
+    "TOKENS",
+];
+
 const PLACEHOLDER_VALUES: [&str; 8] = [
     "xxx",
     "changeme",
@@ -206,6 +222,27 @@ const PLACEHOLDER_VALUES: [&str; 8] = [
     "placeholder",
 ];
 
+/// #181: true if `needle` appears in `haystack` as a whole "word" — not immediately preceded or
+/// followed by another alphanumeric character. Without this, a marker like `"TOKEN"` matched
+/// mid-word inside an unrelated identifier via plain substring search — `"TOKENIZER"` contains
+/// `"TOKEN"` followed directly by `"IZER"` (not a real boundary), so it isn't actually
+/// token/credential-flavored just because the letters happen to line up.
+fn contains_marker_word(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = haystack.get(start..).and_then(|h| h.find(needle)) {
+        let idx = start + rel;
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let after = idx + needle.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
 /// Catches `.env`-style `KEY=value` (or `KEY: "value"` in YAML/JSON-ish config) lines where the
 /// key name looks secret-flavored and the value isn't an obvious placeholder or an
 /// interpolation reference like `${VAR}`/`$VAR`.
@@ -214,9 +251,23 @@ fn find_env_style_secret(line: &str) -> Option<&str> {
     let sep_idx = trimmed
         .find(['=', ':'])
         .filter(|&i| i > 0 && i < trimmed.len() - 1)?;
-    let key = trimmed[..sep_idx].trim();
+    let raw_key = trimmed[..sep_idx].trim();
+    // #181: only the identifier immediately before the separator is "the key" — a line like
+    // `model, max_tokens: value` (a destructured/positional parameter list, not a single
+    // assignment) previously treated the whole `"model, max_tokens"` prefix as one key, which
+    // is neither a real identifier nor what a human would call "the key name" here.
+    let key = raw_key
+        .rsplit([',', ' ', '\t'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(raw_key);
     let key_upper = key.to_ascii_uppercase();
-    if !SECRET_KEY_MARKERS.iter().any(|m| key_upper.contains(m)) {
+    if BENIGN_TOKEN_KEY_NAMES.contains(&key_upper.as_str()) {
+        return None;
+    }
+    if !SECRET_KEY_MARKERS
+        .iter()
+        .any(|m| contains_marker_word(&key_upper, m))
+    {
         return None;
     }
     let value = trimmed[sep_idx + 1..]
@@ -285,6 +336,57 @@ mod tests {
             .collect();
         assert_eq!(env_hits.len(), 1);
         assert!(env_hits[0].redacted.starts_with("hunt"));
+    }
+
+    // --- #181: bare "TOKEN" marker false-positiving on non-secret identifiers ---
+
+    #[test]
+    fn scan_does_not_flag_an_ordinary_max_tokens_api_parameter() {
+        let diff = "+++ b/index.ts\n@@ -1 +1 @@\n\
+                     +        model, max_tokens: maxTokens, temperature, stream: false,\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "max_tokens is an ordinary LLM API parameter, not a credential: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_other_benign_token_count_identifiers() {
+        for line in [
+            "+num_tokens: 4096,\n",
+            "+token_count = 128\n",
+            "+token_limit: 8192,\n",
+            "+tokenizer = get_tokenizer(model)\n",
+        ] {
+            let diff = format!("+++ b/config.py\n@@ -1 +1 @@\n{line}");
+            let hits = scan(&diff);
+            assert!(hits.is_empty(), "false positive on {line:?}: {hits:?}");
+        }
+    }
+
+    #[test]
+    fn scan_still_flags_a_real_token_credential() {
+        let diff = "+++ b/.env\n@@ -1 +1 @@\n+AUTH_TOKEN=abcdef0123456789longenough\n";
+        let hits = scan(diff);
+        assert_eq!(
+            hits.len(),
+            1,
+            "a real *_TOKEN credential must still be caught: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn contains_marker_word_rejects_a_mid_word_match() {
+        assert!(!contains_marker_word("TOKENIZER", "TOKEN"));
+        assert!(!contains_marker_word("MAX_TOKENS", "TOKEN"));
+    }
+
+    #[test]
+    fn contains_marker_word_accepts_a_real_word_boundary_match() {
+        assert!(contains_marker_word("AUTH_TOKEN", "TOKEN"));
+        assert!(contains_marker_word("TOKEN", "TOKEN"));
+        assert!(contains_marker_word("API_TOKEN_EXPIRY", "TOKEN"));
     }
 
     #[test]
