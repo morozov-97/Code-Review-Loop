@@ -1,4 +1,5 @@
-use crate::cargo_audit;
+use crate::cargo_audit::CargoAuditTool;
+use crate::deterministic::{self, DeterministicTool};
 use crate::discourse;
 use crate::evidence;
 use crate::fixcheck;
@@ -12,7 +13,7 @@ use crate::policy;
 use crate::quantify;
 use crate::report;
 use crate::requirements;
-use crate::semgrep;
+use crate::semgrep::SemgrepTool;
 use crate::spec::Spec;
 use crate::state;
 use anyhow::Result;
@@ -168,26 +169,39 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             inp.diff.len()
         );
     }
-    // #169: semgrep used to run synchronously right here, blocking lens selection on a
-    // subprocess whose result nothing in the LLM context even reads (shared_context never
-    // includes deterministic_results — only quantify::deterministic_gate does, at the very end
-    // of this function). Spawned in the background instead; joined just before that gate needs
-    // it, so it overlaps with everything from lens review through human-voice.
-    let semgrep_started = std::time::Instant::now();
-    let semgrep_handle = inp.deterministic_results.is_none().then(|| {
-        let changed_files = inp.changed_files.clone();
-        let timeout = deterministic_tool_timeout(semgrep::DEFAULT_TIMEOUT, deadline_instant);
-        std::thread::spawn(move || semgrep::try_run(&changed_files, timeout))
-    });
-    // #164: a second deterministic source, run concurrently with semgrep for the same reason
-    // (nothing in the LLM context reads it before the deterministic gate at the very end) —
-    // gated on the same is_none() check, since an externally-supplied --deterministic-results
-    // means neither auto-detected tool should run or override what the caller passed in.
-    let cargo_audit_started = std::time::Instant::now();
-    let cargo_audit_handle = inp.deterministic_results.is_none().then(|| {
-        let timeout = deterministic_tool_timeout(cargo_audit::DEFAULT_TIMEOUT, deadline_instant);
-        std::thread::spawn(move || cargo_audit::try_run(timeout))
-    });
+    // #169/#164/#200: every registered deterministic tool used to run synchronously (semgrep),
+    // blocking lens selection on a subprocess whose result nothing in the LLM context even reads
+    // (shared_context never includes deterministic_results — only quantify::deterministic_gate
+    // does, at the very end of this function) — spawned in the background instead, joined just
+    // before that gate needs them, so they overlap with everything from lens review through
+    // human-voice. A second tool (cargo-audit, #164) was hand-added as a near-duplicate block;
+    // #200 replaced both with this list of trait objects so a third tool doesn't need its own
+    // copy of the same spawn/gate/join dance. Gated on deterministic_results already being None:
+    // an externally-supplied --deterministic-results means no auto-detected tool should run or
+    // override what the caller passed in.
+    let deterministic_tools: Vec<Box<dyn DeterministicTool>> =
+        vec![Box::new(SemgrepTool), Box::new(CargoAuditTool)];
+    let deterministic_handles: Vec<(
+        &'static str,
+        std::time::Instant,
+        std::thread::JoinHandle<Option<serde_json::Value>>,
+    )> = if inp.deterministic_results.is_none() {
+        deterministic_tools
+            .into_iter()
+            .map(|tool| {
+                let id = tool.id();
+                let started = std::time::Instant::now();
+                let changed_files = inp.changed_files.clone();
+                let timeout = deterministic_tool_timeout(tool.default_timeout(), deadline_instant);
+                let handle = std::thread::spawn(move || {
+                    deterministic::try_run(tool.as_ref(), &changed_files, timeout)
+                });
+                (id, started, handle)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let out_dir = prepare_out(args.out)?;
 
     let prior_state = match args.prior {
@@ -538,44 +552,28 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         });
     let requirements_and_human_voice_ms = req_hv_started.elapsed().as_millis();
 
-    // #169: this is the earliest point that actually needs deterministic_results (quantify's
-    // deterministic gate, right below) — join the background semgrep run here instead of
-    // blocking on it before lens selection even started.
-    let semgrep_ms = semgrep_handle.map(|handle| {
+    // #169/#200: this is the earliest point that actually needs deterministic_results
+    // (quantify's deterministic gate, right below) — join every background tool here instead of
+    // blocking on any of them before lens selection even started. Joined back to back; none of
+    // them block lens selection/review, so this adds wall-clock only up to whichever tool ran
+    // longest, not the sum of all of them.
+    let mut deterministic_tool_timings: Vec<(String, u128)> = Vec::new();
+    for (id, started, handle) in deterministic_handles {
         match handle.join() {
             Ok(Some(v)) => {
                 println!(
-                    "semgrep auto-detected — reflecting local run results in deterministic checks"
+                    "{id} auto-detected — reflecting local run results in deterministic checks"
                 );
                 merge_deterministic_results(&mut inp.deterministic_results, v);
             }
             Ok(None) => {}
             Err(_) => {
-                eprintln!("Warning: semgrep background thread panicked");
-                stage_errors.push("semgrep: background thread panicked".to_string());
+                eprintln!("Warning: {id} background thread panicked");
+                stage_errors.push(format!("{id}: background thread panicked"));
             }
         }
-        semgrep_started.elapsed().as_millis()
-    });
-    // #164: joined right alongside semgrep — both were spawned at the same point and neither
-    // blocks lens selection/review, so joining them back to back here doesn't add wall-clock
-    // beyond whichever of the two ran longer.
-    let cargo_audit_ms = cargo_audit_handle.map(|handle| {
-        match handle.join() {
-            Ok(Some(v)) => {
-                println!(
-                    "cargo audit auto-detected — reflecting local run results in deterministic checks"
-                );
-                merge_deterministic_results(&mut inp.deterministic_results, v);
-            }
-            Ok(None) => {}
-            Err(_) => {
-                eprintln!("Warning: cargo audit background thread panicked");
-                stage_errors.push("cargo_audit: background thread panicked".to_string());
-            }
-        }
-        cargo_audit_started.elapsed().as_millis()
-    });
+        deterministic_tool_timings.push((id.to_string(), started.elapsed().as_millis()));
+    }
 
     // Step 10: quantitative summary + verdict
     let mut quant = quantify::summarize(
@@ -640,8 +638,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         dropped_files,
         llm.usage(),
         manifest::StageTimings {
-            semgrep_ms,
-            cargo_audit_ms,
+            deterministic_tool_timings,
             lens_selection_and_review_ms,
             discourse_ms,
             fixcheck_ms,

@@ -26,15 +26,15 @@ use std::path::{Path, PathBuf};
 /// Wall-clock milliseconds per stage of `run_review`. Fields stay 0 when a stage didn't run at
 /// all (e.g. `discourse_ms` on a clean diff with no findings, `fixcheck_ms` without --prior) —
 /// that's a legitimate measurement (the stage really did take ~0ms because it was skipped), not
-/// a missing value, so plain `u128` rather than `Option<u128>` throughout except `semgrep_ms`
-/// (which is meaningfully absent, not zero, when deterministic_results was already provided and
-/// the background semgrep thread never spawned at all).
+/// a missing value, so plain `u128` rather than `Option<u128>` throughout.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct StageTimings {
-    pub(crate) semgrep_ms: Option<u128>,
-    /// #164: absent for the same reason semgrep_ms is — never spawned when deterministic_results
-    /// was already supplied externally.
-    pub(crate) cargo_audit_ms: Option<u128>,
+    /// #200: one `(tool id, elapsed ms)` entry per registered `DeterministicTool` that actually
+    /// spawned — empty (not a per-tool `Option`) when `deterministic_results` was already
+    /// supplied externally and no auto-detected tool ran at all. Was two separate `Option<u128>`
+    /// fields (`semgrep_ms`, `cargo_audit_ms`) before the deterministic-tool plugin interface
+    /// made the tool list open-ended.
+    pub(crate) deterministic_tool_timings: Vec<(String, u128)>,
     /// Combined: lens selection (when --lenses isn't given) and mandatory-lens review run
     /// concurrently (#168), followed by optional-lens review once selection returns.
     pub(crate) lens_selection_and_review_ms: u128,

@@ -1,9 +1,9 @@
-use crate::procutil::{spawn_and_wait, which};
+use crate::deterministic::DeterministicTool;
 use std::time::Duration;
 
-/// Higher than semgrep::DEFAULT_TIMEOUT (120s) — `cargo audit`'s first run on a machine clones
-/// the advisory-db git repo, which semgrep's static analysis has no equivalent of.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Higher than `SemgrepTool`'s 120s — `cargo audit`'s first run on a machine clones the
+/// advisory-db git repo, which semgrep's static analysis has no equivalent of.
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// #164: a second deterministic source alongside semgrep, for this project's own ecosystem
 /// (Rust/Cargo) — the point isn't that this specific tool matters most, it's proving the
@@ -13,14 +13,42 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 /// (previously always `NOT_RUN` unless supplied externally via `--deterministic-results`) — see
 /// README's "Deterministic results JSON shape" section for the full contract every entry here
 /// (and semgrep's) follows.
-pub fn try_run(timeout: Duration) -> Option<serde_json::Value> {
-    let bin = which("cargo")?;
-    let output = spawn_and_wait(&bin, &["audit", "--json"], timeout)?;
-    // #144-style leniency: cargo-audit not being installed as a subcommand, or a network
-    // failure fetching the advisory database, both land here as "stdout wasn't valid JSON" —
-    // falls back to NOT_RUN like every other failure mode in this module, never a guessed result.
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    build_deterministic_result(&v)
+///
+/// #200: implements `DeterministicTool` — see `semgrep::SemgrepTool`'s doc comment for why this
+/// shape exists.
+pub(crate) struct CargoAuditTool;
+
+impl DeterministicTool for CargoAuditTool {
+    fn id(&self) -> &'static str {
+        "cargo_audit"
+    }
+
+    fn binary(&self) -> &'static str {
+        "cargo"
+    }
+
+    fn default_timeout(&self) -> Duration {
+        DEFAULT_TIMEOUT
+    }
+
+    /// Unlike semgrep, `cargo audit` scans the whole dependency tree regardless of which files
+    /// changed — always runs when auto-detected, never bails for lack of changed files.
+    fn requires_changed_files(&self) -> bool {
+        false
+    }
+
+    fn args(&self, _existing_files: &[&str]) -> Vec<String> {
+        vec!["audit".to_string(), "--json".to_string()]
+    }
+
+    fn parse(&self, output: &std::process::Output) -> Option<serde_json::Value> {
+        // #144-style leniency: cargo-audit not being installed as a subcommand, or a network
+        // failure fetching the advisory database, both land here as "stdout wasn't valid JSON" —
+        // falls back to NOT_RUN like every other failure mode in this module, never a guessed
+        // result.
+        let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        build_deterministic_result(&v)
+    }
 }
 
 /// Split out for the same reason `semgrep::build_deterministic_results` is: unit-testable

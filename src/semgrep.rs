@@ -1,9 +1,9 @@
-use crate::procutil::{spawn_and_wait, which};
+use crate::deterministic::DeterministicTool;
 use std::time::Duration;
 
-/// #169: a generous default for callers (like the CLI's automatic semgrep detection) that don't
-/// have a more specific deadline of their own to bound this by.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+/// #169: a generous default for `SemgrepTool::default_timeout`, used when the caller has no more
+/// specific `--deadline-minutes` budget to bound this by.
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// If semgrep is on PATH, run it against the changed files and convert the output into
 /// deterministic_results form. Returns None if it's missing or execution/parsing fails — the
@@ -31,27 +31,39 @@ fn build_args<'a>(existing: &[&'a str]) -> Vec<&'a str> {
     args
 }
 
-/// #169: this used to be a synchronous `.output()` call with no timeout at all — a hang (e.g. a
-/// slow first-run rule pull under `--config=auto`) blocked the whole review indefinitely,
-/// regardless of `--deadline-minutes`, even though nothing in the LLM context actually depends
-/// on this result (only `quantify::deterministic_gate`, at the very end of the pipeline, reads
-/// it) — the caller is expected to run this in the background and only join it there. On
-/// timeout, same as every other failure path here: falls back to NOT_RUN rather than fabricating
-/// a guessed result.
-pub fn try_run(changed_files: &[String], timeout: Duration) -> Option<serde_json::Value> {
-    let bin = which("semgrep")?;
-    let existing: Vec<&str> = changed_files
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|f| std::path::Path::new(f).exists())
-        .collect();
-    if existing.is_empty() {
-        return None;
+/// #200: implements `DeterministicTool` — the actual PATH lookup/spawn/timeout mechanics live in
+/// `deterministic::try_run`/`procutil.rs` now, shared with every other tool. This struct is just
+/// "what command to build and how to parse it," per the trait's own doc comment.
+pub(crate) struct SemgrepTool;
+
+impl DeterministicTool for SemgrepTool {
+    fn id(&self) -> &'static str {
+        "semgrep"
     }
 
-    let output = spawn_and_wait(&bin, &build_args(&existing), timeout)?;
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    build_deterministic_results(output.status.success(), output.status.code(), &v)
+    fn binary(&self) -> &'static str {
+        "semgrep"
+    }
+
+    fn default_timeout(&self) -> Duration {
+        DEFAULT_TIMEOUT
+    }
+
+    fn requires_changed_files(&self) -> bool {
+        true
+    }
+
+    fn args(&self, existing_files: &[&str]) -> Vec<String> {
+        build_args(existing_files)
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    fn parse(&self, output: &std::process::Output) -> Option<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        build_deterministic_results(output.status.success(), output.status.code(), &v)
+    }
 }
 
 /// #144: split out of `try_run` so the exit-status/errors-array handling can be unit tested

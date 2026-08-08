@@ -3,6 +3,7 @@ mod cargo_audit;
 mod cli;
 mod core;
 mod describe;
+mod deterministic;
 mod discourse;
 mod evidence;
 mod fixcheck;
