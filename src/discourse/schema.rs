@@ -65,7 +65,7 @@ pub fn normalize_move_kind(raw: &str) -> String {
 
 /// Found in production (#94): `confidence_weight` only matches exact lowercase "high"/"low",
 /// so a case variant like "Low" silently fell through to the 0.6 default — which happens to
-/// sit exactly on VOTE_THRESHOLD, so a single miscased low-confidence vote could wrongly
+/// sit exactly on the vote threshold, so a single miscased low-confidence vote could wrongly
 /// confirm a finding on its own. Lowercasing here is enough: genuinely unrecognized values
 /// still hit confidence_weight's own "unspecified" fallback exactly as before.
 pub fn normalize_confidence(raw: &str) -> String {

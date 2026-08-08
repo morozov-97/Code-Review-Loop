@@ -13,7 +13,9 @@ pub(super) fn confidence_weight(c: &str) -> f64 {
     }
 }
 
-pub(super) const VOTE_THRESHOLD: f64 = 0.6;
+// #4: the confirmation/rejection threshold this net gets compared against used to live here as
+// a hardcoded VOTE_THRESHOLD const — it's now spec-configurable (`Spec::discourse.vote_threshold`,
+// see spec.rs), read directly in `mod.rs::run()` rather than through this module.
 
 /// Tallies only the AGREE/CHALLENGE(existence) votes that directly target one finding
 /// (excludes merge_vote_weight itself — this lets merge_vote_weight, when it calls this

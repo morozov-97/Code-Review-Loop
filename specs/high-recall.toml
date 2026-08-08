@@ -1,0 +1,168 @@
+# #4 (LLM-accuracy operating points): derived from specs/default.toml — same lenses/labels/
+# policies, only [discourse].vote_threshold differs. Real numbers behind these choices are in
+# evals/README.md's 41-case benchmark: at the default threshold (0.6), the full pipeline measured
+# precision 0.633 / recall 0.792 against a real SZZ-derived ground truth set. No preset here has
+# been independently re-measured against that same benchmark yet — these are principled starting
+# points (threshold math, not a re-run), not verified operating points. If you use one for real,
+# treat it the same way: measure it against your own repo before trusting it.
+#
+# NOTE ON MAINTENANCE: this file is a full copy of default.toml, not an "extends" — Spec::load has
+# no include mechanism. If default.toml's lenses/labels/policies change, this file needs the same
+# change applied by hand or it silently drifts out of sync.
+
+name = "Multi-Angle Code Review (High-Recall Preset)"
+context = """
+High-recall preset: biased toward catching more real defects, at the cost of more false positives. Lowers the confirmation bar so a single lower-confidence AGREE is enough for discourse to confirm a finding — use when missing a real bug is more costly than an extra false positive (e.g. security-sensitive code, pre-release hardening).
+A general-purpose code review that uses the 12 axes from Google's eng-practices as lenses.
+Deterministic checks (security/secrets/dependencies/dataflow/API deprecation) are not judged by this spec;
+results from external tools such as Semgrep/CodeQL are passed through as-is via --deterministic-results.
+Each lens has a distinctly defined persona (in the open-code-review style) — this is intended to suppress sycophancy.
+"""
+
+diff_size_limit = 400
+# #157: strict by design, not a lenient "arbitrary repo" default — any source-file change fails
+# these two unless *some* test/doc path also appears anywhere in the same diff (presence-only,
+# not mapped per changed file). Even this project's own "clean diff" eval fixture failed it on
+# first attempt and needed a padded test+changelog change added just to pass (see
+# evals/README.md). Treat this spec as a strict example configuration to adapt, not a sensible
+# default for every repo — loosen test_path_patterns/doc_path_patterns/ignored_path_patterns
+# (or drop them to NOT_CONFIGURED) if that strictness isn't what you want.
+test_path_patterns = ["test/", "tests/", "__tests__/", "_test.", ".test.", ".spec.", "spec/"]
+doc_path_patterns = ["README", "CHANGELOG", "docs/"]
+# #126: files that are neither behavior nor test/docs — don't penalize a PR for not adding a
+# test/doc change alongside these.
+ignored_path_patterns = [".github/workflows/", "Cargo.lock", "package-lock.json", "yarn.lock", "go.sum", "vendor/", "node_modules/", "dist/", "evals/diffs/"]
+
+labels = ["security", "possible bug", "possible issue", "performance", "enhancement", "best practice", "maintainability", "typo"]
+
+[[lenses]]
+# #174: this lens also collects good_things (see lens::GOOD_THINGS_HOST_LENS) — it used to be a
+# separate always-on "good_things" lens with its own dedicated full-context LLM call, which cost
+# a whole extra round trip for information that doesn't affect score/verdict.
+id = "functionality"
+title = "Functionality"
+guide = "Does the code work as the author intended, and in a way that's actually good for the user? Look at edge cases, concurrency, and user-facing errors."
+always = true
+tier = "generalist"
+persona_name = "Generalist Reviewer"
+persona_voice = "Balances overall completeness with meeting requirements. Does not favor any particular school of thought."
+
+[[lenses]]
+id = "design"
+title = "Design"
+guide = "Do the API, data model, module boundaries, and dependencies integrate well with the codebase?"
+signal = "Changes to API, data model, module boundaries, or dependencies"
+tier = "famous_engineer"
+persona_name = "Martin Fowler"
+persona_voice = "A refactoring and evolutionary-design perspective — looks at whether this change makes future changes easier or harder."
+
+[[lenses]]
+id = "complexity"
+title = "Complexity"
+guide = "Is the CL more complex than it needs to be? Is each line and each function easy to understand? Watches out for speculative generalization and over-engineering for the future."
+signal = "New abstractions, generics, increased branching, speculative generalization"
+tier = "famous_engineer"
+persona_name = "John Ousterhout"
+persona_voice = "A Philosophy of Software Design perspective — complexity is the sum of dependencies and obscurity. Wary of shallow modules, prefers deep modules."
+
+[[lenses]]
+id = "tests"
+title = "Tests"
+guide = "Is the change accompanied by appropriate, well-designed tests? Would the tests actually catch a bug if it failed?"
+signal = "Changes to behavior, error handling, or boundary values; bug fixes"
+tier = "famous_engineer"
+persona_name = "Kent Beck"
+persona_voice = "The perspective of the founder of TDD — looks at whether a failing test actually tells you something, and whether the test itself gives design feedback."
+
+[[lenses]]
+id = "naming"
+title = "Naming"
+guide = "Are names sufficiently descriptive? Is there any risk of confusion with names used elsewhere?"
+signal = "Public symbols, domain terminology, large-scale renames"
+tier = "famous_engineer"
+persona_name = "Sandi Metz"
+persona_voice = "A 99 Bottles of OOP perspective — looks at whether names precisely reveal the boundaries of a concept, and whether a reader could mistake it for something else."
+
+[[lenses]]
+id = "comments"
+title = "Comments"
+guide = "Do comments explain the 'why' rather than restating the code? Are there any unnecessary or stale comments?"
+signal = "Non-obvious constraints, code where the 'why' behind a decision matters"
+tier = "specialist"
+persona_name = "Comments Specialist"
+persona_voice = "Strictly distinguishes between comments that just repeat 'what' the code does and comments that explain 'why' it was done that way."
+
+[[lenses]]
+id = "style"
+title = "Style"
+guide = "Does the code follow the team's or language's style guide?"
+signal = "Possible violations of explicit style rules"
+tier = "famous_engineer"
+persona_name = "Kent C. Dodds"
+persona_voice = "A pragmatic coding-standards perspective — looks at whether a style reduces the reader's cognitive load, not whether it follows rules for their own sake."
+
+[[lenses]]
+id = "consistency"
+title = "Consistency"
+guide = "Is the change consistent with surrounding code's patterns, error handling, and API conventions? If there's an inconsistency, checks whether it's intentional."
+signal = "Requires comparison with surrounding code's patterns, error handling, and API conventions"
+tier = "famous_engineer"
+persona_name = "Vladimir Khorikov"
+persona_voice = "A Unit Testing Principles, Practices, and Patterns perspective — looks at whether this change is consistent with existing architectural boundaries and error-handling conventions."
+
+[[lenses]]
+id = "documentation"
+title = "Documentation"
+guide = "Are related docs (README, reference docs, generated docs) updated alongside the change?"
+signal = "Changes to user-facing behavior, configuration, public APIs, or operational procedures"
+tier = "specialist"
+persona_name = "Documentation Specialist"
+persona_voice = "Looks for anything that could mislead someone who reads only the docs without reading the code."
+
+[[lenses]]
+id = "every_line"
+title = "Every Line"
+guide = "Unless the file is generated or transformed, is every line worth reviewing? Is this a small but high-risk diff?"
+signal = "Small but high-risk diffs, or changes that require a full line-by-line review"
+tier = "specialist"
+persona_name = "Line-by-line Specialist"
+persona_voice = "Unless it's a generated or transformed file, does not let any line pass without scrutiny."
+
+[[lenses]]
+id = "context"
+title = "Context"
+guide = "Is this CL an improvement in isolation but a step in the wrong direction for the system as a whole? Does correctness hinge on interaction with callers or requirements?"
+signal = "Changes where correctness depends on requirements, callers, or system-level interactions"
+tier = "famous_engineer"
+persona_name = "Rich Hickey"
+persona_voice = "A Simple Made Easy perspective — looks at whether a locally beneficial change increases complecting across the system as a whole."
+
+[[deterministic_checks]]
+id = "sast"
+title = "SAST/security patterns"
+tool = "Semgrep/CodeQL"
+
+[[deterministic_checks]]
+id = "secrets"
+title = "Secrets"
+tool = "Semgrep or a dedicated scanner"
+
+[[deterministic_checks]]
+id = "dependency_sca"
+title = "Dependency/SCA"
+tool = "Semgrep or a separate SCA tool"
+
+[[deterministic_checks]]
+id = "dataflow_taint"
+title = "Dataflow/taint"
+tool = "CodeQL/Semgrep"
+
+[[deterministic_checks]]
+id = "api_deprecation"
+title = "API deprecation"
+tool = "Static analysis/compiler"
+
+[discourse]
+# Default is 0.6 — lower means a single lower-confidence AGREE (weight 0.3) is enough to
+# confirm on its own, where the default would need at least a medium-confidence one.
+vote_threshold = 0.35

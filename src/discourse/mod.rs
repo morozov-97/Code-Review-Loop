@@ -24,7 +24,7 @@ use schema::{
     surface_id, DiscourseRound,
 };
 use std::collections::HashMap;
-use votes::{direct_vote_net, merge_vote_weight, VOTE_THRESHOLD};
+use votes::{direct_vote_net, merge_vote_weight};
 
 pub struct DiscourseAudit {
     pub round: usize,
@@ -77,6 +77,9 @@ pub fn run(
     outer_round: usize,
 ) -> Result<(Vec<DiscourseAudit>, HashMap<String, Resolution>)> {
     let max_rounds = max_rounds.max(1);
+    // #4 (LLM-accuracy operating points): was a hardcoded const — now spec-configurable via
+    // [discourse].vote_threshold, defaulting to the same 0.6.
+    let vote_threshold = spec.discourse.vote_threshold;
     let mut resolved: HashMap<String, Resolution> = HashMap::new();
     let mut audit: Vec<DiscourseAudit> = Vec::new();
     // Discourse used to see only findings_catalog (the claim/evidence text left by reviewers)
@@ -170,7 +173,7 @@ pub fn run(
             // confidence-weighted vote (direct_vote_net + merge_vote_weight) only ever ran as an
             // end-of-rounds fallback for findings still UNCERTAIN after every round, which a
             // directly-CONFIRMED finding never reaches. Requiring the vote net to actually clear
-            // VOTE_THRESHOLD — and the citation to have passed evidence::verify — makes local
+            // the vote threshold — and the citation to have passed evidence::verify — makes local
             // math a real check on the LLM's own resolution, not just a fallback for when it
             // declines to state one.
             if r.status == "CONFIRMED" {
@@ -186,9 +189,9 @@ pub fn run(
                         )
                     })
                     .unwrap_or((true, false));
-                if net < VOTE_THRESHOLD || unverified || whole_file_claim {
+                if net < vote_threshold || unverified || whole_file_claim {
                     r.reason = format!(
-                        "{} [Verification failed: local vote net={net:.2} (need >= {VOTE_THRESHOLD}) or evidence_unverified={unverified} or claim needs whole-file context no lens has={whole_file_claim} — reverted to UNCERTAIN instead of trusting the stated CONFIRMED]",
+                        "{} [Verification failed: local vote net={net:.2} (need >= {vote_threshold}) or evidence_unverified={unverified} or claim needs whole-file context no lens has={whole_file_claim} — reverted to UNCERTAIN instead of trusting the stated CONFIRMED]",
                         r.reason
                     );
                     r.status = "UNCERTAIN".to_string();
@@ -238,7 +241,7 @@ pub fn run(
         // claims_undefined_or_compile_error's doc comment) — the vote net clearing threshold
         // here just means no lens challenged it, not that it's actually true.
         let whole_file_claim = claims_undefined_or_compile_error(&f.claim);
-        let (status, reason) = if net >= VOTE_THRESHOLD
+        let (status, reason) = if net >= vote_threshold
             && (f.evidence_unverified || whole_file_claim)
         {
             let why = match (f.evidence_unverified, whole_file_claim) {
@@ -255,12 +258,12 @@ pub fn run(
                     "discourse rounds exhausted, vote net={net:.2} clears the threshold but {why} — not confirmed"
                 ),
             )
-        } else if net >= VOTE_THRESHOLD {
+        } else if net >= vote_threshold {
             (
                 "CONFIRMED".to_string(),
                 format!("discourse rounds exhausted, confirmed by confidence-weighted vote (net={net:.2})"),
             )
-        } else if net <= -VOTE_THRESHOLD {
+        } else if net <= -vote_threshold {
             (
                 "REJECTED".to_string(),
                 format!("discourse rounds exhausted, rejected by confidence-weighted vote (net={net:.2})"),
@@ -379,6 +382,52 @@ mod tests {
         assert_eq!(
             resolved["security-r1-1"].status, "CONFIRMED",
             "the MERGE target (survivor) must be confirmed even without direct votes"
+        );
+    }
+
+    #[test]
+    fn run_honors_a_spec_configured_vote_threshold_stricter_than_the_default() {
+        // #4 (LLM-accuracy operating points): a single medium-confidence AGREE (weight 0.6)
+        // exactly clears the default 0.6 threshold -> CONFIRMED. A spec raising the threshold
+        // to 0.8 must leave the same vote net at UNCERTAIN instead — proving vote_threshold is
+        // actually read from the spec, not still the old hardcoded constant.
+        let mut findings = vec![test_finding("possible bug", "evidence")];
+        findings[0].id = "design-r1-1".to_string();
+
+        // Needs at least one CHALLENGE in the response or run() retries the round expecting one
+        // (see the loop body below) — a severity-axis CHALLENGE contributes 0 to direct_vote_net
+        // (only an EXISTENCE challenge subtracts), so it doesn't interfere with the net=0.6 this
+        // test is actually about.
+        let response = serde_json::json!({
+            "moves": [
+                {"move": "AGREE", "lens": "other", "target": "design-r1-1", "confidence": "medium", "new_evidence": "e"},
+                {"move": "CHALLENGE", "lens": "other2", "target": "design-r1-1", "confidence": "high", "challenge_axis": "severity", "detail": "severity may be overstated"}
+            ],
+            "resolutions": [],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let mut spec = super::test_support::test_spec();
+        spec.discourse.vote_threshold = 0.8;
+
+        let (_audit, resolved) = run(&llm, &spec, &input, &mut findings, 1, 1).unwrap();
+
+        assert_eq!(
+            resolved["design-r1-1"].status, "UNCERTAIN",
+            "net=0.6 must not confirm against a spec-raised threshold of 0.8"
         );
     }
 
@@ -654,7 +703,7 @@ mod tests {
 
     #[test]
     fn run_confirms_when_both_the_vote_and_evidence_check_out() {
-        // Positive path: a real AGREE clears VOTE_THRESHOLD and evidence_unverified is false —
+        // Positive path: a real AGREE clears the vote threshold and evidence_unverified is false —
         // the CONFIRMED must be allowed to stand.
         let mut findings = vec![test_finding("a claim", "evidence")];
         findings[0].id = "a".to_string();
@@ -957,7 +1006,7 @@ mod tests {
                     "detail": "severity is overstated", "confidence": "high", "challenge_axis": "severity"
                 },
                 // #148: a directly-stated CONFIRMED is now gated on the local vote net actually
-                // clearing VOTE_THRESHOLD — this AGREE is what makes that true here.
+                // clearing the vote threshold — this AGREE is what makes that true here.
                 {
                     "move": "AGREE", "lens": "reviewer", "target": "a",
                     "confidence": "high", "new_evidence": "confirmed independently"

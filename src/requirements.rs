@@ -283,6 +283,7 @@ mod tests {
             doc_path_patterns: Vec::new(),
             ignored_path_patterns: Vec::new(),
             scoring: Default::default(),
+            discourse: Default::default(),
         }
     }
 

@@ -218,6 +218,24 @@ Default personas include:
 Additional personas can be defined via `persona_name`, `persona_voice`, and `tier` in
 `src/spec.rs` config structures and TOML settings.
 
+## Precision/recall operating points
+
+Discourse's confirmation bar (`[discourse].vote_threshold` in a spec, default `0.6`) controls how
+easily a finding gets `CONFIRMED` from its confidence-weighted vote tally — lower catches more
+real defects at the cost of more false positives, higher does the reverse. Three starting points,
+in `specs/`:
+
+- `specs/default.toml` — the balanced default (`vote_threshold = 0.6`).
+- `specs/high-recall.toml` — lower bar (`0.35`); use when missing a real bug costs more than an
+  extra false positive.
+- `specs/low-noise.toml` — higher bar (`1.0`); use for high-volume review queues where noisy
+  findings get ignored wholesale.
+
+The high-recall/low-noise numbers are principled starting points (threshold math against the
+`confidence_weight` scale — see `discourse/votes.rs`), not independently re-measured operating
+points — only the default's precision/recall (0.633/0.792) has been checked against a real
+benchmark (`evals/README.md`). Measure a preset against your own repo before trusting it there.
+
 ## Command architecture and mapping
 
 The implementation is a 12-step pipeline; the most important modules are:

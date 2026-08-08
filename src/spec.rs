@@ -73,6 +73,31 @@ impl ScoringConfig {
     }
 }
 
+/// #4 (LLM-accuracy operating points): how easily discourse confirms/rejects a finding from its
+/// confidence-weighted vote tally. Previously a hardcoded `VOTE_THRESHOLD` const in
+/// `discourse/votes.rs` — a team that wants to bias toward catching more real defects at the
+/// cost of more noise (or the reverse) had no way to express that short of editing this
+/// project's own source. Default (0.6) preserves the original hardcoded value.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscourseConfig {
+    #[serde(default = "DiscourseConfig::default_vote_threshold")]
+    pub vote_threshold: f64,
+}
+
+impl DiscourseConfig {
+    fn default_vote_threshold() -> f64 {
+        0.6
+    }
+}
+
+impl Default for DiscourseConfig {
+    fn default() -> Self {
+        DiscourseConfig {
+            vote_threshold: Self::default_vote_threshold(),
+        }
+    }
+}
+
 impl Default for ScoringConfig {
     fn default() -> Self {
         ScoringConfig {
@@ -114,6 +139,9 @@ pub struct Spec {
     /// Per-severity score-deduction weights. Absent `[scoring]` table = all defaults.
     #[serde(default)]
     pub scoring: ScoringConfig,
+    /// Discourse confirmation/rejection sensitivity. Absent `[discourse]` table = default.
+    #[serde(default)]
+    pub discourse: DiscourseConfig,
 }
 
 impl Spec {
@@ -175,6 +203,16 @@ impl Spec {
                 "scoring.{name} must be between 0 and 100, got {value}"
             );
         }
+
+        // A threshold <= 0 would make a single CHALLENGE (or even no votes at all) enough to
+        // confirm a finding, defeating the point of a confirmation gate entirely; there's no
+        // natural upper bound (a very high threshold is a legitimate "require several
+        // high-confidence agrees" choice), so only the low end is checked.
+        anyhow::ensure!(
+            spec.discourse.vote_threshold > 0.0,
+            "discourse.vote_threshold must be > 0, got {}",
+            spec.discourse.vote_threshold
+        );
 
         Ok(spec)
     }
@@ -383,6 +421,81 @@ title = "Design"
         let spec = Spec::load(&path).expect("spec without ignored_path_patterns should load");
         assert!(spec.ignored_path_patterns.is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_defaults_vote_threshold_to_zero_point_six_when_discourse_table_is_absent() {
+        let path = write_spec(
+            "no-discourse-table.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let spec = Spec::load(&path).unwrap();
+        assert_eq!(spec.discourse.vote_threshold, 0.6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_honors_a_custom_vote_threshold() {
+        let path = write_spec(
+            "custom-threshold.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+[discourse]
+vote_threshold = 1.2
+"#,
+        );
+        let spec = Spec::load(&path).unwrap();
+        assert_eq!(spec.discourse.vote_threshold, 1.2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_a_zero_or_negative_vote_threshold() {
+        let path = write_spec(
+            "zero-threshold.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+[discourse]
+vote_threshold = 0.0
+"#,
+        );
+        let err = Spec::load(&path).expect_err("a zero vote_threshold must be rejected");
+        assert!(err.to_string().contains("vote_threshold"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_accepts_the_shipped_high_recall_and_low_noise_presets() {
+        // #4: regression guard against the preset files drifting out of sync with Spec's schema
+        // (they're full copies of default.toml, not an "extends" — see their own header comment)
+        // or silently ending up back at the default threshold.
+        let high_recall =
+            Spec::load(std::path::Path::new("specs/high-recall.toml")).expect("should load");
+        assert!(
+            high_recall.discourse.vote_threshold < 0.6,
+            "high-recall preset must lower the confirmation bar below the 0.6 default"
+        );
+
+        let low_noise =
+            Spec::load(std::path::Path::new("specs/low-noise.toml")).expect("should load");
+        assert!(
+            low_noise.discourse.vote_threshold > 0.6,
+            "low-noise preset must raise the confirmation bar above the 0.6 default"
+        );
     }
 
     #[test]

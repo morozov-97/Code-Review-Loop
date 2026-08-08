@@ -252,6 +252,7 @@ mod tests {
             doc_path_patterns: doc_patterns.iter().map(|s| s.to_string()).collect(),
             ignored_path_patterns: ignored_patterns.iter().map(|s| s.to_string()).collect(),
             scoring: Default::default(),
+            discourse: Default::default(),
         }
     }
 
