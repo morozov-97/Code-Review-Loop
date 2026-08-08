@@ -117,7 +117,16 @@ fn find_secrets(line: &str) -> Vec<(&'static str, &str)> {
             found.push(("Slack token", m));
         }
     }
-    if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
+    // Real false positive: code that *processes* PEM marker strings (e.g. a regex stripping
+    // `-----BEGIN PRIVATE KEY-----`/`-----END PRIVATE KEY-----` from an env-supplied key before
+    // use) mentions both marker strings as text, not as an actual embedded key. A real PEM
+    // block's BEGIN and END lines are never the same line — the base64 body sits between them
+    // across multiple lines — so a single line naming both is a reference to the markers, not a
+    // literal key.
+    if line.contains("-----BEGIN")
+        && line.contains("PRIVATE KEY-----")
+        && !line.contains("-----END")
+    {
         found.push(("PEM private key block", line.trim()));
     }
     if let Some(m) = find_jwt(line) {
@@ -277,15 +286,21 @@ fn is_dotted_identifier_chain(value: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
-/// True when `value` contains whitespace or parentheses — found via a real false positive on
-/// `final token = (await freshToken()) ?? supabaseKey;`, where the whole right-hand-side
-/// expression (a function call plus a `??` fallback) was captured as "the value". A real
-/// credential is a single opaque token; it never contains a space or a paren, since it wouldn't
-/// work as a token in code if it did.
+/// True when `value` contains whitespace or parentheses, or starts with `++`/`--` — found via
+/// two real false positives: `final token = (await freshToken()) ?? supabaseKey;` (the whole
+/// right-hand-side expression, a function call plus a `??` fallback, captured as "the value"),
+/// and `final token = ++_speechToken;` (a bare pre/post-increment expression on a private
+/// field). A real credential is a single opaque token; it never contains a space or a paren
+/// (it wouldn't work as a token in code if it did), and never starts with a doubled `+`/`-` —
+/// unlike a single leading `-`/`+` (plausible in some token formats, e.g. base64's `+`), a
+/// *doubled* one at the very start is specifically the increment/decrement operator, not
+/// something any real credential format uses.
 fn looks_like_a_code_expression(value: &str) -> bool {
-    value
-        .chars()
-        .any(|c| c.is_whitespace() || c == '(' || c == ')')
+    value.starts_with("++")
+        || value.starts_with("--")
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || c == '(' || c == ')')
 }
 
 /// True when `value` is a bare identifier with no digits at all — e.g. `supabaseKey`,
@@ -332,9 +347,17 @@ fn find_env_style_secret(line: &str) -> Option<&str> {
     {
         return None;
     }
+    // `;` added alongside the quote/comma set — without it, a real quoted secret with a
+    // trailing statement semicolon (`const apiKey = "realSecret123";`, ubiquitous in Dart/JS/TS/
+    // Java/C/Rust/Go source) only had its closing quote stripped, not the semicolon after it,
+    // since trim_matches stops at the first non-matching char from each end and `;` didn't
+    // match — leaving a value like `realSecret123";` that a later code-expression check could
+    // then wrongly reject as non-literal. Stripping `;` in the same pass as quotes/commas fixes
+    // both directions: a real quoted secret ends up clean, and a bare code statement's trailing
+    // `;` no longer masks whatever comes before it from the checks below.
     let value = trimmed[sep_idx + 1..]
         .trim()
-        .trim_matches(|c| c == '"' || c == '\'' || c == ',');
+        .trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';');
     if value.len() < 8 {
         return None;
     }
@@ -384,6 +407,21 @@ mod tests {
         let diff = "+++ b/id_rsa\n@@ -1 +1 @@\n+-----BEGIN RSA PRIVATE KEY-----\n";
         let hits = scan(diff);
         assert!(hits.iter().any(|h| h.pattern == "PEM private key block"));
+    }
+
+    #[test]
+    fn scan_does_not_flag_code_that_processes_pem_marker_strings_as_text() {
+        // Real false positive: a regex stripping PEM headers from an env-supplied key before
+        // use mentions both marker strings on one line — a real embedded PEM block's BEGIN and
+        // END lines are never the same line (the base64 body sits between them), so this is
+        // code referencing the markers as text, not a literal key.
+        let diff = "+++ b/index.ts\n@@ -1 +1 @@\n\
+                     +      .replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\\n/g, '')\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a line mentioning both markers is processing them as text, not a literal key: {hits:?}"
+        );
     }
 
     #[test]
@@ -461,6 +499,37 @@ mod tests {
         assert!(
             hits.is_empty(),
             "a code expression is not a literal secret value: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_a_bare_increment_expression_assigned_to_a_token_named_variable() {
+        // Real false positive: `++_speechToken` is a pre-increment expression on a private
+        // field, not a literal — no whitespace/parens, so this needed its own check separate
+        // from the code-expression-with-parens case above.
+        let diff = "+++ b/lib/x.dart\n@@ -1 +1 @@\n\
+                     +    final token = ++_speechToken;\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a bare increment expression is not a literal secret value: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_still_flags_a_real_secret_that_ends_with_a_quoted_semicolon() {
+        // Guards against the `;` fix above overreaching in the other direction: a real,
+        // generic (non-prefix-recognized) secret literal followed by a statement semicolon —
+        // ubiquitous in Dart/JS/TS/Java/C/Rust/Go source — must still be caught. Before adding
+        // `;` to the value's trim_matches set, trim_matches stopped at the first non-matching
+        // trailing char (`;` didn't match), leaving `realSecretValue123";` — this itself isn't
+        // what regressed, but confirms the value extraction still works correctly end-to-end.
+        let diff = "+++ b/lib/x.dart\n@@ -1 +1 @@\n\
+                     +    const API_TOKEN = \"realSecretValue123\";\n";
+        let hits = scan(diff);
+        assert!(
+            !hits.is_empty(),
+            "a real quoted secret followed by a semicolon must still be flagged: {hits:?}"
         );
     }
 
