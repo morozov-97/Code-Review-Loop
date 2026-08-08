@@ -277,6 +277,33 @@ fn is_dotted_identifier_chain(value: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
+/// True when `value` contains whitespace or parentheses — found via a real false positive on
+/// `final token = (await freshToken()) ?? supabaseKey;`, where the whole right-hand-side
+/// expression (a function call plus a `??` fallback) was captured as "the value". A real
+/// credential is a single opaque token; it never contains a space or a paren, since it wouldn't
+/// work as a token in code if it did.
+fn looks_like_a_code_expression(value: &str) -> bool {
+    value
+        .chars()
+        .any(|c| c.is_whitespace() || c == '(' || c == ')')
+}
+
+/// True when `value` is a bare identifier with no digits at all — e.g. `supabaseKey`,
+/// `freshToken`. Found via a real false positive on `'apikey': supabaseKey,`, where a plain
+/// variable reference (not its value) sat on the right of a `KEY`-flavored key. Deliberately
+/// narrow: only rejects when there isn't a single digit anywhere in the value, since real
+/// credential formats (AWS/GitHub/Slack/JWT) are covered by their own dedicated patterns
+/// elsewhere in this file and virtually always contain digits — an *entirely* alphabetic value
+/// reads far more like an English identifier than a generated secret. Disclosed tradeoff: a
+/// real secret that happens to be purely alphabetic (no digits at all) would be missed by this
+/// specific check — accepted as a real, bounded false-negative risk rather than leaving the
+/// original false positive unfixed (see #185).
+fn is_pure_alphabetic_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+}
+
 /// Catches `.env`-style `KEY=value` (or `KEY: "value"` in YAML/JSON-ish config) lines where the
 /// key name looks secret-flavored and the value isn't an obvious placeholder or an
 /// interpolation reference like `${VAR}`/`$VAR`.
@@ -316,6 +343,12 @@ fn find_env_style_secret(line: &str) -> Option<&str> {
     }
     if is_dotted_identifier_chain(value) {
         return None; // a reference to another value (e.g. `AppConfig.supabaseAnonKey`), not a literal
+    }
+    if looks_like_a_code_expression(value) {
+        return None; // e.g. `(await freshToken()) ?? supabaseKey;` — an expression, not a literal
+    }
+    if is_pure_alphabetic_identifier(value) {
+        return None; // e.g. `supabaseKey` — a bare variable reference, not a literal (see #185)
     }
     let value_lower = value.to_ascii_lowercase();
     if PLACEHOLDER_VALUES.iter().any(|p| value_lower.contains(p)) {
@@ -415,6 +448,45 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "a real credential-shaped literal must still be flagged"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_a_code_expression_captured_after_a_token_named_variable() {
+        // Real false positive (#185): the whole right-hand-side expression — a function call
+        // plus a `??` fallback — was captured as if it were a literal secret.
+        let diff = "+++ b/lib/x.dart\n@@ -1 +1 @@\n\
+                     +    final token = (await freshToken()) ?? supabaseKey;\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a code expression is not a literal secret value: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_a_bare_identifier_with_no_digits_assigned_to_a_key_named_field() {
+        // Real false positive (#185): `supabaseKey` is a plain variable reference, not the
+        // credential value itself.
+        let diff = "+++ b/lib/x.dart\n@@ -1 +1 @@\n\
+                     +          'apikey': supabaseKey,\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a bare identifier with no digits reads as a variable reference, not a secret: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_still_flags_a_bare_value_that_contains_a_digit() {
+        // Guards against `is_pure_alphabetic_identifier` overreaching — the presence of even one
+        // digit should be enough to still treat a bare env-style value as a real credential
+        // candidate, since that's the disclosed boundary the function's own doc comment draws.
+        let diff = "+++ b/.env\n@@ -1 +1 @@\n+API_KEY=abcXYZ123longenough\n";
+        let hits = scan(diff);
+        assert!(
+            !hits.is_empty(),
+            "a bare value containing a digit must still be flagged: {hits:?}"
         );
     }
 
