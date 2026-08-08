@@ -98,11 +98,13 @@ pub(crate) fn build_llm(cli: &Cli) -> Result<(Llm, Llm)> {
         main_llm
             .with_gate(Some(gate.clone()))
             .with_max_output_tokens(Some(cli.max_output_tokens))
+            .with_temperature(cli.temperature)
             .with_max_calls(cli.max_provider_calls)
             .with_calls_log(Some(calls_log.clone())),
         cheap_llm
             .with_gate(Some(gate))
             .with_max_output_tokens(Some(cli.max_output_tokens))
+            .with_temperature(cli.temperature)
             .with_max_calls(cli.max_provider_calls)
             .with_calls_log(Some(calls_log)),
     ))
@@ -229,5 +231,30 @@ mod tests {
         assert!(main_debug.contains("max_output_tokens: Some(1234)"));
         assert!(cheap_debug.contains("max_calls: Some(5)"));
         assert!(cheap_debug.contains("max_output_tokens: Some(1234)"));
+    }
+
+    #[test]
+    fn build_llm_leaves_temperature_unset_by_default() {
+        let cli = parse(&["review", "--spec", "s.toml", "--diff", "d.patch"]);
+        assert_eq!(cli.temperature, None);
+        let (main_llm, cheap_llm) = build_llm(&cli).expect("should build successfully");
+        assert!(format!("{main_llm:?}").contains("temperature: None"));
+        assert!(format!("{cheap_llm:?}").contains("temperature: None"));
+    }
+
+    #[test]
+    fn build_llm_wires_a_configured_temperature_into_both_models() {
+        let cli = parse(&[
+            "--temperature",
+            "0.2",
+            "review",
+            "--spec",
+            "s.toml",
+            "--diff",
+            "d.patch",
+        ]);
+        let (main_llm, cheap_llm) = build_llm(&cli).expect("should build successfully");
+        assert!(format!("{main_llm:?}").contains("temperature: Some(0.2)"));
+        assert!(format!("{cheap_llm:?}").contains("temperature: Some(0.2)"));
     }
 }

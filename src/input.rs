@@ -310,28 +310,79 @@ fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
     (out, dropped)
 }
 
-/// Returns the normalized `Input` plus the list of files `prioritize_and_cap_diff` had to drop
-/// from what's actually sent to the LLM (empty if nothing was dropped) — #129 surfaces this in
-/// `manifest.json` as structured data instead of only the in-diff text note.
+/// Strips whole file-blocks matching `denied_path_patterns` (`spec.security.denied_path_patterns`)
+/// out of the diff before anything else touches it — secrets/credentials files, infra configs,
+/// or any other path a team decides must never leave the machine as diff content sent to an LLM
+/// backend. Applied before `parse_diff_stats`, so a denied file also never appears in
+/// `changed_files`/added/removed line counts, not just in what's sent to the model — the point
+/// is that its content leaves no trace in anything this run produces, not merely that lens
+/// prompts skip it.
+fn strip_denied_paths(diff: &str, denied_path_patterns: &[String]) -> (String, Vec<String>) {
+    if denied_path_patterns.is_empty() {
+        return (diff.to_string(), Vec::new());
+    }
+    let blocks = split_into_file_blocks(diff);
+    let mut kept: Vec<String> = Vec::new();
+    let mut denied: Vec<String> = Vec::new();
+    for (path, text) in blocks {
+        let is_denied = path
+            .as_deref()
+            .is_some_and(|p| denied_path_patterns.iter().any(|pat| crate::policy::matches_one(p, pat)));
+        if is_denied {
+            denied.push(path.unwrap());
+        } else {
+            kept.push(text);
+        }
+    }
+    let mut out = kept.join("\n");
+    if !denied.is_empty() {
+        out.push_str(&format!(
+            "\n\n[NOTE: {} file(s) excluded from this diff by security.denied_path_patterns policy — not sent to the LLM, not reviewed: {}]\n",
+            denied.len(),
+            denied.join(", ")
+        ));
+    }
+    (out, denied)
+}
+
+/// Returns the normalized `Input`, the list of files `prioritize_and_cap_diff` had to drop from
+/// what's actually sent to the LLM (empty if nothing was dropped — #129 surfaces this in
+/// `manifest.json` as structured data instead of only the in-diff text note), and the list of
+/// files excluded up front by `denied_path_patterns`.
 pub fn normalize(
     diff_path: &Path,
     requirements_path: &Option<std::path::PathBuf>,
     conventions_path: &Option<std::path::PathBuf>,
     deterministic_results_path: &Option<std::path::PathBuf>,
     language: Option<String>,
-) -> Result<(Input, Vec<String>)> {
+    denied_path_patterns: &[String],
+) -> Result<(Input, Vec<String>, Vec<String>)> {
     let diff = std::fs::read_to_string(diff_path)
         .with_context(|| format!("failed to read diff file: {}", diff_path.display()))?;
     anyhow::ensure!(!diff.trim().is_empty(), "diff is empty");
+
+    // Run before parse_diff_stats/changed_files below, not just before prioritize_and_cap_diff —
+    // a denied file must leave no trace anywhere this run produces (stats, manifest changed-file
+    // list, report), not merely be skipped by lens prompts.
+    let (diff, denied_files) = strip_denied_paths(&diff, denied_path_patterns);
+    if !denied_files.is_empty() {
+        eprintln!(
+            "security.denied_path_patterns excluded {} file(s) from this diff, not sent to the LLM: {}",
+            denied_files.len(),
+            denied_files.join(", ")
+        );
+    }
+
     let (changed_files, added_lines, removed_lines) = parse_diff_stats(&diff);
     anyhow::ensure!(
         !changed_files.is_empty(),
-        "no changed files found in diff (check unified diff format)"
+        "no changed files found in diff (check unified diff format, or whether \
+         denied_path_patterns excluded everything)"
     );
 
-    // changed_files/added_lines/removed_lines above reflect the full original diff (accurate
-    // stats for reporting) even if prioritize_and_cap_diff below drops some file-blocks from
-    // what's actually sent to the LLM.
+    // changed_files/added_lines/removed_lines above reflect the post-denylist diff (accurate
+    // stats for what's actually reviewable) even if prioritize_and_cap_diff below drops further
+    // file-blocks from what's actually sent to the LLM.
     let (diff, dropped_files) = prioritize_and_cap_diff(&diff);
     if !dropped_files.is_empty() {
         eprintln!(
@@ -370,6 +421,7 @@ pub fn normalize(
             config: RunConfig { language },
         },
         dropped_files,
+        denied_files,
     ))
 }
 
@@ -639,6 +691,51 @@ mod tests {
         let (out, dropped) = prioritize_and_cap_diff(diff);
         assert_eq!(out.trim_end(), diff.trim_end());
         assert!(dropped.is_empty());
+    }
+
+    // --- strip_denied_paths() ---
+
+    #[test]
+    fn strip_denied_paths_is_a_no_op_when_no_patterns_are_configured() {
+        let diff = "diff --git a/secrets.env b/secrets.env\n+API_KEY=x\n";
+        let (out, denied) = strip_denied_paths(diff, &[]);
+        assert_eq!(out, diff);
+        assert!(denied.is_empty());
+    }
+
+    #[test]
+    fn strip_denied_paths_removes_a_matching_file_block_and_its_content() {
+        let diff = "diff --git a/src/main.rs b/src/main.rs\n+fn main() {}\n\
+             diff --git a/secrets.env b/secrets.env\n+API_KEY=super-secret-value\n";
+        let (out, denied) = strip_denied_paths(diff, &["secrets.env".to_string()]);
+        assert_eq!(denied, vec!["secrets.env".to_string()]);
+        assert!(out.contains("fn main()"), "the kept file must survive");
+        assert!(
+            !out.contains("super-secret-value"),
+            "a denied file's content must never appear in what's returned"
+        );
+        assert!(out.contains("[NOTE: 1 file(s) excluded"));
+        assert!(out.contains("security.denied_path_patterns"));
+    }
+
+    #[test]
+    fn strip_denied_paths_leaves_a_non_matching_diff_untouched() {
+        let diff = "diff --git a/src/main.rs b/src/main.rs\n+fn main() {}\n";
+        let (out, denied) = strip_denied_paths(diff, &["secrets.env".to_string()]);
+        assert_eq!(out.trim_end(), diff.trim_end());
+        assert!(denied.is_empty());
+    }
+
+    #[test]
+    fn strip_denied_paths_matches_a_directory_style_pattern_at_a_real_segment_boundary_only() {
+        // Same matches_one semantics as test_path_patterns/doc_path_patterns: "secrets/" must
+        // match a real path segment, not the middle of "my_secrets_config.rs".
+        let diff = "diff --git a/config/secrets/db.toml b/config/secrets/db.toml\n+password=x\n\
+             diff --git a/src/my_secrets_config.rs b/src/my_secrets_config.rs\n+fn f() {}\n";
+        let (out, denied) = strip_denied_paths(diff, &["secrets/".to_string()]);
+        assert_eq!(denied, vec!["config/secrets/db.toml".to_string()]);
+        assert!(out.contains("my_secrets_config.rs"));
+        assert!(!out.contains("password=x"));
     }
 
     #[test]

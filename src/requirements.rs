@@ -284,6 +284,7 @@ mod tests {
             ignored_path_patterns: Vec::new(),
             scoring: Default::default(),
             discourse: Default::default(),
+            security: Default::default(),
         }
     }
 

@@ -135,8 +135,65 @@ fn find_secrets(line: &str) -> Vec<(&'static str, &str)> {
     if let Some(m) = find_env_style_secret(line) {
         found.push(("assigned secret-like value", m));
     }
+    // PII: deliberately narrow in scope. Emails/phone numbers/national IDs are far too common as
+    // *legitimate* content in ordinary source (test fixtures, contact info, config defaults) to
+    // flag on shape alone without drowning real hits in noise — the same lesson already learned
+    // the hard way tuning the credential patterns above. A Luhn-valid 13-19 digit run is a much
+    // stronger signal: it's specifically what a real payment card number looks like, and an
+    // arbitrary digit run this long passing Luhn by chance is rare (~1 in 10). Broader PII
+    // detection (emails, phone numbers, national IDs) needs more context than a line-by-line
+    // pattern scan can give and isn't attempted here.
+    if let Some(m) = find_luhn_valid_card_number(line) {
+        found.push(("possible payment card number (Luhn-valid)", m));
+    }
 
     found
+}
+
+/// Digits with interior spaces/dashes allowed (how card numbers are usually written:
+/// `4111 1111 1111 1111` / `4111-1111-1111-1111`), matching the run in whichever length range
+/// (13-19 digits) checks out via Luhn.
+fn find_luhn_valid_card_number(line: &str) -> Option<&str> {
+    let mut run_start: Option<usize> = None;
+    let mut run_end = 0usize;
+    for (i, c) in line.char_indices() {
+        if c.is_ascii_digit() || c == ' ' || c == '-' {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+            run_end = i + c.len_utf8();
+        } else if let Some(s) = run_start.take() {
+            if is_luhn_valid_card_run(&line[s..run_end]) {
+                return Some(&line[s..run_end]);
+            }
+        }
+    }
+    if let Some(s) = run_start {
+        if is_luhn_valid_card_run(&line[s..run_end]) {
+            return Some(&line[s..run_end]);
+        }
+    }
+    None
+}
+
+fn is_luhn_valid_card_run(run: &str) -> bool {
+    let digits: String = run.chars().filter(|c| c.is_ascii_digit()).collect();
+    (13..=19).contains(&digits.len()) && luhn_checksum_valid(&digits)
+}
+
+fn luhn_checksum_valid(digits: &str) -> bool {
+    let mut sum = 0u32;
+    for (i, c) in digits.chars().rev().enumerate() {
+        let mut d = c.to_digit(10).expect("digits is filtered to ASCII digits only");
+        if i % 2 == 1 {
+            d *= 2;
+            if d > 9 {
+                d -= 9;
+            }
+        }
+        sum += d;
+    }
+    sum % 10 == 0
 }
 
 /// Finds `prefix` in `line`, then greedily consumes characters matching `is_body` right after
@@ -530,6 +587,55 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "a real quoted secret followed by a semicolon must still be flagged: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_flags_a_luhn_valid_card_number() {
+        let diff = "+++ b/fixtures/customer.json\n@@ -1 +1 @@\n\
+                     +    \"card_number\": \"4532015112830366\",\n";
+        let hits = scan(diff);
+        assert!(
+            hits.iter().any(|h| h.pattern.contains("card number")),
+            "a Luhn-valid 16-digit run must be flagged as a possible card number: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_flags_a_luhn_valid_card_number_written_with_spaces() {
+        let diff = "+++ b/fixtures/customer.json\n@@ -1 +1 @@\n\
+                     +    cardNumber = \"4111 1111 1111 1111\"\n";
+        let hits = scan(diff);
+        assert!(
+            hits.iter().any(|h| h.pattern.contains("card number")),
+            "a space-grouped Luhn-valid card number must still be flagged: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_an_arbitrary_16_digit_number_that_fails_luhn() {
+        // Ordinary numeric ids/constants of card-like length are common in real code and must
+        // not be flagged just for being 16 digits — only a Luhn-valid run is a real signal.
+        let diff = "+++ b/src/constants.rs\n@@ -1 +1 @@\n\
+                     +    const MAGIC_ID: u64 = 1234567890123456;\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a 16-digit number that fails the Luhn check must not be flagged: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_flag_an_ordinary_short_number_even_if_it_would_pass_luhn() {
+        // Luhn validity alone isn't enough at short lengths -- phone numbers, short ids, etc.
+        // are common and some fraction will happen to pass Luhn by chance; the length gate
+        // (13-19 digits) is what keeps that rare instead of routine.
+        let diff = "+++ b/src/constants.rs\n@@ -1 +1 @@\n\
+                     +    const PORT: u16 = 8080;\n";
+        let hits = scan(diff);
+        assert!(
+            hits.is_empty(),
+            "a short number must not be flagged as a card number: {hits:?}"
         );
     }
 

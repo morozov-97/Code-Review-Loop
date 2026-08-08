@@ -168,6 +168,13 @@ pub struct Llm {
     /// #175: sent as `max_tokens` on OpenAI-compatible requests (OpenRouter/Custom) — None
     /// means no cap is sent (existing behavior, unchanged). Ignored by the claude-cli backend.
     max_output_tokens: Option<u32>,
+    /// Sent as `temperature` on OpenAI-compatible requests (OpenRouter/Custom) — None means no
+    /// value is sent at all (existing behavior, unchanged: whatever the provider/model defaults
+    /// to, typically not 0). Ignored by the claude-cli backend, which has no such knob exposed
+    /// through the `claude -p` CLI. Real, measured non-determinism (the same diff can produce a
+    /// different verdict on a repeat run) is why this exists — see README's "Path to
+    /// production" — but no default is silently changed here: a team has to opt in.
+    temperature: Option<f64>,
     /// #175: hard ceiling on total provider calls (shared `usage.calls` — main and cheap model
     /// combined when they share a usage tracker) — None means uncapped (existing behavior,
     /// unchanged).
@@ -322,6 +329,7 @@ impl Llm {
             deadline: None,
             gate: None,
             max_output_tokens: None,
+            temperature: None,
             max_calls: None,
             calls_log: None,
         }
@@ -349,6 +357,7 @@ impl Llm {
             deadline: None,
             gate: None,
             max_output_tokens: None,
+            temperature: None,
             max_calls: None,
             calls_log: None,
         })
@@ -380,6 +389,7 @@ impl Llm {
             deadline: None,
             gate: None,
             max_output_tokens: None,
+            temperature: None,
             max_calls: None,
             calls_log: None,
         }
@@ -399,6 +409,7 @@ impl Llm {
             deadline: None,
             gate: None,
             max_output_tokens: None,
+            temperature: None,
             max_calls: None,
             calls_log: None,
         }
@@ -432,6 +443,13 @@ impl Llm {
     /// doc comment.
     pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
         self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// Applies to OpenAI-compatible backends only (OpenRouter/Custom) — see the field's doc
+    /// comment.
+    pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
+        self.temperature = temperature;
         self
     }
 
@@ -549,6 +567,7 @@ impl Llm {
                 system,
                 self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
                 self.max_output_tokens,
+                self.temperature,
             ),
             Provider::Custom {
                 base_url,
@@ -564,6 +583,7 @@ impl Llm {
                 system,
                 self.effective_timeout(HTTP_TIMEOUT_GLOBAL),
                 self.max_output_tokens,
+                self.temperature,
             ),
             #[cfg(test)]
             Provider::Fixture(queue) => {
@@ -934,6 +954,7 @@ fn call_openai_compatible(
     system: Option<&str>,
     timeout: Duration,
     max_output_tokens: Option<u32>,
+    temperature: Option<f64>,
 ) -> Result<CallResult> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(s) = system {
@@ -969,6 +990,9 @@ fn call_openai_compatible(
     // its length beyond whatever the provider defaults to.
     if let Some(max) = max_output_tokens {
         body["max_tokens"] = serde_json::json!(max);
+    }
+    if let Some(t) = temperature {
+        body["temperature"] = serde_json::json!(t);
     }
 
     // #171: timeout is set per-request (via RequestBuilder::config()), not on the agent itself

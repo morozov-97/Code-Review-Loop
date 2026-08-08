@@ -19,7 +19,9 @@ sections below — this is the summary for someone who wants the bottom line fir
 | 78-case scale-up, full pipeline | 78 | 451 | $0.3022 |
 | 78-case scale-up, single-lens baseline (comparison) | 78 | 136 | $0.1158 |
 | 41-case self-consistency (3 independent passes each) | 123 | 222 | $0.1589 |
-| **Total** | **385** | **1264** | **$0.8469** |
+| 34-case cross-repo benchmark (this project's own repo) | 31 | 167 | $0.0837 |
+| 12-case same-diff repeat run (non-determinism check) | 12 | 65 | $0.0426 |
+| **Total** | **428** | **1496** | **$0.9732** |
 
 **What this bought:**
 
@@ -45,14 +47,26 @@ sections below — this is the summary for someone who wants the bottom line fir
   sizes, direction-unstable enough that an early "medium beats high" result reversed once the
   sample grew. Don't trust a single high-confidence discourse AGREE more than a medium one without
   independent verification.
+- **Generalization to another repo/language is weak.** A second SZZ benchmark against this
+  project's own (Rust) codebase measured recall 0.444 and precision 0.222 — both far below the
+  original benchmark's 0.816/0.53–0.63. The same "missed positives are almost all
+  `policy_failure`-only, no confirmed finding ever proposed" pattern showed up in both repos,
+  which is evidence of a real, systematic gap rather than one benchmark's sampling noise. See
+  [`evals/reports/2026-08-08-cross-repo/summary.md`](reports/2026-08-08-cross-repo/summary.md).
+- **Non-determinism isn't just an anecdote anymore.** Re-running 12 of the cross-repo benchmark's
+  diffs a second, fully independent time (same spec/diff/model) flipped the catch/miss outcome on
+  6/12 (50%) — every negative case was stable, but 5/9 positives weren't. A single run's recall
+  number is one noisy draw from a distribution this wide, not a fixed property of the tool.
 - None of this is a finished verdict on the architecture — see each section's own caveats (sample
   sizes, one repo, one spec, methodology limits). It's real, measured evidence in place of pure
   speculation, not proof the design is optimal.
 
-**Privacy note:** every run above was against a real, unrelated private production codebase — not
-part of this repo, not the golden-set fixtures. App name, file paths, and any in-app text are
-deliberately omitted throughout this document; only the review mechanics and aggregate numbers are
-recorded.
+**Privacy note:** every run in the main 78-case benchmark and its comparisons above was against a
+real, unrelated private production codebase — not part of this repo, not the golden-set fixtures.
+App name, file paths, and any in-app text are deliberately omitted throughout this document; only
+the review mechanics and aggregate numbers are recorded. The cross-repo benchmark and its repeat
+run are the one exception: their target is this project's own (public) repository, named directly
+since there's no third party's codebase to protect.
 
 ## Validated against a real model
 
@@ -399,6 +413,15 @@ injection finding was left `UNCERTAIN` and dropped from the report's scored find
 5 distinct golden diffs is not enough to give a statistical reliability guarantee. Treat a single green
 run as "didn't regress obviously," not as proof the tool reliably catches everything it's
 supposed to.
+
+**Update, 2026-08-08 — this is now measured, not just anecdotal.** 12 diffs from the cross-repo
+benchmark (see [`evals/reports/2026-08-08-cross-repo/summary.md`](reports/2026-08-08-cross-repo/summary.md))
+were each run twice, independently, with identical spec/diff/model and no `--temperature`
+override. **6 of 12 (50%) flipped the catch/miss outcome** between the two runs — every negative
+case stayed stable, but 5 of 9 positives didn't. A `--temperature` flag now exists
+(`src/cli.rs`/`src/llm.rs`) to trade some review nuance for more reproducible verdicts; whether a
+low value actually reduces this flip rate is a separate, still-open measurement — this run used
+the provider default (unset) in both passes.
 
 ## What's here
 

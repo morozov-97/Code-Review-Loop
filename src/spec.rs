@@ -90,6 +90,17 @@ impl DiscourseConfig {
     }
 }
 
+/// Path patterns (same substring/directory-boundary matching as `test_path_patterns` etc, see
+/// `policy::matches_one`) for files whose diff content must never leave the machine as text sent
+/// to an LLM backend — secrets/credential files, infra configs, anything a team decides is out
+/// of bounds regardless of what secretscan's marker-word heuristics happen to catch. Applied in
+/// `input::normalize`, before anything else touches the diff.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub denied_path_patterns: Vec<String>,
+}
+
 impl Default for DiscourseConfig {
     fn default() -> Self {
         DiscourseConfig {
@@ -142,6 +153,10 @@ pub struct Spec {
     /// Discourse confirmation/rejection sensitivity. Absent `[discourse]` table = default.
     #[serde(default)]
     pub discourse: DiscourseConfig,
+    /// Paths whose diff content is excluded before it's sent anywhere. Absent `[security]`
+    /// table = no denied paths (unchanged behavior).
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl Spec {
@@ -187,6 +202,13 @@ impl Spec {
                 .iter()
                 .all(|p| !p.trim().is_empty()),
             "ignored_path_patterns has an empty pattern"
+        );
+        anyhow::ensure!(
+            spec.security
+                .denied_path_patterns
+                .iter()
+                .all(|p| !p.trim().is_empty()),
+            "security.denied_path_patterns has an empty pattern"
         );
 
         // #146: score() only clamps the final total at the low end (.max(0)) — a negative
@@ -420,6 +442,65 @@ title = "Design"
         );
         let spec = Spec::load(&path).expect("spec without ignored_path_patterns should load");
         assert!(spec.ignored_path_patterns.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_defaults_denied_path_patterns_to_empty_when_security_table_is_absent() {
+        let path = write_spec(
+            "no-security.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let spec = Spec::load(&path).expect("spec without a [security] table should load");
+        assert!(spec.security.denied_path_patterns.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_honors_a_configured_denied_path_pattern() {
+        let path = write_spec(
+            "with-security.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[security]
+denied_path_patterns = ["secrets/", ".env"]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let spec = Spec::load(&path).expect("spec with a [security] table should load");
+        assert_eq!(
+            spec.security.denied_path_patterns,
+            vec!["secrets/".to_string(), ".env".to_string()]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_empty_denied_path_pattern() {
+        let path = write_spec(
+            "empty-denied-pattern.toml",
+            r#"
+name = "t"
+labels = ["bug"]
+[security]
+denied_path_patterns = ["secrets/", ""]
+[[lenses]]
+id = "design"
+title = "Design"
+"#,
+        );
+        let err = Spec::load(&path)
+            .expect_err("empty security.denied_path_patterns entry must be rejected");
+        assert!(err.to_string().contains("denied_path_patterns"));
         let _ = std::fs::remove_file(&path);
     }
 

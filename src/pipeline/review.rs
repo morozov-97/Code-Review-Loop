@@ -128,7 +128,11 @@ fn review_one_lens(
     Ok((id.to_string(), out))
 }
 
-pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<()> {
+/// Returns the run's final `verdict` string (APPROVE/COMMENT/NEEDS_CONTEXT/REQUEST_CHANGES) on
+/// success, so a caller that wants an actual CI gate (see `cli::FailOn`) has something to gate
+/// on — `Err` is reserved for this run itself failing (bad diff, LLM/IO error), never for "the
+/// verdict was bad."
+pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Result<String> {
     let started = std::time::Instant::now();
     // #119: without this, --deadline-minutes only stopped new *stages* from starting — a call
     // already in flight could still run its full per-call timeout (600s) past the deadline.
@@ -140,12 +144,13 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     let llm = &llm.clone().with_deadline(deadline_instant);
     let cheap_llm = &cheap_llm.clone().with_deadline(deadline_instant);
     let sp = Spec::load(args.spec_path)?;
-    let (mut inp, dropped_files) = input::normalize(
+    let (mut inp, dropped_files, denied_files) = input::normalize(
         args.diff_path,
         args.requirements_path,
         args.conventions_path,
         args.deterministic_results_path,
         args.lang.clone(),
+        &sp.security.denied_path_patterns,
     )?;
     enforce_secret_scan(&inp, args.allow_sensitive_input)?;
     // Not a hard cap — since the full diff (plus requirements/conventions) is resent on every
@@ -636,6 +641,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         successful_lens_count,
         stage_errors.clone(),
         dropped_files,
+        denied_files,
         llm.usage(),
         manifest::StageTimings {
             deterministic_tool_timings,
@@ -660,7 +666,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     println!("Report: {}", path.display());
     println!("Next round: --prior {}", out_dir.display());
     println!("{}", llm.usage().summary());
-    Ok(())
+    Ok(quant.verdict)
 }
 
 /// A minimal E2E test verifying that the 12-step pipeline actually meshes together, without a
@@ -801,7 +807,7 @@ always = true
         let llm = Llm::fixture(vec![lens_response, discourse_response], 0, usage.clone());
         let cheap_llm = llm.clone();
 
-        run_review(
+        let verdict = run_review(
             &llm,
             &cheap_llm,
             &ReviewArgs {
@@ -822,6 +828,12 @@ always = true
             },
         )
         .expect("run_review should complete end-to-end against the fixture LLM");
+
+        assert_eq!(
+            verdict, "COMMENT",
+            "run_review's returned verdict must match what the report itself says, so a \
+             --fail-on caller can gate on it without re-parsing report.md"
+        );
 
         let report =
             std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");

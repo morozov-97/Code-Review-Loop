@@ -63,6 +63,9 @@ pub(crate) struct Manifest {
     pub(crate) stage_errors: Vec<String>,
     /// Files `prioritize_and_cap_diff` dropped from what was actually sent to the LLM.
     pub(crate) dropped_files: Vec<String>,
+    /// Files excluded before anything else touched them, by `security.denied_path_patterns` —
+    /// the audit trail of what a path policy kept out of every LLM call this run made.
+    pub(crate) denied_files: Vec<String>,
     pub(crate) usage: Usage,
     pub(crate) stages: StageTimings,
     /// #172: one entry per logical LLM call across the whole run (main + cheap model combined).
@@ -88,6 +91,7 @@ pub(crate) fn build(
     successful_lens_count: usize,
     stage_errors: Vec<String>,
     dropped_files: Vec<String>,
+    denied_files: Vec<String>,
     usage: Usage,
     stages: StageTimings,
     calls: Vec<CallRecord>,
@@ -104,6 +108,7 @@ pub(crate) fn build(
         successful_lens_count,
         stage_errors,
         dropped_files,
+        denied_files,
         usage,
         stages,
         calls,
@@ -157,6 +162,7 @@ mod tests {
             1,
             vec!["good_things: boom".to_string()],
             vec!["Cargo.lock".to_string()],
+            vec!["secrets.env".to_string()],
             Usage::default(),
             StageTimings {
                 total_ms: 1234,
@@ -176,6 +182,7 @@ mod tests {
         assert!(contents.contains("\"round\": 2"));
         assert!(contents.contains("some-model"));
         assert!(contents.contains("Cargo.lock"));
+        assert!(contents.contains("secrets.env"));
         assert!(contents.contains("\"latency_ms\": 42"));
         assert!(contents.contains("\"total_ms\": 1234"));
 

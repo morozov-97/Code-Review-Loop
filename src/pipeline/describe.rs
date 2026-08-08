@@ -22,12 +22,13 @@ pub(crate) fn run_describe(
     allow_sensitive_input: bool,
 ) -> Result<()> {
     let sp = Spec::load(spec_path)?;
-    let (inp, _dropped_files) = input::normalize(
+    let (inp, _dropped_files, _denied_files) = input::normalize(
         diff_path,
         requirements_path,
         conventions_path,
         &None,
         lang.clone(),
+        &sp.security.denied_path_patterns,
     )?;
     enforce_secret_scan(&inp, allow_sensitive_input)?;
     let out_dir = prepare_out(out)?;

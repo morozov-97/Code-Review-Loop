@@ -252,10 +252,68 @@ self-graded) — confidence tiers are only weakly distinguishable, and an early 
 result at a smaller sample size did not replicate at a larger one. **Don't trust a single
 high-confidence claim over a medium one without independent verification.**
 
-Total real spend behind these numbers so far: **$0.85 across 385 review runs (1,264 LLM calls)**.
+Total real spend behind these numbers so far: **$0.97 across 428 review runs (1,496 LLM calls)**.
 None of this is a finished verdict on the architecture — see `evals/README.md`'s own caveats
 (sample sizes, one repo, one spec, methodology limits) — but it's real, measured evidence in place
 of the pure speculation this section used to be.
+
+**Generalization and non-determinism, also measured, not assumed:**
+
+| | This repo (n=78, mobile app) | A second repo (n=34, this project's own Rust codebase) |
+|---|---|---|
+| Recall | 0.816 | **0.444** |
+| Precision | 0.53–0.63 | **0.222** |
+
+The drop is real, not noise: both repos share the same dominant miss pattern (a missed defect
+almost always has `verdict_reason=policy_failure` — no lens/discourse round ever proposed a
+matching finding at all), seen independently in two different languages/domains. A same-diff
+repeat run (12 cases, identical spec/diff/model) found the underlying scoring itself is noisy on
+top of that: **6/12 (50%) flipped catch/miss between two independent runs of the exact same
+diff.** Full detail: [`evals/reports/2026-08-08-cross-repo/summary.md`](evals/reports/2026-08-08-cross-repo/summary.md).
+
+### Path to production
+
+The numbers above answer "does the architecture help" — not "is this ready to gate merges." It
+isn't, yet. Updated against what's now real vs. still open:
+
+1. **Close the precision/recall gap — still open.** Recall 0.44–0.82 / precision 0.22–0.63 (both
+   repos) is too weak and too variable for a blocking gate. Root-cause is now real, not
+   speculative: the dominant miss pattern in both repos is a `policy_failure`-only verdict with
+   zero confirmed findings proposed — the gap is in lens/discourse coverage, not in
+   `vote_threshold` tuning (see [Precision/recall operating points](#precisionrecall-operating-points)):
+   in the cross-repo benchmark's own confirmed findings (now logged per-finding via
+   `discourse/mod.rs`'s vote-net instrumentation), CONFIRMED outcomes clustered at either exactly
+   the 0.6 default threshold or a full 1.0, with little middle ground — retuning the threshold has
+   limited room to help with cases where no finding was ever proposed in the first place.
+2. **Fix or drop the confidence signal — partially done.** `report.md` itself now carries an
+   inline caveat next to every discourse confidence value (previously this warning only lived in
+   this README, invisible to someone reading a single PR's report). The underlying weak
+   correlation is unchanged — finding-level ground truth calibration (the open half of #163) or a
+   different mechanism (e.g. stricter citation verification) is still unbuilt.
+3. **Widen validation scope — measured, and the answer is bad news.** A second SZZ benchmark
+   against a different repo/language (this project's own Rust codebase, table above) shows the
+   numbers do *not* transfer: recall and precision both roughly halve or worse. This makes the
+   "not prod-ready" conclusion stronger, not weaker — treat the 78-case numbers as an upper bound
+   specific to that repo/spec, not a general expectation.
+4. **Handle non-determinism — measured, and it's severe.** A same-diff repeat run found a 50%
+   catch/miss flip rate (above). A `--temperature` flag now exists (`--temperature 0.0`–`1.0` on
+   `review`) to trade review nuance for reproducibility, but whether a low value actually reduces
+   the flip rate is a separate, still-open measurement — the 50% figure was measured at the
+   provider's default (unset) temperature.
+5. **Close known security gaps — done.** `[security].denied_path_patterns` (spec-configurable)
+   excludes matching files' diff content before anything touches it, not just before the LLM call
+   — excluded files are logged in `manifest.json`'s `denied_files` as an audit trail.
+   `secretscan.rs` now also flags Luhn-valid payment-card-shaped digit runs, not just
+   credential-shaped patterns. Broader PII (emails, phone numbers, national IDs) is deliberately
+   not attempted — line-by-line pattern matching can't tell legitimate contact info in source from
+   real leaked user data without more context than this scan has.
+6. **Shadow mode before any gate — done.** `codereview review`'s exit code has never reflected
+   `verdict` by default (it's always been shadow mode, whether or not that was documented as
+   deliberate) — `--fail-on {comment,needs-context,request-changes}` is now the explicit opt-in
+   for a team that's ready to gate on it; the default (`never`) is unchanged.
+
+Items 1 and 2 remain open, and item 3's answer makes the overall picture worse, not better — treat
+`codereview` as advisory only. See [Recommended CI integration](#recommended-ci-integration).
 
 ## Precision/recall operating points
 
@@ -504,7 +562,12 @@ that helps a reviewer prioritize what to look at (start with `P0`/`P1` findings)
 replacement for their judgment:
 
 - Post the report as a PR comment or check-run **annotation**, not a required status check that
-  blocks merge on its own.
+  blocks merge on its own. `codereview review`'s process exit code has never reflected `verdict`
+  by default — it exits 0 on any successful run regardless of what it found, so wiring it into CI
+  at all already means shadow mode unless you opt in. `--fail-on {comment,needs-context,
+  request-changes}` is that explicit opt-in, for a team that's run in shadow mode long enough to
+  trust gating on it (see [Path to production](#path-to-production)'s step 6). Default
+  (`--fail-on never`) keeps today's non-blocking behavior unchanged.
 - Findings that assert something is *absent* from the diff (`"not in the diff"`,
   `"not present"`, `"missing"`) are the most failure-prone category — discourse now has the actual
   diff to verify these against (previously it didn't; see `src/discourse/mod.rs`'s `ctx` handling),
@@ -519,8 +582,10 @@ replacement for their judgment:
   example above) — anything mechanically checkable shouldn't be left for the LLM to assert and
   potentially contradict itself on across discourse rounds.
 - Before trusting `verdict` for any kind of gating, measure its actual precision/recall against a
-  golden set of known-good/known-bad diffs (see `evals/` — scaffolded but not yet validated with a
-  real API key/run) rather than assuming it.
+  golden set of known-good/known-bad diffs for *your* codebase — don't assume the numbers in
+  [Real-world validation](#real-world-validation) (recall 0.79–0.82, precision 0.53–0.63,
+  measured on one repo/one spec) transfer as-is; see `evals/` for the same methodology applied
+  here.
 
 ## Governance and internal docs
 

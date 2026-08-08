@@ -16,6 +16,7 @@ pub(super) fn test_spec() -> Spec {
         ignored_path_patterns: Vec::new(),
         scoring: Default::default(),
         discourse: Default::default(),
+        security: Default::default(),
     }
 }
 

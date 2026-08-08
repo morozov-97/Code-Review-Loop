@@ -64,9 +64,10 @@ fn real_main() -> Result<()> {
             human_voice,
             lang,
             deadline_minutes,
+            fail_on,
         } => {
             let (llm, cheap_llm) = build_llm(&cli)?;
-            run_review(
+            let verdict = run_review(
                 &llm,
                 &cheap_llm,
                 &ReviewArgs {
@@ -85,7 +86,14 @@ fn real_main() -> Result<()> {
                     deadline_minutes: *deadline_minutes,
                     allow_sensitive_input: cli.allow_sensitive_input,
                 },
-            )
+            )?;
+            if fail_on.triggers(&verdict) {
+                eprintln!(
+                    "codereview: verdict {verdict} triggers --fail-on {fail_on:?} — exiting non-zero"
+                );
+                std::process::exit(1);
+            }
+            Ok(())
         }
         Cmd::Describe {
             spec,

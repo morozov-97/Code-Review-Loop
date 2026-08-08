@@ -389,6 +389,19 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             ));
         }
     }
+    if audit
+        .iter()
+        .any(|a| a.moves.iter().any(|m| m.kind == "AGREE" || m.kind == "CHALLENGE"))
+    {
+        // Measured (not assumed): confidence tiers here are only weakly correlated with actual
+        // correctness (see README's Real-world validation section) — surfaced right next to the
+        // table itself, since a reader of one PR's report won't see the repo-level README caveat.
+        md.push_str(
+            "\n_Confidence above is self-reported by the discourse round, not independently \
+verified — measured to be only weakly correlated with actual correctness. Don't use it alone to \
+decide what to read first._\n",
+        );
+    }
 
     if let Some(hv) = human_voice {
         md.push_str("\n## Human-voice Review\n\n");
@@ -496,6 +509,7 @@ mod tests {
             ignored_path_patterns: Vec::new(),
             scoring: Default::default(),
             discourse: Default::default(),
+            security: Default::default(),
         }
     }
 
@@ -723,6 +737,112 @@ mod tests {
         assert!(
             audit_line.contains("high"),
             "discourse audit row must carry the move's confidence:\n{audit_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_renders_a_confidence_reliability_caveat_when_the_audit_has_a_confidence_bearing_move() {
+        // A reader of one PR's report never sees the repo-level README caveat about confidence
+        // being weakly correlated with correctness -- it needs to be right next to the table.
+        let spec = test_spec();
+        let input = test_input();
+        let quant = test_quant();
+        let dir = std::env::temp_dir()
+            .join("codereview-loop-report-confidence-caveat-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![crate::discourse::Move {
+                kind: "AGREE".to_string(),
+                lens: "reviewer".to_string(),
+                target: "design-r1-1".to_string(),
+                new_evidence: "corroborating".to_string(),
+                confidence: "high".to_string(),
+                ..Default::default()
+            }],
+        }];
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["design".to_string()],
+            round: 1,
+            findings: &[],
+            resolved: &HashMap::new(),
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &audit,
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &[],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            md.contains("weakly correlated with actual correctness"),
+            "report must warn readers not to triage by confidence alone:\n{md}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_does_not_render_a_confidence_caveat_when_the_audit_has_no_confidence_bearing_move() {
+        // CONNECT/SURFACE moves carry no confidence -- the caveat would be noise with nothing to
+        // warn about.
+        let spec = test_spec();
+        let input = test_input();
+        let quant = test_quant();
+        let dir = std::env::temp_dir()
+            .join("codereview-loop-report-no-confidence-caveat-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![crate::discourse::Move {
+                kind: "SURFACE".to_string(),
+                lens: "reviewer".to_string(),
+                target: "".to_string(),
+                new_evidence: "".to_string(),
+                confidence: "".to_string(),
+                ..Default::default()
+            }],
+        }];
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["design".to_string()],
+            round: 1,
+            findings: &[],
+            resolved: &HashMap::new(),
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &audit,
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &[],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            !md.contains("weakly correlated with actual correctness"),
+            "no confidence-bearing move happened, so the caveat has nothing to warn about:\n{md}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

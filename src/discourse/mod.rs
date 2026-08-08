@@ -195,6 +195,12 @@ pub fn run(
                         r.reason
                     );
                     r.status = "UNCERTAIN".to_string();
+                } else {
+                    // Kept even on the passing path (not just the failure path above) so every
+                    // CONFIRMED resolution's net vote is recoverable from `state.json` alone --
+                    // needed to offline-resweep vote_threshold against past runs without
+                    // re-spending real LLM calls to regenerate them.
+                    r.reason = format!("{} [local vote net={net:.2}]", r.reason);
                 }
             }
             // #140: the prompt says resolutions "should only judge findings that are UNRESOLVED
@@ -750,6 +756,11 @@ mod tests {
         assert_eq!(
             resolved["a"].status, "CONFIRMED",
             "a CONFIRMED backed by a real vote and verified evidence must stand"
+        );
+        assert!(
+            resolved["a"].reason.contains("[local vote net="),
+            "the passing net vote must be recoverable from reason for offline threshold resweeps, got: {}",
+            resolved["a"].reason
         );
     }
 

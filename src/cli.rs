@@ -1,6 +1,56 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// `review`'s exit code has never reflected `verdict` — the process exits 0
+/// on any successful run regardless of what it found, so "wire this into CI" already meant
+/// "shadow mode" by default, whether or not that was documented as a deliberate choice (see
+/// README's "Recommended CI integration"). This is the explicit opt-in for a team that's done
+/// running in shadow mode and wants an actual gate: `--fail-on` maps `verdict` to the process
+/// exit code, at whatever severity the team picks. Default (`never`) keeps today's behavior
+/// exactly as-is.
+#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
+pub(crate) enum FailOn {
+    /// Exit 0 regardless of verdict (default, unchanged from today's behavior).
+    #[default]
+    Never,
+    /// Exit 1 on COMMENT or worse (any confirmed defect, or an unrelated policy failure).
+    Comment,
+    /// Exit 1 on NEEDS_CONTEXT or worse.
+    NeedsContext,
+    /// Exit 1 only on REQUEST_CHANGES (a confirmed P0, or an unresolved high-severity finding).
+    RequestChanges,
+}
+
+impl FailOn {
+    fn threshold_rank(&self) -> Option<u8> {
+        match self {
+            FailOn::Never => None,
+            FailOn::Comment => Some(1),
+            FailOn::NeedsContext => Some(2),
+            FailOn::RequestChanges => Some(3),
+        }
+    }
+
+    /// An unrecognized verdict string is treated like APPROVE (rank 0) — never triggers on its
+    /// own, the conservative direction for a value this shouldn't ever see in practice.
+    fn verdict_rank(verdict: &str) -> u8 {
+        match verdict {
+            "APPROVE" => 0,
+            "COMMENT" => 1,
+            "NEEDS_CONTEXT" => 2,
+            "REQUEST_CHANGES" => 3,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn triggers(&self, verdict: &str) -> bool {
+        match self.threshold_rank() {
+            None => false,
+            Some(threshold) => Self::verdict_rank(verdict) >= threshold,
+        }
+    }
+}
+
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 pub(crate) enum Backend {
     /// claude -p subprocess
@@ -56,6 +106,13 @@ pub(crate) struct Cli {
     /// Unset means uncapped (existing behavior, unchanged).
     #[arg(long, global = true)]
     pub(crate) max_provider_calls: Option<u64>,
+    /// Sent as `temperature` on OpenAI-compatible requests (OpenRouter/Custom backends) — unset
+    /// (default) sends no value at all, i.e. whatever the provider/model defaults to (existing
+    /// behavior, unchanged). A lower value (e.g. 0.0-0.2) trades some review nuance for more
+    /// reproducible verdicts on a repeat run of the same diff — see README's "Path to
+    /// production" for why this matters. Ignored by the claude-cli backend.
+    #[arg(long, global = true)]
+    pub(crate) temperature: Option<f64>,
 
     #[command(subcommand)]
     pub(crate) cmd: Cmd,
@@ -104,6 +161,11 @@ pub(crate) enum Cmd {
         /// timeout first. Unset means no overall deadline (existing behavior, unchanged).
         #[arg(long)]
         deadline_minutes: Option<u64>,
+        /// Maps `verdict` to the process exit code, for a CI job that wants an actual gate
+        /// instead of shadow mode. Default (`never`) exits 0 regardless of verdict — today's
+        /// existing behavior, unchanged.
+        #[arg(long, value_enum, default_value = "never")]
+        fail_on: FailOn,
     },
     /// PR title/summary/walkthrough/labels/splittability + TODO scan
     Describe {
@@ -137,4 +199,49 @@ pub(crate) enum Cmd {
         #[arg(long)]
         lang: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fail_on_never_does_not_trigger_even_on_request_changes() {
+        assert!(!FailOn::Never.triggers("REQUEST_CHANGES"));
+    }
+
+    #[test]
+    fn fail_on_comment_triggers_on_comment_and_worse() {
+        assert!(!FailOn::Comment.triggers("APPROVE"));
+        assert!(FailOn::Comment.triggers("COMMENT"));
+        assert!(FailOn::Comment.triggers("NEEDS_CONTEXT"));
+        assert!(FailOn::Comment.triggers("REQUEST_CHANGES"));
+    }
+
+    #[test]
+    fn fail_on_needs_context_does_not_trigger_on_a_mere_comment() {
+        assert!(!FailOn::NeedsContext.triggers("COMMENT"));
+        assert!(FailOn::NeedsContext.triggers("NEEDS_CONTEXT"));
+        assert!(FailOn::NeedsContext.triggers("REQUEST_CHANGES"));
+    }
+
+    #[test]
+    fn fail_on_request_changes_only_triggers_on_request_changes_itself() {
+        assert!(!FailOn::RequestChanges.triggers("APPROVE"));
+        assert!(!FailOn::RequestChanges.triggers("COMMENT"));
+        assert!(!FailOn::RequestChanges.triggers("NEEDS_CONTEXT"));
+        assert!(FailOn::RequestChanges.triggers("REQUEST_CHANGES"));
+    }
+
+    #[test]
+    fn fail_on_default_is_never() {
+        assert_eq!(FailOn::default(), FailOn::Never);
+    }
+
+    #[test]
+    fn fail_on_treats_an_unrecognized_verdict_string_like_approve() {
+        // Defensive default: a verdict string this shouldn't ever see in practice must not
+        // silently trip a CI gate.
+        assert!(!FailOn::Comment.triggers("SOME_FUTURE_VERDICT"));
+    }
 }

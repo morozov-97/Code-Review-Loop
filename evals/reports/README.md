@@ -26,6 +26,7 @@ cost, and what was found, frozen as of the date it ran.
 | Date | Summary |
 |---|---|
 | [2026-08-08](2026-08-08/summary.md) | First SZZ-derived real benchmark (41→78 cases): full-pipeline-vs-single-lens comparison at two scales, discourse confidence calibration, a self-consistency baseline ruling out "just more LLM calls" as the explanation, $0.85 total real cost across 385 runs. |
+| [2026-08-08-cross-repo](2026-08-08-cross-repo/summary.md) | Second SZZ benchmark against a different repo/language (this project's own Rust codebase, n=34): recall/precision both drop sharply (0.444/0.222 vs 0.816/0.53–0.63) — weak generalization. A same-diff repeat run also found a 50% catch/miss flip rate, the first systematic (not anecdotal) non-determinism measurement. $0.13 total real cost. |
 
 Add a row here whenever a new report lands — this table is the entry point, not something a
 reader should have to reconstruct by listing directories.

@@ -68,7 +68,7 @@ fn matches_word_boundary(path: &str, pattern: &str) -> bool {
 /// Patterns ending in a slash (directory-style), like "test/", are forced to match only at path
 /// segment boundaries — otherwise "test/" would accidentally match mid-word inside
 /// "contest/practice.rs" as "con[test/]...", misclassifying a non-test/doc file as a test file.
-fn matches_one(path: &str, pattern: &str) -> bool {
+pub(crate) fn matches_one(path: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
@@ -253,6 +253,7 @@ mod tests {
             ignored_path_patterns: ignored_patterns.iter().map(|s| s.to_string()).collect(),
             scoring: Default::default(),
             discourse: Default::default(),
+            security: Default::default(),
         }
     }
 
