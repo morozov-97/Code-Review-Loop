@@ -21,9 +21,17 @@ def parse_report(path):
     if not os.path.exists(path):
         return None
     text = open(path).read()
-    m = re.search(r"\*\*Verdict:\s*([A-Z_]+)\*\*\s*.*?Score:\s*(\d+)/100", text)
-    verdict = m.group(1) if m else "UNKNOWN"
-    score = int(m.group(2)) if m else None
+    # verdict_reason (added alongside the verdict/policy decoupling fix) renders inline as
+    # `**Verdict: X _(reason)_**` -- match that shape first and fall back to the older
+    # `**Verdict: X**` (no reason) so this still works against a report from before that change.
+    m = re.search(r"\*\*Verdict:\s*([A-Z_]+)\s*_\(([a-z0-9_]+)\)_\s*.*?\*\*\s*.*?Score:\s*(\d+)/100", text)
+    if m:
+        verdict, verdict_reason, score = m.group(1), m.group(2), int(m.group(3))
+    else:
+        m = re.search(r"\*\*Verdict:\s*([A-Z_]+)\*\*\s*.*?Score:\s*(\d+)/100", text)
+        verdict = m.group(1) if m else "UNKNOWN"
+        verdict_reason = None
+        score = int(m.group(2)) if m else None
 
     fm = re.search(r"## Findings\n\n(.*?)(\n##|\n### Needs Human Review|\Z)", text, re.S)
     findings_section = fm.group(1) if fm else ""
@@ -39,8 +47,8 @@ def parse_report(path):
         if l.startswith("|") and not l.startswith("| ID") and not re.match(r"^\|[-\s|]+\|$", l)
     ]
 
-    return {"verdict": verdict, "score": score, "confirmed_count": len(confirmed_rows),
-            "uncertain_count": len(uncertain_rows)}
+    return {"verdict": verdict, "verdict_reason": verdict_reason, "score": score,
+            "confirmed_count": len(confirmed_rows), "uncertain_count": len(uncertain_rows)}
 
 
 def main():
@@ -54,7 +62,7 @@ def main():
         base = entry["file"].replace(".patch", "")
         parsed = parse_report(os.path.join(args.dir, "results", base, "report.md"))
         rows.append({**entry, "base": base,
-                     **(parsed or {"verdict": "MISSING", "score": None, "confirmed_count": 0, "uncertain_count": 0})})
+                     **(parsed or {"verdict": "MISSING", "verdict_reason": None, "score": None, "confirmed_count": 0, "uncertain_count": 0})})
 
     pos = [r for r in rows if r["label"] == "positive_bic"]
     neg = [r for r in rows if r["label"] == "negative_clean"]

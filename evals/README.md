@@ -233,6 +233,50 @@ This is real data toward #161, not a settled verdict: it's one repo, one spec, 4
 purpose-built single-pass reviewer prompt might do better than the generalist lens used here as a
 stand-in.
 
+## Scaled up: 78 cases (38 positive / 40 negative)
+
+Extended the same real repo/methodology to a larger sample — 38 positive (the ceiling this
+repo's actual history yields for traceable bug-introducing commits, even after loosening
+`extract.py`'s size bounds to `--max-files 15 --max-lines 900`; the repo simply doesn't have more
+than 38 commits SZZ can confidently attribute at a size where attribution stays meaningful) and 40
+negative. **Not an independent replication** — 29 of these 78 diffs are the same commits as the
+original 41-case run (`extract.py`'s selection is deterministic; raising the limits just extends
+the same ordered list) — so treat this as the original run *scaled up*, not a second, separate
+sample confirming the first from scratch.
+
+- **Precision/recall on the larger sample: 0.534 / 0.816** (was 0.633 / 0.792 at n=41). Recall
+  held roughly steady; precision dropped — with 27 false positives now against 40 negative cases
+  (up from 11/17), the ratio direction is consistent with the original run, not a reversal.
+- **The verdict-saturation problem from the original run is gone.** #196 (a follow-up decoupling
+  policy failures from `REQUEST_CHANGES`) fixed this structurally, and it shows here: verdicts
+  are now genuinely distributed (positive set: 10 `REQUEST_CHANGES`, 19 `COMMENT`, 9
+  `NEEDS_CONTEXT`; negative set: 5/30/5) instead of 78/78 identical. This is real confirmation
+  that fix works, not just a unit test of it.
+- **The "medium beats high" AGREE-confidence anomaly from the smaller move-level sample (#163) did
+  not hold up.** At n=64 (the original 41-case run), medium-confidence AGREE moves had a *higher*
+  location-match rate (0.929) than high-confidence ones (0.44) — flagged at the time as a real
+  signal but explicitly caveated as small-sample (medium's n=14 especially). At n=100 on this
+  larger run, the ordering reverted to the "expected" direction: high 0.467, medium 0.3 — still
+  mediocre in absolute terms (neither confidence tier is a strong predictor), but the earlier
+  inversion reads as a small-sample artifact, not a real, reproducible finding. Recorded here
+  specifically because it's an example of a "surprising result" from smaller data *not*
+  replicating — the honest outcome, not the more dramatic one from the first pass.
+- `Finding.confidence` (the non-circular but coarser signal) also moved closer together at scale:
+  high 0.515 vs. medium 0.505 on all findings (was 0.495/0.537), high 0.648 vs. medium 0.5 on
+  CONFIRMED-only (was 0.75/0.7) — same broad picture as before (confidence tiers barely
+  distinguishable), now with a bigger sample behind it.
+
+**Also found and fixed two more real problems while running this larger set** (both in
+`src/secretscan.rs`, PR merged before this section was written): a regex stripping PEM headers
+from an env-supplied key matched the PEM-block detector, since a real embedded PEM block never has
+`-----BEGIN` and `-----END` on the same line but code *processing* the marker strings as text
+does; and a bare pre/post-increment expression (`++_speechToken`) wasn't caught by any of the
+existing code-expression heuristics. Separately, `evals/szz-bench/aggregate.py` itself had a real
+bug found here: its verdict-parsing regex predated #189's `verdict_reason` slug and required
+digits in reason names (`confirmed_p0_defect`) that its character class excluded — fixed, since a
+benchmark tool that silently reports `UNKNOWN` for every verdict after an upstream format change
+is exactly the kind of failure this whole exercise exists to catch.
+
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 
 Running `sql-injection.patch` twice produced two different discourse outcomes: once the SQL
