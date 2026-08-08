@@ -44,6 +44,11 @@ python3 calibrate_confidence.py --repo /path/to/target/repo --bench-dir ./szz-ou
 #    Needs report.md's Discourse Audit "Confidence" column (added alongside this script) --
 #    reports generated before that change won't parse.
 python3 calibrate_move_confidence.py --repo /path/to/target/repo --bench-dir ./szz-out
+
+# 6. Optional (issue #209): does self-consistency (N independent single-lens passes, majority
+#    vote) recover the full pipeline's recall advantage, at comparable cost?
+./run_self_consistency.sh --repo /path/to/target/repo --szz-dir ./szz-out --out-dir ./szz-out --reps 3
+python3 aggregate_self_consistency.py --dir ./szz-out
 ```
 
 `calibrate_confidence.py` is a narrower, non-circular attempt at #163 — it checks each finding's
@@ -61,6 +66,17 @@ ground truth via the finding each move targets. Real result from the 41-case run
 (0.44, n=50) — the opposite of what `confidence_weight`'s 1.0-for-high/0.6-for-medium weighting
 assumes. Small samples (especially medium's n=14), so treat as a real signal worth more data, not
 a settled result — see the full writeup and caveats in the #163 comment this shipped alongside.
+
+`run_self_consistency.sh`/`aggregate_self_consistency.py` answer the question the full-pipeline-vs-
+single-lens comparison can't on its own: is the full pipeline's higher recall from persona
+diversity + discourse doing real work, or just from making more LLM calls per diff? Real result
+from the 41-case run: even the most lenient aggregation (any of 3 independent passes flagged it)
+tops out at 0.667 recall — below the full pipeline's 0.792 — at essentially the same real cost
+(3 independent single-lens passes ≈ one full-pipeline run). Requiring majority agreement is
+*worse* than a single pass (0.292 vs. 0.375 recall) — not a bug, a real consequence of each pass
+independently catching a given defect well under 50% of the time, which makes majority-of-N
+mathematically reduce the catch rate rather than improve it. See `../README.md`'s "still-missing
+baseline" section for the full numbers and reasoning.
 
 `extract.py --fix-grep` defaults to `^fix` (Conventional Commits style) — pass a different pattern
 for repos using another convention. `--max-files`/`--max-lines` bound how large a commit can be

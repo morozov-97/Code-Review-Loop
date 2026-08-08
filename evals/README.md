@@ -18,7 +18,8 @@ sections below — this is the summary for someone who wants the bottom line fir
 | 24-case rerun (discourse-move-confidence data) | 24 | 139 | $0.0774 |
 | 78-case scale-up, full pipeline | 78 | 451 | $0.3022 |
 | 78-case scale-up, single-lens baseline (comparison) | 78 | 136 | $0.1158 |
-| **Total** | **262** | **1042** | **$0.6880** |
+| 41-case self-consistency (3 independent passes each) | 123 | 222 | $0.1589 |
+| **Total** | **385** | **1264** | **$0.8469** |
 
 **What this bought:**
 
@@ -28,6 +29,12 @@ sections below — this is the summary for someone who wants the bottom line fir
   between the two configs both times (within ~0.01–0.11, no consistent direction) — the extra
   findings the full pipeline surfaces aren't disproportionately noise, it's genuinely more
   sensitive, not just louder. Cost: consistently about 3x more calls per diff at both sizes.
+- **That advantage isn't just "asking more than once."** At essentially the same cost, 3
+  independent single-lens passes voted by simple self-consistency top out at 0.667 recall (most
+  lenient aggregation) — still below the full pipeline's 0.792, and requiring majority agreement
+  makes it *worse* than a single pass (0.292 vs. 0.375), a real consequence of each pass's <50%
+  per-trial hit rate, not a bug. Real evidence the architecture (persona diversity + discourse) is
+  contributing something blind repetition doesn't.
 - **`verdict` used to be structurally useless as a quality signal** on a repo whose commit style
   didn't match the default spec's test/changelog policy (a single unrelated policy failure forced
   the same `REQUEST_CHANGES` as a confirmed critical defect). Fixed, and the fix is verified
@@ -343,6 +350,44 @@ This closes out the piece of #161 that the original n=41 comparison couldn't ans
 whether "the full pipeline beats a single reviewer" was itself a coincidence of that particular
 41-diff sample. It wasn't — the same magnitude of effect (~2x recall, ~3x cost, comparable
 precision) showed up independently on a sample nearly twice the size.
+
+### The still-missing baseline: does the full pipeline beat just asking more than once? (#209)
+
+Neither comparison above tells you *why* the full pipeline catches more — persona diversity and
+discourse cross-verification doing real work is one explanation; simply running more LLM calls per
+diff (5.8–5.9 vs. 1.7–1.8) is another, much less interesting one. Ran the missing baseline: the
+same 41 diffs, single-lens (`--lenses ""`) config, **3 fully independent passes per diff, no shared
+state between them** — the standard self-consistency technique (majority vote across independent
+samples) applied to this problem.
+
+| Aggregation across 3 independent single-lens passes | Recall | Precision | 
+|---|---|---|
+| Any of 3 flagged it (most lenient) | 0.667 | 0.640 |
+| Majority (2 of 3) | 0.292 | 0.636 |
+| All 3 agreed (strictest) | 0.083 | 1.000 |
+| *(for reference)* single pass (n=1) | 0.375 | 0.643 |
+| *(for reference)* full pipeline | 0.792 | 0.633 |
+
+Real cost for the 3-pass set: $0.0039 / 5.4 calls per diff on average — **essentially the same
+cost as the full pipeline** ($0.0035 / 5.9 calls), since 3 independent single-lens passes cost
+about as much as one full-pipeline run.
+
+**This answers #209's question cleanly: no, self-consistency doesn't recover the full pipeline's
+advantage.** Even the most lenient aggregation (flag it if any of the 3 independent passes did)
+tops out at 0.667 recall — meaningfully below the full pipeline's 0.792 — at essentially identical
+cost. Requiring majority agreement makes things *worse* than a single pass (0.292 vs. 0.375),
+which isn't a bug in the method: each pass only independently catches a given real defect about
+37.5% of the time (the single-pass recall), and requiring 2-of-3 agreement on an event with
+sub-50% single-trial probability mathematically drives the majority-vote rate *down*, not up (the
+same reason majority voting only helps when per-vote accuracy exceeds 50% — a property that held
+in the small sample here: observed flagged-count-of-3 distribution on the positive set was
+`{0: 8, 1: 9, 2: 5, 3: 2}`, consistent with roughly independent ~35–40%-per-pass hits).
+
+Read plainly: at comparable cost, the architected pipeline (different personas, one round of
+cross-verification) beats blind repetition of the same single-lens pass. This is real evidence
+that persona diversity + discourse is contributing something repetition alone doesn't — not proof
+the specific architecture is optimal, but a real answer to "is this just asking three times,"
+which #161 raised and #209 tracked as the missing piece.
 
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 

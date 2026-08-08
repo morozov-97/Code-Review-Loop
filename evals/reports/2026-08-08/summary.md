@@ -18,7 +18,8 @@ Every number is from an actual `manifest.json` (`usage.calls`/`usage.cost_usd`),
 | 24-case rerun (discourse-move-confidence data) | 24 | 139 | $0.0774 |
 | 78-case scale-up, full pipeline | 78 | 451 | $0.3022 |
 | 78-case scale-up, single-lens baseline (comparison) | 78 | 136 | $0.1158 |
-| **Total** | **262** | **1042** | **$0.6880** |
+| 41-case self-consistency (3 independent passes each) | 123 | 222 | $0.1589 |
+| **Total** | **385** | **1264** | **$0.8469** |
 
 ## Methodology
 
@@ -71,6 +72,25 @@ real, reproducible finding. Across both runs and both signals, confidence tiers 
 distinguishable — self-reported confidence is not a reliable signal to trust without independent
 verification.
 
+**Self-consistency baseline** (#209 — does running the single-lens config N times independently
+and voting recover the full pipeline's recall, at comparable cost?): 3 independent passes per diff
+on the 41-case set.
+
+| Aggregation | Recall | Precision |
+|---|---|---|
+| Any of 3 flagged it | 0.667 | 0.640 |
+| Majority (2 of 3) | 0.292 | 0.636 |
+| All 3 agreed | 0.083 | 1.000 |
+| *(single pass, n=1)* | 0.375 | 0.643 |
+| *(full pipeline)* | 0.792 | 0.633 |
+
+Real cost: $0.0039 / 5.4 calls per diff — essentially the same as the full pipeline ($0.0035 /
+5.9). Even the most lenient aggregation falls short of the full pipeline's recall at comparable
+cost; majority voting is *worse* than a single pass, a real consequence of each pass's <50%
+per-trial hit rate (not a bug — majority-of-N only helps when per-trial accuracy exceeds 50%).
+Real evidence the full pipeline's advantage is from the architecture (persona diversity +
+discourse), not just from making more LLM calls per diff.
+
 ## Real bugs found and fixed along the way
 
 All found via real diffs failing/misbehaving during the runs above, not hypothesized in advance.
@@ -105,3 +125,6 @@ All found via real diffs failing/misbehaving during the runs above, not hypothes
 - 78 is still short of the 100–500 scale a fully convincing benchmark would want; this repo's real
   history doesn't yield more than 38 attributable positive cases without accepting noisier
   attribution from larger, harder-to-attribute commits.
+- The self-consistency baseline used N=3 only, at n=41 (not re-run at n=78), and used simple
+  per-diff flagged/not-flagged voting rather than matching individual findings across the 3
+  passes — a finding-level match (same claim, not just "something got confirmed") wasn't attempted.
