@@ -27,7 +27,11 @@ pub enum ReviewCompleteness {
 
 pub struct QuantSummary {
     pub verdict: String, // APPROVE|COMMENT|REQUEST_CHANGES|NEEDS_CONTEXT
-    pub score: i64,      // 0-100
+    /// #189: which branch of `verdict()` actually produced `verdict` above — see its own doc
+    /// comment for why this exists (verdict alone can't distinguish a confirmed defect from an
+    /// unrelated policy failure).
+    pub verdict_reason: VerdictReason,
+    pub score: i64, // 0-100
     pub score_deductions: Vec<String>,
     pub estimated_effort_1_5: u8,
     pub time_best_min: u32,
@@ -117,26 +121,84 @@ fn deterministic_gate(deterministic_results: &Option<serde_json::Value>) -> Opti
     }
 }
 
+/// #189: `verdict` alone can't tell a caller whether `REQUEST_CHANGES` means "a confirmed P0
+/// defect" or "the changelog wasn't updated" — found via a real 41-case benchmark where every
+/// single case (positive and negative alike) came back `REQUEST_CHANGES`, because this repo's
+/// commit style never satisfies the default spec's test/changelog policy, regardless of actual
+/// code quality. This exists so that signal is readable without re-deriving it from
+/// findings/policies/deterministic_results by hand — every branch below was already being
+/// evaluated by `verdict()`; this just names which one actually fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictReason {
+    /// A CONFIRMED P0 finding — an actual, discourse-confirmed defect.
+    ConfirmedP0Defect,
+    /// A policy check (tests-accompany-changes, changelog-updated, diff-size) failed — a
+    /// process signal, not a claim that the code itself has a confirmed defect.
+    PolicyFailure,
+    /// An external deterministic tool (semgrep/cargo-audit/`--deterministic-results`) reported
+    /// `"fail"` on at least one check.
+    DeterministicCheckFailed,
+    /// A deterministic tool reported `"error"` (couldn't run cleanly) with no `"fail"` present —
+    /// distinct from an actual failing check.
+    DeterministicCheckErrored,
+    /// A P0/P1 finding exists but discourse couldn't reach consensus (`UNCERTAIN`) — a real
+    /// signal worth attention, but not a confirmed defect either.
+    UnresolvedHighSeverityFinding,
+    /// A CONFIRMED P1 finding.
+    ConfirmedP1Defect,
+    /// A requirement came back MISSING or AMBIGUOUS.
+    MissingOrAmbiguousRequirement,
+    /// A CONFIRMED finding exists (P2/P3 only — nothing above fired).
+    ConfirmedMinorDefect,
+    /// No CONFIRMED findings and none of the above — genuinely clean by every signal checked.
+    NoConfirmedFindings,
+}
+
+impl VerdictReason {
+    /// Short slug rendered on report.md's verdict line — stable, machine-matchable, not prose.
+    pub fn as_slug(&self) -> &'static str {
+        match self {
+            VerdictReason::ConfirmedP0Defect => "confirmed_p0_defect",
+            VerdictReason::PolicyFailure => "policy_failure",
+            VerdictReason::DeterministicCheckFailed => "deterministic_check_failed",
+            VerdictReason::DeterministicCheckErrored => "deterministic_check_errored",
+            VerdictReason::UnresolvedHighSeverityFinding => "unresolved_high_severity_finding",
+            VerdictReason::ConfirmedP1Defect => "confirmed_p1_defect",
+            VerdictReason::MissingOrAmbiguousRequirement => "missing_or_ambiguous_requirement",
+            VerdictReason::ConfirmedMinorDefect => "confirmed_minor_defect",
+            VerdictReason::NoConfirmedFindings => "no_confirmed_findings",
+        }
+    }
+}
+
 fn verdict(
     findings: &[Finding],
     resolved: &HashMap<String, Resolution>,
     policies: &[PolicyResult],
     requirements: &Option<Vec<RequirementCheck>>,
     deterministic_results: &Option<serde_json::Value>,
-) -> String {
+) -> (String, VerdictReason) {
     let confirmed: Vec<&Finding> = findings
         .iter()
         .filter(|f| resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED"))
         .collect();
 
     if confirmed.iter().any(|f| f.severity == "P0") {
-        return "REQUEST_CHANGES".to_string();
+        return (
+            "REQUEST_CHANGES".to_string(),
+            VerdictReason::ConfirmedP0Defect,
+        );
     }
     if policies.iter().any(|p| p.status == PolicyStatus::Fail) {
-        return "REQUEST_CHANGES".to_string();
+        return ("REQUEST_CHANGES".to_string(), VerdictReason::PolicyFailure);
     }
     if let Some(v) = deterministic_gate(deterministic_results) {
-        return v.to_string();
+        let reason = if v == "REQUEST_CHANGES" {
+            VerdictReason::DeterministicCheckFailed
+        } else {
+            VerdictReason::DeterministicCheckErrored
+        };
+        return (v.to_string(), reason);
     }
     // #136: verdict/score used to look at CONFIRMED findings only — a P0/P1 that discourse
     // couldn't reach consensus on (UNCERTAIN) had zero influence here, so a diff with a
@@ -147,23 +209,29 @@ fn verdict(
         matches!(f.severity.as_str(), "P0" | "P1")
             && resolved.get(&f.id).map(|r| r.status.as_str()) == Some("UNCERTAIN")
     }) {
-        return "NEEDS_CONTEXT".to_string();
+        return (
+            "NEEDS_CONTEXT".to_string(),
+            VerdictReason::UnresolvedHighSeverityFinding,
+        );
     }
     if confirmed.iter().any(|f| f.severity == "P1") {
-        return "COMMENT".to_string();
+        return ("COMMENT".to_string(), VerdictReason::ConfirmedP1Defect);
     }
     if let Some(reqs) = requirements {
         if reqs
             .iter()
             .any(|r| r.status == "MISSING" || r.status == "AMBIGUOUS")
         {
-            return "NEEDS_CONTEXT".to_string();
+            return (
+                "NEEDS_CONTEXT".to_string(),
+                VerdictReason::MissingOrAmbiguousRequirement,
+            );
         }
     }
     if confirmed.is_empty() {
-        "APPROVE".to_string()
+        ("APPROVE".to_string(), VerdictReason::NoConfirmedFindings)
     } else {
-        "COMMENT".to_string()
+        ("COMMENT".to_string(), VerdictReason::ConfirmedMinorDefect)
     }
 }
 
@@ -178,7 +246,7 @@ pub fn summarize(
 ) -> QuantSummary {
     let (sc, deductions) = score(scoring, findings, resolved);
     let (effort, best, average, worst) = effort_and_time(input, lens_count);
-    let v = verdict(
+    let (v, reason) = verdict(
         findings,
         resolved,
         policies,
@@ -187,6 +255,7 @@ pub fn summarize(
     );
     QuantSummary {
         verdict: v,
+        verdict_reason: reason,
         score: sc,
         score_deductions: deductions,
         estimated_effort_1_5: effort,
@@ -345,7 +414,7 @@ mod tests {
         assert_eq!(sc, 60); // 100 - 40 (custom P0 weight), not the default 25
     }
 
-    // --- verdict() ---
+    // --- verdict().0 ---
 
     #[test]
     fn verdict_request_changes_on_confirmed_p0() {
@@ -353,7 +422,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
         assert_eq!(
-            verdict(&findings, &resolved, &[], &None, &None),
+            verdict(&findings, &resolved, &[], &None, &None).0,
             "REQUEST_CHANGES"
         );
     }
@@ -362,7 +431,7 @@ mod tests {
     fn verdict_request_changes_on_policy_failure_even_with_no_findings() {
         let policies = vec![policy(PolicyStatus::Fail)];
         assert_eq!(
-            verdict(&[], &HashMap::new(), &policies, &None, &None),
+            verdict(&[], &HashMap::new(), &policies, &None, &None).0,
             "REQUEST_CHANGES"
         );
     }
@@ -376,7 +445,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
         assert_eq!(
-            verdict(&findings, &resolved, &[], &None, &None),
+            verdict(&findings, &resolved, &[], &None, &None).0,
             "NEEDS_CONTEXT"
         );
     }
@@ -387,7 +456,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
         assert_eq!(
-            verdict(&findings, &resolved, &[], &None, &None),
+            verdict(&findings, &resolved, &[], &None, &None).0,
             "NEEDS_CONTEXT"
         );
     }
@@ -397,7 +466,10 @@ mod tests {
         let findings = vec![finding("a", "P2")];
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
-        assert_eq!(verdict(&findings, &resolved, &[], &None, &None), "APPROVE");
+        assert_eq!(
+            verdict(&findings, &resolved, &[], &None, &None).0,
+            "APPROVE"
+        );
     }
 
     #[test]
@@ -407,7 +479,10 @@ mod tests {
         let findings = vec![finding("a", "P0")];
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "MERGED"));
-        assert_eq!(verdict(&findings, &resolved, &[], &None, &None), "APPROVE");
+        assert_eq!(
+            verdict(&findings, &resolved, &[], &None, &None).0,
+            "APPROVE"
+        );
     }
 
     #[test]
@@ -418,7 +493,7 @@ mod tests {
         resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
         resolved.insert("b".to_string(), resolution("b", "UNCERTAIN"));
         assert_eq!(
-            verdict(&findings, &resolved, &[], &None, &None),
+            verdict(&findings, &resolved, &[], &None, &None).0,
             "REQUEST_CHANGES"
         );
     }
@@ -428,14 +503,17 @@ mod tests {
         let findings = vec![finding("a", "P1")];
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
-        assert_eq!(verdict(&findings, &resolved, &[], &None, &None), "COMMENT");
+        assert_eq!(
+            verdict(&findings, &resolved, &[], &None, &None).0,
+            "COMMENT"
+        );
     }
 
     #[test]
     fn verdict_needs_context_on_missing_requirement() {
         let reqs = vec![requirement("MISSING")];
         assert_eq!(
-            verdict(&[], &HashMap::new(), &[], &Some(reqs), &None),
+            verdict(&[], &HashMap::new(), &[], &Some(reqs), &None).0,
             "NEEDS_CONTEXT"
         );
     }
@@ -444,14 +522,17 @@ mod tests {
     fn verdict_needs_context_on_ambiguous_requirement() {
         let reqs = vec![requirement("AMBIGUOUS")];
         assert_eq!(
-            verdict(&[], &HashMap::new(), &[], &Some(reqs), &None),
+            verdict(&[], &HashMap::new(), &[], &Some(reqs), &None).0,
             "NEEDS_CONTEXT"
         );
     }
 
     #[test]
     fn verdict_approve_when_nothing_confirmed_and_no_other_signal() {
-        assert_eq!(verdict(&[], &HashMap::new(), &[], &None, &None), "APPROVE");
+        assert_eq!(
+            verdict(&[], &HashMap::new(), &[], &None, &None).0,
+            "APPROVE"
+        );
     }
 
     #[test]
@@ -460,7 +541,7 @@ mod tests {
         // showed it.
         let det = serde_json::json!({"sast": {"status": "fail", "evidence": "1 findings"}});
         assert_eq!(
-            verdict(&[], &HashMap::new(), &[], &None, &Some(det)),
+            verdict(&[], &HashMap::new(), &[], &None, &Some(det)).0,
             "REQUEST_CHANGES"
         );
     }
@@ -469,7 +550,7 @@ mod tests {
     fn verdict_needs_context_on_a_deterministic_check_error_with_no_fail() {
         let det = serde_json::json!({"sast": {"status": "error", "evidence": "scan incomplete"}});
         assert_eq!(
-            verdict(&[], &HashMap::new(), &[], &None, &Some(det)),
+            verdict(&[], &HashMap::new(), &[], &None, &Some(det)).0,
             "NEEDS_CONTEXT"
         );
     }
@@ -478,7 +559,7 @@ mod tests {
     fn verdict_unaffected_by_a_deterministic_check_that_passes() {
         let det = serde_json::json!({"sast": {"status": "pass", "evidence": "0 findings"}});
         assert_eq!(
-            verdict(&[], &HashMap::new(), &[], &None, &Some(det)),
+            verdict(&[], &HashMap::new(), &[], &None, &Some(det)).0,
             "APPROVE"
         );
     }
@@ -492,7 +573,7 @@ mod tests {
         resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
         let det = serde_json::json!({"secrets": {"status": "fail", "evidence": "1 findings"}});
         assert_eq!(
-            verdict(&findings, &resolved, &[], &None, &Some(det)),
+            verdict(&findings, &resolved, &[], &None, &Some(det)).0,
             "REQUEST_CHANGES"
         );
     }
@@ -502,6 +583,57 @@ mod tests {
         let findings = vec![finding("a", "P2")];
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
-        assert_eq!(verdict(&findings, &resolved, &[], &None, &None), "COMMENT");
+        assert_eq!(
+            verdict(&findings, &resolved, &[], &None, &None).0,
+            "COMMENT"
+        );
+    }
+
+    // --- VerdictReason (#189) ---
+
+    #[test]
+    fn verdict_reason_distinguishes_a_policy_failure_from_a_confirmed_p0_defect() {
+        // The exact complaint #189 was filed over: both produce REQUEST_CHANGES, but callers
+        // need to tell them apart.
+        let (v1, r1) = verdict(
+            &[finding("a", "P0")],
+            &{
+                let mut m = HashMap::new();
+                m.insert("a".to_string(), resolution("a", "CONFIRMED"));
+                m
+            },
+            &[],
+            &None,
+            &None,
+        );
+        let (v2, r2) = verdict(
+            &[],
+            &HashMap::new(),
+            &[policy(PolicyStatus::Fail)],
+            &None,
+            &None,
+        );
+        assert_eq!(v1, "REQUEST_CHANGES");
+        assert_eq!(v2, "REQUEST_CHANGES");
+        assert_eq!(r1, VerdictReason::ConfirmedP0Defect);
+        assert_eq!(r2, VerdictReason::PolicyFailure);
+        assert_ne!(r1, r2, "same verdict string, but the reason must differ");
+    }
+
+    #[test]
+    fn verdict_reason_distinguishes_a_deterministic_fail_from_a_deterministic_error() {
+        let fail = serde_json::json!({"sast": {"status": "fail"}});
+        let error = serde_json::json!({"sast": {"status": "error"}});
+        let (_, r_fail) = verdict(&[], &HashMap::new(), &[], &None, &Some(fail));
+        let (_, r_error) = verdict(&[], &HashMap::new(), &[], &None, &Some(error));
+        assert_eq!(r_fail, VerdictReason::DeterministicCheckFailed);
+        assert_eq!(r_error, VerdictReason::DeterministicCheckErrored);
+    }
+
+    #[test]
+    fn verdict_reason_is_no_confirmed_findings_on_a_genuinely_clean_diff() {
+        let (v, r) = verdict(&[], &HashMap::new(), &[], &None, &None);
+        assert_eq!(v, "APPROVE");
+        assert_eq!(r, VerdictReason::NoConfirmedFindings);
     }
 }

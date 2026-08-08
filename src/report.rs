@@ -143,8 +143,9 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
         }
     };
     md.push_str(&format!(
-        "**Verdict: {}{}**  ·  Score: {}/100  ·  Effort: {}/5  ·  {} files changed (+{}/-{})\n\n",
+        "**Verdict: {} _({})_{}**  ·  Score: {}/100  ·  Effort: {}/5  ·  {} files changed (+{}/-{})\n\n",
         quant.verdict,
+        quant.verdict_reason.as_slug(),
         partial_marker,
         quant.score,
         quant.estimated_effort_1_5,
@@ -503,6 +504,7 @@ mod tests {
     fn test_quant() -> QuantSummary {
         QuantSummary {
             verdict: "REQUEST_CHANGES".to_string(),
+            verdict_reason: crate::quantify::VerdictReason::ConfirmedP0Defect,
             score: 99,
             score_deductions: Vec::new(),
             estimated_effort_1_5: 1,
@@ -656,6 +658,47 @@ mod tests {
         assert!(
             verdict_line.contains("(PARTIAL"),
             "verdict line must carry a partial-review marker when stage_errors is non-empty:\n{verdict_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_renders_the_verdict_reason_slug_on_the_verdict_line() {
+        // #189: the verdict line alone used to be unable to say whether REQUEST_CHANGES meant
+        // a confirmed defect or an unrelated policy failure.
+        let spec = test_spec();
+        let input = test_input();
+        let quant = test_quant(); // VerdictReason::ConfirmedP0Defect
+        let dir = std::env::temp_dir().join("codereview-loop-report-verdict-reason-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["security".to_string()],
+            round: 1,
+            findings: &[],
+            resolved: &HashMap::new(),
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &[],
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &[],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        let verdict_line = md.lines().find(|l| l.starts_with("**Verdict:")).unwrap();
+        assert!(
+            verdict_line.contains("confirmed_p0_defect"),
+            "verdict line must carry the verdict_reason slug:\n{verdict_line}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
