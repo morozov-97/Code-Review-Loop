@@ -30,6 +30,34 @@ inspection:
   scripts, and `default-rounds` took ~2x as long wall-clock (225s vs. 113s) — consistent with a
   real second discourse round actually running, not just a different label on the same call.
 
+## Also validated against a real external codebase (not the golden set)
+
+Beyond the 5 synthetic fixtures above, `codereview` was run once against a real single-commit
+diff from an unrelated private production mobile app (not part of this repo or the golden set) —
+an auth/session error-handling refactor in a Flutter/Supabase codebase, 1 file, +29/-23 lines.
+Identifying details (app name, file paths, in-app UI strings) are deliberately omitted here; only
+the review mechanics and real output numbers are recorded.
+
+- **Result:** `REQUEST_CHANGES`, score 94/100, effort 3/5, 7 provider calls, cost $0.0045
+  (`--backend openrouter`, default model).
+- **The finding was real, not fabricated:** the diff had collapsed a specific
+  network-exception branch (previously mapped to its own error code) into a broader generic
+  exception handler, losing the ability for callers to distinguish network failures from other
+  auth failures. The review caught exactly that, cited the correct before/after lines, and
+  scored it as a minor (P2/P3) deduction rather than overstating it.
+- **The one result worth calling out:** discourse's cross-verification rejected two of the four
+  raw candidate findings before they reached the report — one claimed a fallback code path had
+  been removed (it never existed in the original code either), the other claimed error detail
+  was being dropped (it wasn't; the exception subclass relationship preserved it). Both
+  rejections were correct on inspection of the actual diff. This is the first observed instance
+  in this repo of the "independent review + anonymous cross-verification catches an unfounded
+  claim" mechanism actually firing on a real diff, not just passing a unit test for the
+  mechanism's plumbing.
+- **What this does and doesn't prove:** one external diff is n=1 — it demonstrates the mechanism
+  can work, not that it reliably does. It's not a substitute for the labeled, larger-scale
+  benchmark comparing single-LLM vs. multi-persona-plus-discourse accuracy that issue #161 asks
+  for and that this repo still doesn't have.
+
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 
 Running `sql-injection.patch` twice produced two different discourse outcomes: once the SQL
