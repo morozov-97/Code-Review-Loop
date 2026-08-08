@@ -94,6 +94,100 @@ an LLM API call as a suspected credential. Root cause and fix proposal filed as
 `*_TOKEN`-containing identifier (`max_tokens`, `token_count`, etc.) trips it, not just genuine
 token/credential fields.
 
+## A 41-case benchmark derived from real git history (not hand-picked, not fabricated)
+
+The two single-diff runs above are n=1 anecdotes. Issue #161 asks for something closer to a real
+labeled benchmark — but a labeled benchmark needs ground truth, and an LLM (or the person running
+it) hand-picking diffs and then judging its own output is circular, not independent evidence. The
+approach here instead derives ground truth from a real project's own history, using
+[SZZ](https://en.wikipedia.org/wiki/SZZ_algorithm) (a standard, established bug-introducing-commit
+technique — not something invented for this write-up): for each commit whose message starts with
+`fix:` in a real, unrelated private production app's git history (same Flutter/Supabase app as the
+two runs above), `git blame` on the fix's parent commit finds which earlier commit last touched the
+lines the fix changed. That earlier commit is a real, historically-confirmed bug-introducing commit
+(BIC) — not a guess, not synthetic.
+
+- **Positive set (24 diffs):** BICs traced from 119 real `fix:` commits (27 traceable candidates
+  found; 3 dropped — 2 pure reverts, 1 trivial rename — leaving 24). Each is a real diff that a
+  later commit in the same project's history confirms introduced a defect.
+- **Negative set (17 diffs):** same-era, similarly-sized commits (`feat`/`chore`/`perf`/`style`)
+  that were never identified as any fix's BIC. Important caveat, stated plainly: this is *absence
+  of evidence*, not *proof of cleanliness* — a commit with an undiscovered defect (never fixed, or
+  fixed without a `fix:`-prefixed commit message) would be mislabeled "clean" here. This is a known
+  limitation of SZZ-derived negative sets in general, not specific to this run.
+- **Ran the real `codereview` binary against all 41** (`--backend openrouter`, default model,
+  `--max-rounds 1`), same as every other real run in this file.
+
+**The single biggest finding: `verdict` was `REQUEST_CHANGES` on all 41/41 diffs**, positive and
+negative alike — including six-line one-file commits and pure reverts. Cause, confirmed by reading
+every report's Policy Checks table: `default.toml`'s "tests accompany behavior changes" and
+"changelog/documentation updated" policies fail on essentially every commit in this real project,
+because this team's actual workflow doesn't add a dedicated test file or changelog entry per
+commit — and `quantify::verdict` returns `REQUEST_CHANGES` on *any* policy failure before it ever
+looks at confirmed findings. This isn't a new bug — the README already carried a caveat that
+`specs/default.toml`'s test/doc policy is "strict enough that even this project's own clean-diff
+eval fixture needed a padded test+changelog change to pass it" — but this is that same caveat
+confirmed at n=41 on a real project instead of n=1 on a synthetic fixture. **Practical
+consequence: raw `verdict` is not a usable accuracy signal for a project whose commit style
+doesn't match the default spec's assumptions**, regardless of how good or bad the underlying
+review is. Anyone evaluating this tool against their own repo should check their spec's policy
+pass rate before trusting `verdict` at all.
+
+Because of that, the numbers below use "did the review produce at least one `CONFIRMED` finding"
+(the `## Findings` table, which the report generator populates only with `CONFIRMED`-status
+findings) as the actual signal, not the saturated `verdict` field:
+
+| | predicted "flagged" | predicted "clean" |
+|---|---|---|
+| **actually had a defect (BIC)** | TP = 19 | FN = 5 |
+| **no known defect (negative set)** | FP = 11 | TN = 6 |
+
+Precision (of diffs flagged, how many had a real known defect): **0.633**. Recall (of diffs with a
+real known defect, how many got flagged): **0.792**.
+
+Two things that make the raw numbers above easy to over- or under-read, checked by hand rather than
+assumed:
+
+- **Spot-checked the false positives — most aren't hallucinations.** Read the actual `CONFIRMED`
+  findings on several FP cases (negative-set diffs the tool flagged). They were real, defensible
+  observations on real code (e.g. a new cross-feature import creating coupling between two
+  previously-independent modules; a batch of maintainability/best-practice notes on a
+  security-relevant file that was substantially rewritten) — not nonsense. They just weren't *the*
+  defect a later `fix:` commit happened to address, which is the only thing this benchmark's label
+  can see. The true "made something up" rate is very likely lower than 11/17 suggests; this
+  benchmark can't distinguish "wrong finding" from "real-but-different finding" without a human
+  reading every case, which wasn't done here.
+- **The 5 false negatives mostly weren't silent misses.** In every FN case checked, the review
+  still surfaced *something* in that diff — just not the specific bug a later commit fixed, and
+  discourse left those specific claims `UNCERTAIN` rather than `CONFIRMED` (visible in each
+  report's "Needs Human Review" section). So "flagged nothing" is a real category, but doesn't
+  describe most of the misses.
+- **This does not give issue #163 (confidence-weight calibration) usable data.** That needs
+  per-finding ground truth — was *this specific claim* correct — matched against the historical
+  fix. What's here is per-diff (did anything get confirmed), which is a coarser signal. #163 stays
+  blocked on that finer-grained labeling, not solved by this.
+
+**What this does and doesn't answer for #161:** it's real data at 41 cases instead of 5 or 1, with
+a methodology that doesn't require fabricating ground truth. It does not include the
+single-strong-reviewer-vs-persona-pipeline comparison matrix #161 explicitly asks for (that would
+mean running the same 41 diffs through a stripped-down single-pass config too, not done here), and
+41 is still small next to the 100-500 the issue names. Posted as a real data point on #161 rather
+than closing it — the comparison-matrix and larger-N gaps remain open.
+
+**Two more real secret-scanner false positives found while running this**, distinct from #181's
+(fixed as [#185](https://github.com/Loop-Suite/Code-Review-Loop/issues/185)/
+[#186](https://github.com/Loop-Suite/Code-Review-Loop/pull/186)): a `token == null` comparison
+had the first `=` of `==` mistaken for an assignment, capturing `"null) {"` as a fake secret value;
+and `const supabaseKey = AppConfig.supabaseAnonKey;` had a property *reference* (not a literal)
+flagged as a credential. A third class — a bare identifier assigned to a `KEY`/`TOKEN`-flavored
+variable, e.g. `'apikey': supabaseKey` — is real and still open (#185), not fixed in the same pass
+since distinguishing "reads like an English identifier" from "looks like a random credential" is a
+fuzzier heuristic than the other two and risks new false negatives. Separately, one diff assigned
+real-shaped Google API key values to client-side Firebase config (`apiKey: 'AIzaSy...'`) — a
+correct pattern match, not a bug: sent with `--allow-sensitive-input` after manual confirmation,
+since Firebase web API keys are documented by Google as safe to embed client-side (access is
+controlled by Firebase Security Rules, not by hiding this value).
+
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 
 Running `sql-injection.patch` twice produced two different discourse outcomes: once the SQL
