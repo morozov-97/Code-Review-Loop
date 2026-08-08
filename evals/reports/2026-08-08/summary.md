@@ -16,8 +16,9 @@ Every number is from an actual `manifest.json` (`usage.calls`/`usage.cost_usd`),
 | 41-case benchmark, full pipeline | 41 | 243 | $0.1446 |
 | 41-case benchmark, single-lens baseline (comparison) | 41 | 73 | $0.0480 |
 | 24-case rerun (discourse-move-confidence data) | 24 | 139 | $0.0774 |
-| 78-case scale-up | 78 | 451 | $0.3022 |
-| **Total** | **184** | **906** | **$0.5722** |
+| 78-case scale-up, full pipeline | 78 | 451 | $0.3022 |
+| 78-case scale-up, single-lens baseline (comparison) | 78 | 136 | $0.1158 |
+| **Total** | **262** | **1042** | **$0.6880** |
 
 ## Methodology
 
@@ -39,17 +40,20 @@ reusable against any git repo. Two runs, not independent of each other:
 **Full pipeline (persona lenses + discourse) vs. a single-lens baseline** (`--lenses ""`, the
 closest single-strong-reviewer approximation buildable from existing flags):
 
-| | full pipeline (41-case) | single-lens (41-case) | full pipeline (78-case) |
-|---|---|---|---|
-| Recall | 0.792 | 0.375 | 0.816 |
-| False-positive rate | 0.647 | 0.294 | — |
-| Precision | 0.633 | 0.643 | 0.534 |
-| Avg. cost/calls per diff | $0.0035 / 5.9 | $0.0012 / 1.8 | — |
+| | full pipeline (41-case) | single-lens (41-case) | full pipeline (78-case) | single-lens (78-case) |
+|---|---|---|---|---|
+| Recall | 0.792 | 0.375 | 0.816 | 0.395 |
+| False-positive rate | 0.647 | 0.294 | 0.675 | 0.300 |
+| Precision | 0.633 | 0.643 | 0.534 | 0.556 |
+| Avg. cost/calls per diff | $0.0035 / 5.9 | $0.0012 / 1.8 | $0.0039 / 5.8 | $0.0015 / 1.7 |
 
-Precision stayed close between the two configs at n=41 (0.633 vs. 0.643) — the full pipeline's
-extra findings aren't disproportionately noise, it's genuinely more sensitive, not just louder.
-Recall roughly doubled both times the comparison was measurable. The single-lens baseline
-comparison wasn't re-run at n=78.
+Precision stayed close between the two configs at both sample sizes (within ~0.01–0.11, no
+consistent direction — full pipeline slightly ahead at n=41, single-lens slightly ahead at n=78) —
+the full pipeline's extra findings aren't disproportionately noise, it's genuinely more sensitive,
+not just louder. Recall roughly doubled at both sizes. Cost ratio held at ~3.4x both times. The
+comparison was re-run independently at n=78, not just scaled from the n=41 numbers — same effect
+size showed up on a sample nearly twice as large, which is evidence against the original n=41
+result being a fluke of that particular sample.
 
 **Discourse confidence calibration** (does self-reported confidence predict whether a finding is
 really at the historical defect's location, checked via `git blame` against the fix commit — not
@@ -97,8 +101,6 @@ All found via real diffs failing/misbehaving during the runs above, not hypothes
 
 - One repo, one spec, two runs of the same repo (not two independent repos).
 - No cross-language/cross-repo validation.
-- The comparison-matrix (full pipeline vs. baseline) was only measured once, at n=41 — not re-run
-  at n=78.
 - Confidence-calibration checks a location-match proxy, not full semantic correctness of a claim.
 - 78 is still short of the 100–500 scale a fully convincing benchmark would want; this repo's real
   history doesn't yield more than 38 attributable positive cases without accepting noisier

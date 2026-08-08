@@ -16,16 +16,18 @@ sections below — this is the summary for someone who wants the bottom line fir
 | 41-case benchmark, full pipeline | 41 | 243 | $0.1446 |
 | 41-case benchmark, single-lens baseline (comparison) | 41 | 73 | $0.0480 |
 | 24-case rerun (discourse-move-confidence data) | 24 | 139 | $0.0774 |
-| 78-case scale-up | 78 | 451 | $0.3022 |
-| **Total** | **184** | **906** | **$0.5722** |
+| 78-case scale-up, full pipeline | 78 | 451 | $0.3022 |
+| 78-case scale-up, single-lens baseline (comparison) | 78 | 136 | $0.1158 |
+| **Total** | **262** | **1042** | **$0.6880** |
 
 **What this bought:**
 
 - **The full persona+discourse pipeline catches meaningfully more real defects than a single
-  reviewer does** — recall roughly doubled (0.79–0.82 vs. 0.375) across two separate runs.
-  Precision was close between the two configs in both runs (roughly 0.53–0.63 either way) — the
-  extra findings the full pipeline surfaces aren't disproportionately noise, it's genuinely more
-  sensitive, not just louder. Cost: about 3x more calls per diff.
+  reviewer does** — recall roughly doubled (0.79–0.82 vs. 0.375–0.395) at **two different sample
+  sizes** (n=41 and n=78, the comparison re-run independently at each). Precision stayed close
+  between the two configs both times (within ~0.01–0.11, no consistent direction) — the extra
+  findings the full pipeline surfaces aren't disproportionately noise, it's genuinely more
+  sensitive, not just louder. Cost: consistently about 3x more calls per diff at both sizes.
 - **`verdict` used to be structurally useless as a quality signal** on a repo whose commit style
   didn't match the default spec's test/changelog policy (a single unrelated policy failure forced
   the same `REQUEST_CHANGES` as a confirmed critical defect). Fixed, and the fix is verified
@@ -316,6 +318,31 @@ bug found here: its verdict-parsing regex predated #189's `verdict_reason` slug 
 digits in reason names (`confirmed_p0_defect`) that its character class excluded — fixed, since a
 benchmark tool that silently reports `UNKNOWN` for every verdict after an upstream format change
 is exactly the kind of failure this whole exercise exists to catch.
+
+### Comparison matrix, re-run at n=78
+
+The full-pipeline-vs-single-lens comparison (originally only measured at n=41) was re-run against
+this larger set:
+
+| | full pipeline (n=41) | single-lens (n=41) | full pipeline (n=78) | single-lens (n=78) |
+|---|---|---|---|---|
+| Recall | 0.792 | 0.375 | 0.816 | 0.395 |
+| False-positive rate | 0.647 | 0.294 | 0.675 | 0.300 |
+| Precision | 0.633 | 0.643 | 0.534 | 0.556 |
+| Avg. cost/calls per diff | $0.0035 / 5.9 | $0.0012 / 1.8 | $0.0039 / 5.8 | $0.0015 / 1.7 |
+
+**Same pattern held at the larger scale, not a fluke of the smaller sample**: recall roughly
+doubles with the full pipeline at both sample sizes (0.792→0.816 vs. 0.375→0.395), while precision
+stays close between the two configs at both sizes (differing by ~0.01–0.02, not a consistent
+direction — full pipeline was slightly ahead at n=41, single-lens slightly ahead at n=78). Cost
+ratio held steady at roughly 3.4x. Agreement across all 78: both configs flagged the same 25 cases,
+the full pipeline alone caught 33 the baseline missed, the baseline alone caught 2 the full
+pipeline missed, both stayed clean on 18 — proportionally similar to the n=41 breakdown.
+
+This closes out the piece of #161 that the original n=41 comparison couldn't answer on its own:
+whether "the full pipeline beats a single reviewer" was itself a coincidence of that particular
+41-diff sample. It wasn't — the same magnitude of effect (~2x recall, ~3x cost, comparable
+precision) showed up independently on a sample nearly twice the size.
 
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 
