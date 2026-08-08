@@ -358,7 +358,7 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
 
     md.push_str("## Discourse Audit\n\n");
     md.push_str(
-        "| Round | Move | Challenge axis | Lens | Target | Detail | New evidence |\n|---|---|---|---|---|---|---|\n",
+        "| Round | Move | Confidence | Challenge axis | Lens | Target | Detail | New evidence |\n|---|---|---|---|---|---|---|---|\n",
     );
     for a in audit {
         for m in &a.moves {
@@ -367,10 +367,20 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             } else {
                 ""
             };
+            // #163: AGREE/CHALLENGE carry a self-reported confidence that confidence_weight()
+            // uses to compute vote_net — previously invisible outside the raw JSON, so neither a
+            // human auditing a report nor any offline analysis (e.g.
+            // evals/szz-bench/calibrate_confidence.py) could check it against anything.
+            let confidence = if m.kind == "AGREE" || m.kind == "CHALLENGE" {
+                m.confidence.as_str()
+            } else {
+                ""
+            };
             md.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 a.round,
                 escape_table_cell(&m.kind),
+                escape_table_cell(confidence),
                 escape_table_cell(axis),
                 escape_table_cell(&m.lens),
                 escape_table_cell(&m.target),
@@ -658,6 +668,60 @@ mod tests {
         assert!(
             verdict_line.contains("(PARTIAL"),
             "verdict line must carry a partial-review marker when stage_errors is non-empty:\n{verdict_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_renders_a_moves_confidence_in_the_discourse_audit_table() {
+        // #163: a move's self-reported confidence (what confidence_weight() actually uses to
+        // compute vote_net) used to be invisible outside the raw JSON — neither a human auditing
+        // a report nor any offline analysis could check it against anything.
+        let spec = test_spec();
+        let input = test_input();
+        let quant = test_quant();
+        let dir = std::env::temp_dir().join("codereview-loop-report-discourse-confidence-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let audit = vec![DiscourseAudit {
+            round: 1,
+            moves: vec![crate::discourse::Move {
+                kind: "AGREE".to_string(),
+                lens: "reviewer".to_string(),
+                target: "design-r1-1".to_string(),
+                new_evidence: "corroborating".to_string(),
+                confidence: "high".to_string(),
+                ..Default::default()
+            }],
+        }];
+
+        let path = write(ReportCtx {
+            out_dir: &dir,
+            spec: &spec,
+            input: &input,
+            selected_lenses: &["design".to_string()],
+            round: 1,
+            findings: &[],
+            resolved: &HashMap::new(),
+            unverified: &[],
+            good_things: &[],
+            policies: &[],
+            requirements: &None,
+            audit: &audit,
+            quant: &quant,
+            fix_results: &[],
+            human_voice: None,
+            stage_errors: &[],
+        })
+        .unwrap();
+        let md = std::fs::read_to_string(&path).unwrap();
+
+        let audit_line = md.lines().find(|l| l.contains("AGREE")).unwrap();
+        assert!(
+            audit_line.contains("high"),
+            "discourse audit row must carry the move's confidence:\n{audit_line}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
