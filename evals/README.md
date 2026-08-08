@@ -58,6 +58,42 @@ the review mechanics and real output numbers are recorded.
   benchmark comparing single-LLM vs. multi-persona-plus-discourse accuracy that issue #161 asks
   for and that this repo still doesn't have.
 
+### Second run: the vote gate prevented a bad outcome, but didn't reach full precision
+
+A second real diff from the same private app (unrelated feature, 14 files, +80/-65 lines) —
+adding per-message mode tracking to a chat feature — produced `REQUEST_CHANGES`, score 95/100,
+effort 4/5, 7 provider calls, cost $0.0086.
+
+One finding claimed a P0 compile error: an undefined-variable reference inside a JSON
+deserialization factory. Discourse `AGREE`d on it in **both** rounds (vote net cleared
+`VOTE_THRESHOLD`). Checked against the actual source file (not just the diff) to settle it: the
+claim was **wrong** — the referenced line was inside an unrelated instance method (not the JSON
+factory the LLM thought it was in), where the identifier is a valid field reference, not an
+undefined variable.
+
+What actually happened in the report: the finding stayed `UNCERTAIN` — `evidence_unverified`
+blocked it from being confirmed and counted toward the score/verdict, and it was routed to
+"Needs Human Review" instead. This is the local vote/evidence gate (issue #148, fixed earlier in
+this repo's history) doing its job for real: a wrong, high-severity, discourse-agreed claim did
+not get to drive the verdict.
+
+But it's a partial result, not a clean one. The same report *did* fully `REJECT` four other
+unfounded candidate findings via discourse `CHALLENGE` — this one only made it to `UNCERTAIN`,
+not a confident rejection. So: the gate stopped the worse outcome (a false P0 silently scored),
+but didn't reach the better outcome (confidently identifying the claim as wrong without a human
+having to check the source file). Recorded here as a real, mixed data point rather than rounding
+it up to a clean success.
+
+### Also found along the way: a secret-scanner false positive
+
+Reviewing the first diff above required `--allow-sensitive-input` — the local secret scanner
+(`src/secretscan.rs`) refused to send it, flagging an ordinary `max_tokens: <value>` parameter in
+an LLM API call as a suspected credential. Root cause and fix proposal filed as
+[#181](https://github.com/Loop-Suite/Code-Review-Loop/issues/181):
+`SECRET_KEY_MARKERS` includes the bare substring `"TOKEN"` with no word-boundary check, so any
+`*_TOKEN`-containing identifier (`max_tokens`, `token_count`, etc.) trips it, not just genuine
+token/credential fields.
+
 ## ⚠ LLM non-determinism is real, not just a theoretical caveat
 
 Running `sql-injection.patch` twice produced two different discourse outcomes: once the SQL
