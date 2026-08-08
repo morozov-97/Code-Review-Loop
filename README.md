@@ -218,6 +218,45 @@ Default personas include:
 Additional personas can be defined via `persona_name`, `persona_voice`, and `tier` in
 `src/spec.rs` config structures and TOML settings.
 
+## Real-world validation
+
+The obvious question about a persona+discourse pipeline is whether it beats a single reviewer, or
+is just theater around one model asked the same thing several times. Answered with real
+measurements, not benchmarked in the abstract — every number below is from an actual
+`--backend openrouter` run against a real model, reviewing real diffs pulled from an unrelated
+production codebase's own git history (ground truth via [SZZ](https://en.wikipedia.org/wiki/SZZ_algorithm):
+`git blame`-traced bug-introducing commits, not hand-picked or self-labeled). Full methodology,
+every raw number, and everything that went wrong along the way: [`evals/README.md`](evals/README.md)
+and [`evals/reports/`](evals/reports/).
+
+| | Full pipeline | Single-lens baseline | Self-consistency (3 passes, best case) |
+|---|---|---|---|
+| Recall (n=78) | **0.816** | 0.395 | — |
+| Recall (n=41) | 0.792 | 0.375 | 0.667 |
+| Precision | 0.53–0.63 | 0.56–0.64 | 0.640 |
+| Cost per diff | ~$0.0035–0.0039 / 5.8–5.9 calls | ~$0.0012–0.0015 / 1.7–1.8 calls | ~$0.0039 / 5.4 calls |
+
+**Recall roughly doubles with the full pipeline, independently confirmed at two sample sizes,
+while precision stays comparable between configs** — the extra findings aren't disproportionately
+noise. The more important result: **self-consistency (running the single-lens config 3 independent
+times and taking a majority or union vote) does not recover this advantage, even at the same real
+cost.** The best self-consistency variant tops out at 0.667 recall against the full pipeline's
+0.792; requiring majority agreement is actually *worse* than one pass (0.292), a real consequence
+of each pass independently catching a given defect under 50% of the time. This is evidence the
+architecture — persona diversity plus one round of anonymous discourse — is doing real work, not
+just spending more tokens per diff.
+
+Also measured, not assumed: whether discourse's self-reported confidence (`high`/`medium`/`low`)
+predicts whether a finding is actually correct. Checked twice against real ground truth (not
+self-graded) — confidence tiers are only weakly distinguishable, and an early "medium beats high"
+result at a smaller sample size did not replicate at a larger one. **Don't trust a single
+high-confidence claim over a medium one without independent verification.**
+
+Total real spend behind these numbers so far: **$0.85 across 385 review runs (1,264 LLM calls)**.
+None of this is a finished verdict on the architecture — see `evals/README.md`'s own caveats
+(sample sizes, one repo, one spec, methodology limits) — but it's real, measured evidence in place
+of the pure speculation this section used to be.
+
 ## Precision/recall operating points
 
 Discourse's confirmation bar (`[discourse].vote_threshold` in a spec, default `0.6`) controls how
@@ -433,16 +472,17 @@ sequenceDiagram
   spec via an optional `[scoring]` table (`p0`/`p1`/`p2`/`p3`); unset fields keep their default,
   so a partial table only overrides what it mentions. Effort/time budgets (`quantify.rs`'s
   `effort_and_time`) are still hardcoded — there's no config field for those yet.
-- fixed persona mapping (e.g., design→Fowler) is customizable but opinionated. More importantly:
-  persona diversity is not model diversity. Every lens, the discourse pass, and the judge draw
-  from the same underlying model by default — differentiated only by system prompt. The premise
-  behind running multiple "reviewers" at all is that their errors are somewhat independent, so
-  cross-verification catches something a single pass would miss; three personas answering as the
-  same model are far more likely to share failure modes than genuinely different models would be.
-  A `model` field on a `[[lenses]]` entry in spec.toml overrides `--model`/`--cheap-model` for
-  just that lens (works with `--backend openrouter`/`custom`, where distinct model ids resolve to
-  distinct endpoints) — set it on one or two lenses to actually test whether model diversity
-  changes what gets caught, rather than assuming persona diversity already covers it.
+- fixed persona mapping (e.g., design→Fowler) is customizable but opinionated. Every lens, the
+  discourse pass, and the judge draw from the same underlying model by default — differentiated
+  only by system prompt, not genuinely different models. A `model` field on a `[[lenses]]` entry
+  in spec.toml overrides `--model`/`--cheap-model` for just that lens (works with
+  `--backend openrouter`/`custom`) if you want to test heterogeneous models directly. **This used
+  to be pure speculation about whether that mattered — it's now measured**: see
+  [Real-world validation](#real-world-validation). Running the same single-lens config 3
+  independent times (the closest same-model analogue) does *not* reproduce the full pipeline's
+  recall even at matched cost, which is evidence persona diversity + discourse cross-verification
+  is contributing something beyond "the same model asked more than once" — not proof every
+  possible failure mode is independent, but a real answer where there used to be none.
 - `--prior` assumes compatible finding identity across re-runs with the same spec.
 - repository-independent claim matching can become noisy when file renames are common
   without supporting heuristics.
@@ -450,15 +490,11 @@ sequenceDiagram
   assert something false with high confidence (e.g. claiming code is absent from a diff when it's
   actually present). Neither failure mode is fully eliminated by the deterministic scoring layer,
   since that layer's inputs (finding existence, severity) still come from the LLM. See
-  [Recommended CI integration](#recommended-ci-integration).
-- multiple lenses are called independently, but they mostly run on the same underlying model
-  against the same diff through a similar prompt family — independent *calls* don't imply
-  independent *error distributions*. If the model misreads a particular code pattern, several
-  personas can plausibly make the same mistake in the same direction, and discourse cross-checking
-  (also the same model) isn't a genuinely independent second opinion on that specific failure mode.
-  "Multiple personas agreed" is evidence the finding survived one model's self-consistency check,
-  not proof of independent verification — lean on non-LLM checks
-  (`--deterministic-results`/semgrep/compile/tests) for anything mechanically checkable instead.
+  [Recommended CI integration](#recommended-ci-integration). Discourse's own self-reported
+  confidence is measured to be only weakly correlated with actual correctness (see
+  [Real-world validation](#real-world-validation)) — lean on non-LLM checks
+  (`--deterministic-results`/semgrep/compile/tests) for anything mechanically checkable instead of
+  trusting a high-confidence claim at face value.
 
 ## Recommended CI integration
 
