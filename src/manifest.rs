@@ -166,6 +166,7 @@ mod tests {
                 attempts: 1,
                 latency_ms: 42,
                 success: true,
+                model: Some("some-model".to_string()),
             }],
         )
         .unwrap();

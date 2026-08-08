@@ -191,6 +191,12 @@ pub struct CallRecord {
     pub attempts: u32,
     pub latency_ms: u128,
     pub success: bool,
+    /// #172 follow-up: `backend_factory::build_llm` shares one `calls_log` across the main and
+    /// cheap `Llm` instances (see its own doc comment) so a manifest sees every call in a run —
+    /// but that meant there was no way to tell which of the two models made a given call. Set
+    /// from `self.model` at record time, so it reflects whichever `Llm` (main or cheap) the call
+    /// actually went through.
+    pub model: Option<String>,
 }
 
 /// An HTTP-ish failure that carries its status code as data, not just baked into a message
@@ -463,6 +469,7 @@ impl Llm {
                     attempts,
                     latency_ms: started.elapsed().as_millis(),
                     success,
+                    model: self.model.clone(),
                 });
         }
     }
@@ -1244,6 +1251,28 @@ mod tests {
         cheap.text_ctx(None, "task", None).unwrap();
         assert_eq!(main.calls().len(), 2);
         assert_eq!(cheap.calls().len(), 2);
+    }
+
+    #[test]
+    fn calls_recorded_via_a_shared_log_are_attributed_to_the_right_model() {
+        // Extends the sharing test above: two Llm values contributing to one shared calls_log
+        // (as backend_factory::build_llm sets up main_llm/cheap_llm) must still be distinguishable
+        // by which one actually made each call.
+        let log = Llm::new_calls_log();
+        let mut main = Llm::fixture(vec!["a".to_string()], 0, Llm::new_usage_tracker())
+            .with_calls_log(Some(log.clone()));
+        main.model = Some("main-model".to_string());
+        let mut cheap = Llm::fixture(vec!["b".to_string()], 0, Llm::new_usage_tracker())
+            .with_calls_log(Some(log));
+        cheap.model = Some("cheap-model".to_string());
+        main.text_ctx(None, "task", None).unwrap();
+        cheap.text_ctx(None, "task", None).unwrap();
+
+        let calls = main.calls();
+        assert_eq!(calls.len(), 2);
+        let models: Vec<_> = calls.iter().map(|c| c.model.as_deref()).collect();
+        assert!(models.contains(&Some("main-model")));
+        assert!(models.contains(&Some("cheap-model")));
     }
 
     #[test]
