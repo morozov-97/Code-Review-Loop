@@ -25,7 +25,7 @@ cost, and what was found, frozen as of the date it ran.
 
 | Date | Summary |
 |---|---|
-| [2026-08-08](2026-08-08/summary.md) | First SZZ-derived real benchmark (41→78 cases), full-pipeline-vs-single-lens comparison, discourse confidence calibration, $0.57 total real cost across 184 runs. |
+| [2026-08-08](2026-08-08/summary.md) | First SZZ-derived real benchmark (41→78 cases): full-pipeline-vs-single-lens comparison at two scales, discourse confidence calibration, a self-consistency baseline ruling out "just more LLM calls" as the explanation, $0.85 total real cost across 385 runs. |
 
 Add a row here whenever a new report lands — this table is the entry point, not something a
 reader should have to reconstruct by listing directories.
