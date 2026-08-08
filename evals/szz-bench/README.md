@@ -35,7 +35,18 @@ export OPENROUTER_API_KEY=...
 
 # 3. Aggregate into precision/recall
 python3 aggregate.py --dir ./szz-out
+
+# 4. Optional (issue #163): does self-reported confidence predict finding location accuracy?
+python3 calibrate_confidence.py --repo /path/to/target/repo --bench-dir ./szz-out
 ```
+
+`calibrate_confidence.py` is a narrower, non-circular attempt at #163 — it checks each finding's
+cited file:line against `git blame` on the historical fix's parent tree (does it land on the same
+lines SZZ already traced back to the bug-introducing commit), bucketed by the finding's own
+self-reported confidence. Read its own docstring before citing a number from it: it's a location-
+match proxy (not full semantic verification), and it measures the *Finding*'s confidence field,
+not the *discourse move* confidence `confidence_weight()` actually weights — related, not
+identical.
 
 `extract.py --fix-grep` defaults to `^fix` (Conventional Commits style) — pass a different pattern
 for repos using another convention. `--max-files`/`--max-lines` bound how large a commit can be
