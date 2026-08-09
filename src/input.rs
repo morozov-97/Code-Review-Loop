@@ -317,21 +317,38 @@ fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
 /// `changed_files`/added/removed line counts, not just in what's sent to the model — the point
 /// is that its content leaves no trace in anything this run produces, not merely that lens
 /// prompts skip it.
-fn strip_denied_paths(diff: &str, denied_path_patterns: &[String]) -> (String, Vec<String>) {
+fn strip_denied_paths(
+    diff: &str,
+    denied_path_patterns: &[String],
+) -> Result<(String, Vec<String>)> {
     if denied_path_patterns.is_empty() {
-        return (diff.to_string(), Vec::new());
+        return Ok((diff.to_string(), Vec::new()));
     }
     let blocks = split_into_file_blocks(diff);
     let mut kept: Vec<String> = Vec::new();
     let mut denied: Vec<String> = Vec::new();
     for (path, text) in blocks {
-        let is_denied = path.as_deref().is_some_and(|p| {
-            denied_path_patterns
-                .iter()
-                .any(|pat| crate::policy::matches_one(p, pat))
-        });
+        // A block whose path this parser couldn't extract (e.g. a `--no-prefix` diff, or a
+        // quoted path containing spaces/unicode — `diff --git`'s own path extraction only
+        // handles the default `a/`.../`b/`... form) used to fall through and get kept
+        // unconditionally, silently bypassing the denylist for exactly the diffs an attacker
+        // controlling diff generation would reach for. Once denied_path_patterns is configured
+        // at all, an unresolved path can't be proven safe, so it can't be sent — fail closed
+        // instead of guessing.
+        let Some(p) = path else {
+            anyhow::bail!(
+                "refusing to send diff: security.denied_path_patterns is configured but a file \
+                 block's path could not be determined (non-default diff header form, e.g. \
+                 `--no-prefix` or a quoted path) — cannot verify it doesn't match a denied \
+                 pattern. First ~120 chars of the unresolved block: {:?}",
+                text.chars().take(120).collect::<String>()
+            );
+        };
+        let is_denied = denied_path_patterns
+            .iter()
+            .any(|pat| crate::policy::matches_one(&p, pat));
         if is_denied {
-            denied.push(path.unwrap());
+            denied.push(p);
         } else {
             kept.push(text);
         }
@@ -344,7 +361,7 @@ fn strip_denied_paths(diff: &str, denied_path_patterns: &[String]) -> (String, V
             denied.join(", ")
         ));
     }
-    (out, denied)
+    Ok((out, denied))
 }
 
 /// Returns the normalized `Input`, the list of files `prioritize_and_cap_diff` had to drop from
@@ -366,7 +383,7 @@ pub fn normalize(
     // Run before parse_diff_stats/changed_files below, not just before prioritize_and_cap_diff —
     // a denied file must leave no trace anywhere this run produces (stats, manifest changed-file
     // list, report), not merely be skipped by lens prompts.
-    let (diff, denied_files) = strip_denied_paths(&diff, denied_path_patterns);
+    let (diff, denied_files) = strip_denied_paths(&diff, denied_path_patterns)?;
     if !denied_files.is_empty() {
         eprintln!(
             "security.denied_path_patterns excluded {} file(s) from this diff, not sent to the LLM: {}",
@@ -700,7 +717,7 @@ mod tests {
     #[test]
     fn strip_denied_paths_is_a_no_op_when_no_patterns_are_configured() {
         let diff = "diff --git a/secrets.env b/secrets.env\n+API_KEY=x\n";
-        let (out, denied) = strip_denied_paths(diff, &[]);
+        let (out, denied) = strip_denied_paths(diff, &[]).unwrap();
         assert_eq!(out, diff);
         assert!(denied.is_empty());
     }
@@ -709,7 +726,7 @@ mod tests {
     fn strip_denied_paths_removes_a_matching_file_block_and_its_content() {
         let diff = "diff --git a/src/main.rs b/src/main.rs\n+fn main() {}\n\
              diff --git a/secrets.env b/secrets.env\n+API_KEY=super-secret-value\n";
-        let (out, denied) = strip_denied_paths(diff, &["secrets.env".to_string()]);
+        let (out, denied) = strip_denied_paths(diff, &["secrets.env".to_string()]).unwrap();
         assert_eq!(denied, vec!["secrets.env".to_string()]);
         assert!(out.contains("fn main()"), "the kept file must survive");
         assert!(
@@ -723,7 +740,7 @@ mod tests {
     #[test]
     fn strip_denied_paths_leaves_a_non_matching_diff_untouched() {
         let diff = "diff --git a/src/main.rs b/src/main.rs\n+fn main() {}\n";
-        let (out, denied) = strip_denied_paths(diff, &["secrets.env".to_string()]);
+        let (out, denied) = strip_denied_paths(diff, &["secrets.env".to_string()]).unwrap();
         assert_eq!(out.trim_end(), diff.trim_end());
         assert!(denied.is_empty());
     }
@@ -734,10 +751,39 @@ mod tests {
         // match a real path segment, not the middle of "my_secrets_config.rs".
         let diff = "diff --git a/config/secrets/db.toml b/config/secrets/db.toml\n+password=x\n\
              diff --git a/src/my_secrets_config.rs b/src/my_secrets_config.rs\n+fn f() {}\n";
-        let (out, denied) = strip_denied_paths(diff, &["secrets/".to_string()]);
+        let (out, denied) = strip_denied_paths(diff, &["secrets/".to_string()]).unwrap();
         assert_eq!(denied, vec!["config/secrets/db.toml".to_string()]);
         assert!(out.contains("my_secrets_config.rs"));
         assert!(!out.contains("password=x"));
+    }
+
+    #[test]
+    fn strip_denied_paths_fails_closed_on_a_no_prefix_diff_when_patterns_are_configured() {
+        // Real bypass, found via an external review and reproduced against a live run: a
+        // `git diff --no-prefix` header has no " b/" substring, so split_into_file_blocks's path
+        // extraction (mirroring parse_diff_stats's own "b/" convention) returns None for the
+        // whole block -- which used to fall through and get kept unconditionally, sending a
+        // denied file's content to the LLM regardless of denied_path_patterns.
+        let diff = "diff --git secrets.env secrets.env\n--- secrets.env\n+++ secrets.env\n\
+                     @@ -1 +1 @@\n-API_KEY=old\n+API_KEY=new\n";
+        let err = strip_denied_paths(diff, &["secrets.env".to_string()])
+            .expect_err("an unresolved path with deny patterns configured must fail closed");
+        assert!(
+            err.to_string().contains("could not be determined"),
+            "error should explain why the diff was refused: {err}"
+        );
+    }
+
+    #[test]
+    fn strip_denied_paths_still_succeeds_on_a_no_prefix_diff_when_no_patterns_are_configured() {
+        // The fail-closed behavior only kicks in once there's something to be unsure about --
+        // an empty denied_path_patterns list has nothing to enforce, so an unresolved path is
+        // harmless (matches the early return for the empty-patterns case above).
+        let diff = "diff --git secrets.env secrets.env\n--- secrets.env\n+++ secrets.env\n\
+                     @@ -1 +1 @@\n-API_KEY=old\n+API_KEY=new\n";
+        let (out, denied) = strip_denied_paths(diff, &[]).unwrap();
+        assert_eq!(out, diff);
+        assert!(denied.is_empty());
     }
 
     #[test]

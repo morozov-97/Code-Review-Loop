@@ -514,12 +514,15 @@ sequenceDiagram
   best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
   formats beyond the ones listed) — it catches the obvious cases, not everything. Scope boundary,
   spelled out since "no redaction" undersells how narrow this is: it is credential-*pattern*
-  matching only. It is not PII detection (no names/emails/phone numbers/addresses/government IDs),
-  not a path allowlist/denylist (no way to say "never send anything under `secrets/` or
-  `infra/prod/` regardless of content"), not an audit log of what was actually transmitted to
-  which provider, and not any data-residency or no-retention enforcement on the provider side. For
-  a repo with PII references or compliance-scoped paths, that gap is real — content scanners
-  always miss things path rules wouldn't.
+  matching (plus a Luhn-validated check for payment-card-shaped digit runs) only, not general PII
+  detection (no names/emails/phone numbers/addresses/government IDs). A real path denylist does
+  exist — `[security].denied_path_patterns` in a spec excludes matching files' diff content
+  before anything else touches it (fails closed, not open, if a diff's header form makes a path
+  unresolvable — see `input::strip_denied_paths`), and excluded files are logged in
+  `manifest.json`'s `denied_files` as an audit trail of what was kept back. What's still missing:
+  an audit log of what was actually transmitted to which provider for the files that *were* sent,
+  and any data-residency or no-retention enforcement on the provider side — those depend on the
+  provider you point `--backend` at, not on anything this tool controls.
 - heuristic-only policy signals for behavior vs surface changes can produce false
   positives depending on project structure. The default spec's test/doc policy is presence-only
   (some test/doc file appears anywhere in the diff, not mapped per changed file) and strict
