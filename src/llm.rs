@@ -110,7 +110,15 @@ impl Drop for GatePermit {
 /// the same Arc, you get totals aggregated across the whole run.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Usage {
+    /// Successful calls only (incremented by `record_usage`, after a response comes back) --
+    /// this is the number token/cost totals below are actually derived from.
     pub calls: u64,
+    /// Every real attempt at reaching a provider -- success, HTTP/subprocess error, timeout, or
+    /// retry -- incremented atomically (under the same lock as the `max_calls` check) right
+    /// before the attempt is made. `max_calls` is enforced against this field, not `calls`:
+    /// `calls` alone let a failing/retried call make real provider requests indefinitely without
+    /// ever counting against the budget it was supposed to be checked against.
+    pub attempted_calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -535,16 +543,29 @@ impl Llm {
         g.cost_usd += u.cost_usd;
     }
 
-    fn call_once(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
-        // #175: checked before acquiring a gate permit or making any actual call — a
-        // misconfigured invocation (e.g. --lenses listing every optional lens) hits this and
-        // fails fast instead of burning the provider call anyway.
-        if let Some(max) = self.max_calls {
-            let current = self.usage.lock().unwrap_or_else(|e| e.into_inner()).calls;
-            if current >= max {
-                return Err(CallBudgetExceeded(max).into());
-            }
+    /// Checks `max_calls` against `attempted_calls` and increments it in the same critical
+    /// section, so two threads racing this at once can't both observe "under budget" before
+    /// either has recorded its own attempt. Called from `call_once`, before the gate permit and
+    /// before any actual provider request -- every real attempt (success, error, or retry) goes
+    /// through here exactly once, unlike the old check against `calls` (successful calls only),
+    /// which a failing/retried call could burn indefinitely without ever counting against.
+    fn reserve_call_slot(&self) -> Result<()> {
+        let Some(max) = self.max_calls else {
+            return Ok(());
+        };
+        let mut g = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        if g.attempted_calls >= max {
+            return Err(CallBudgetExceeded(max).into());
         }
+        g.attempted_calls += 1;
+        Ok(())
+    }
+
+    fn call_once(&self, ctx: Option<&str>, task: &str, system: Option<&str>) -> Result<CallResult> {
+        // #175/hardening: checked (and reserved, atomically) before acquiring a gate permit or
+        // making any actual call — a misconfigured invocation (e.g. --lenses listing every
+        // optional lens) hits this and fails fast instead of burning the provider call anyway.
+        self.reserve_call_slot()?;
         // #166: held for the whole call (network round trip or subprocess) — dropped at the end
         // of this function, freeing the slot for the next waiting caller.
         let _permit = self.gate.as_ref().map(|g| g.acquire());
@@ -1209,6 +1230,59 @@ mod tests {
         let llm = Llm::fixture(vec!["a".to_string(), "b".to_string()], 0, usage);
         assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "a");
         assert_eq!(llm.text_ctx(None, "task", None).unwrap(), "b");
+    }
+
+    #[test]
+    fn call_once_counts_a_failed_attempt_against_max_calls_not_just_successes() {
+        // Real gap this closes: max_calls used to be checked against `usage.calls`, which only
+        // record_usage (success path) incremented -- a call that fails inside call_once itself
+        // (here: an empty fixture queue) burned a real attempt without ever counting toward the
+        // budget it was supposed to be checked against.
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![], 0, usage.clone()).with_max_calls(Some(2));
+        let e1 = llm.call_once(None, "task", None).unwrap_err();
+        assert!(
+            e1.to_string().contains("fixture response queue is empty"),
+            "first attempt should fail for the underlying reason, not the budget: {e1}"
+        );
+        let e2 = llm.call_once(None, "task", None).unwrap_err();
+        assert!(
+            e2.to_string().contains("fixture response queue is empty"),
+            "second attempt should also still fail for the underlying reason: {e2}"
+        );
+        let e3 = llm.call_once(None, "task", None).unwrap_err();
+        assert!(
+            e3.to_string().contains("provider call budget exceeded"),
+            "third attempt must be refused by the budget, having counted the two prior failures: {e3}"
+        );
+        assert_eq!(usage.lock().unwrap().attempted_calls, 2);
+    }
+
+    #[test]
+    fn call_once_never_lets_concurrent_callers_exceed_max_calls_even_under_a_race() {
+        // Real gap this closes: the old check-then-increment (read usage.calls, release the
+        // lock, increment later in record_usage) let N concurrently racing threads all observe
+        // "under budget" before any of them had recorded an attempt. reserve_call_slot folds the
+        // check and increment into one locked critical section instead.
+        let usage = Llm::new_usage_tracker();
+        let responses: Vec<String> = (0..5).map(|i| format!("r{i}")).collect();
+        let llm = Llm::fixture(responses, 0, usage.clone()).with_max_calls(Some(5));
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let llm = llm.clone();
+                std::thread::spawn(move || llm.call_once(None, "task", None).is_ok())
+            })
+            .collect();
+        let successes = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 5,
+            "exactly max_calls attempts should ever be let through, regardless of how many raced in concurrently"
+        );
+        assert_eq!(usage.lock().unwrap().attempted_calls, 5);
     }
 
     // --- #172: per-call telemetry ---

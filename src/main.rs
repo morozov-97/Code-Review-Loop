@@ -87,7 +87,7 @@ fn real_main() -> Result<()> {
                     allow_sensitive_input: cli.allow_sensitive_input,
                 },
             )?;
-            if fail_on.triggers(&verdict) {
+            if fail_on.triggers(&verdict)? {
                 eprintln!(
                     "codereview: verdict {verdict} triggers --fail-on {fail_on:?} — exiting non-zero"
                 );
