@@ -1,3 +1,4 @@
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -31,22 +32,27 @@ impl FailOn {
         }
     }
 
-    /// An unrecognized verdict string is treated like APPROVE (rank 0) — never triggers on its
-    /// own, the conservative direction for a value this shouldn't ever see in practice.
-    fn verdict_rank(verdict: &str) -> u8 {
+    /// An unrecognized verdict string used to be silently treated like APPROVE (rank 0), on the
+    /// reasoning that it "shouldn't ever see this in practice" — which is exactly backwards for
+    /// a flag whose whole job is gating CI on verdict: "I don't recognize this verdict" and "no
+    /// problems found" are not the same claim, and the first should never be allowed to pass as
+    /// the second. Errors instead, so an unrecognized value is loud, not a silent pass-through.
+    fn verdict_rank(verdict: &str) -> Result<u8> {
         match verdict {
-            "APPROVE" => 0,
-            "COMMENT" => 1,
-            "NEEDS_CONTEXT" => 2,
-            "REQUEST_CHANGES" => 3,
-            _ => 0,
+            "APPROVE" => Ok(0),
+            "COMMENT" => Ok(1),
+            "NEEDS_CONTEXT" => Ok(2),
+            "REQUEST_CHANGES" => Ok(3),
+            other => anyhow::bail!(
+                "unrecognized verdict {other:?} — refusing to guess whether --fail-on should trigger on it"
+            ),
         }
     }
 
-    pub(crate) fn triggers(&self, verdict: &str) -> bool {
+    pub(crate) fn triggers(&self, verdict: &str) -> Result<bool> {
         match self.threshold_rank() {
-            None => false,
-            Some(threshold) => Self::verdict_rank(verdict) >= threshold,
+            None => Ok(false),
+            Some(threshold) => Ok(Self::verdict_rank(verdict)? >= threshold),
         }
     }
 }
@@ -207,30 +213,38 @@ mod tests {
 
     #[test]
     fn fail_on_never_does_not_trigger_even_on_request_changes() {
-        assert!(!FailOn::Never.triggers("REQUEST_CHANGES"));
+        assert!(!FailOn::Never.triggers("REQUEST_CHANGES").unwrap());
+    }
+
+    #[test]
+    fn fail_on_never_does_not_even_check_an_unrecognized_verdict() {
+        // threshold_rank() is None for Never, short-circuiting before verdict_rank ever runs --
+        // "never gate on anything" must hold even for a verdict string this binary doesn't
+        // recognize, not just for the four known ones.
+        assert!(!FailOn::Never.triggers("SOME_FUTURE_VERDICT").unwrap());
     }
 
     #[test]
     fn fail_on_comment_triggers_on_comment_and_worse() {
-        assert!(!FailOn::Comment.triggers("APPROVE"));
-        assert!(FailOn::Comment.triggers("COMMENT"));
-        assert!(FailOn::Comment.triggers("NEEDS_CONTEXT"));
-        assert!(FailOn::Comment.triggers("REQUEST_CHANGES"));
+        assert!(!FailOn::Comment.triggers("APPROVE").unwrap());
+        assert!(FailOn::Comment.triggers("COMMENT").unwrap());
+        assert!(FailOn::Comment.triggers("NEEDS_CONTEXT").unwrap());
+        assert!(FailOn::Comment.triggers("REQUEST_CHANGES").unwrap());
     }
 
     #[test]
     fn fail_on_needs_context_does_not_trigger_on_a_mere_comment() {
-        assert!(!FailOn::NeedsContext.triggers("COMMENT"));
-        assert!(FailOn::NeedsContext.triggers("NEEDS_CONTEXT"));
-        assert!(FailOn::NeedsContext.triggers("REQUEST_CHANGES"));
+        assert!(!FailOn::NeedsContext.triggers("COMMENT").unwrap());
+        assert!(FailOn::NeedsContext.triggers("NEEDS_CONTEXT").unwrap());
+        assert!(FailOn::NeedsContext.triggers("REQUEST_CHANGES").unwrap());
     }
 
     #[test]
     fn fail_on_request_changes_only_triggers_on_request_changes_itself() {
-        assert!(!FailOn::RequestChanges.triggers("APPROVE"));
-        assert!(!FailOn::RequestChanges.triggers("COMMENT"));
-        assert!(!FailOn::RequestChanges.triggers("NEEDS_CONTEXT"));
-        assert!(FailOn::RequestChanges.triggers("REQUEST_CHANGES"));
+        assert!(!FailOn::RequestChanges.triggers("APPROVE").unwrap());
+        assert!(!FailOn::RequestChanges.triggers("COMMENT").unwrap());
+        assert!(!FailOn::RequestChanges.triggers("NEEDS_CONTEXT").unwrap());
+        assert!(FailOn::RequestChanges.triggers("REQUEST_CHANGES").unwrap());
     }
 
     #[test]
@@ -239,9 +253,14 @@ mod tests {
     }
 
     #[test]
-    fn fail_on_treats_an_unrecognized_verdict_string_like_approve() {
-        // Defensive default: a verdict string this shouldn't ever see in practice must not
-        // silently trip a CI gate.
-        assert!(!FailOn::Comment.triggers("SOME_FUTURE_VERDICT"));
+    fn fail_on_errors_instead_of_silently_passing_an_unrecognized_verdict() {
+        // Real gap this closes: an unrecognized verdict string used to be silently ranked like
+        // APPROVE, so "I don't know what this verdict means" and "no problems found" were
+        // indistinguishable to a CI gate. Any threshold that isn't Never must now surface this
+        // loudly instead of quietly declining to trigger.
+        let err = FailOn::Comment
+            .triggers("SOME_FUTURE_VERDICT")
+            .expect_err("an unrecognized verdict must not be allowed to silently pass a gate");
+        assert!(err.to_string().contains("unrecognized verdict"));
     }
 }
