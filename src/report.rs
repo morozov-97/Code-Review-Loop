@@ -389,10 +389,11 @@ pub fn write(ctx: ReportCtx) -> Result<PathBuf> {
             ));
         }
     }
-    if audit
-        .iter()
-        .any(|a| a.moves.iter().any(|m| m.kind == "AGREE" || m.kind == "CHALLENGE"))
-    {
+    if audit.iter().any(|a| {
+        a.moves
+            .iter()
+            .any(|m| m.kind == "AGREE" || m.kind == "CHALLENGE")
+    }) {
         // Measured (not assumed): confidence tiers here are only weakly correlated with actual
         // correctness (see README's Real-world validation section) — surfaced right next to the
         // table itself, since a reader of one PR's report won't see the repo-level README caveat.
@@ -743,14 +744,14 @@ mod tests {
     }
 
     #[test]
-    fn write_renders_a_confidence_reliability_caveat_when_the_audit_has_a_confidence_bearing_move() {
+    fn write_renders_a_confidence_reliability_caveat_when_the_audit_has_a_confidence_bearing_move()
+    {
         // A reader of one PR's report never sees the repo-level README caveat about confidence
         // being weakly correlated with correctness -- it needs to be right next to the table.
         let spec = test_spec();
         let input = test_input();
         let quant = test_quant();
-        let dir = std::env::temp_dir()
-            .join("codereview-loop-report-confidence-caveat-test");
+        let dir = std::env::temp_dir().join("codereview-loop-report-confidence-caveat-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -802,8 +803,7 @@ mod tests {
         let spec = test_spec();
         let input = test_input();
         let quant = test_quant();
-        let dir = std::env::temp_dir()
-            .join("codereview-loop-report-no-confidence-caveat-test");
+        let dir = std::env::temp_dir().join("codereview-loop-report-no-confidence-caveat-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
