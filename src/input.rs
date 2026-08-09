@@ -325,9 +325,11 @@ fn strip_denied_paths(diff: &str, denied_path_patterns: &[String]) -> (String, V
     let mut kept: Vec<String> = Vec::new();
     let mut denied: Vec<String> = Vec::new();
     for (path, text) in blocks {
-        let is_denied = path
-            .as_deref()
-            .is_some_and(|p| denied_path_patterns.iter().any(|pat| crate::policy::matches_one(p, pat)));
+        let is_denied = path.as_deref().is_some_and(|p| {
+            denied_path_patterns
+                .iter()
+                .any(|pat| crate::policy::matches_one(p, pat))
+        });
         if is_denied {
             denied.push(path.unwrap());
         } else {

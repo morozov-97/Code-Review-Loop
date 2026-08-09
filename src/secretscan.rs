@@ -184,7 +184,9 @@ fn is_luhn_valid_card_run(run: &str) -> bool {
 fn luhn_checksum_valid(digits: &str) -> bool {
     let mut sum = 0u32;
     for (i, c) in digits.chars().rev().enumerate() {
-        let mut d = c.to_digit(10).expect("digits is filtered to ASCII digits only");
+        let mut d = c
+            .to_digit(10)
+            .expect("digits is filtered to ASCII digits only");
         if i % 2 == 1 {
             d *= 2;
             if d > 9 {
